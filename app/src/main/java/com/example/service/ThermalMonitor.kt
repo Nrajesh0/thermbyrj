@@ -24,7 +24,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
-import java.net.NetworkInterface
 import kotlin.math.roundToInt
 
 data class LiveThermalData(
@@ -52,7 +51,7 @@ data class LiveThermalData(
     val cpuCores: Int = Runtime.getRuntime().availableProcessors(),
     val cpuArch: String = System.getProperty("os.arch") ?: "Unknown",
     
-    val ipAddress: String = "Disconnected",
+    val ipAddress: String = "Air-Gapped (No Network)",
     val uptime: Long = 0L,
     val refreshRate: Float = 0f
 )
@@ -70,7 +69,19 @@ class ThermalMonitor private constructor(private val context: Context) {
         }
     }
 
-    private val _liveData = MutableStateFlow(LiveThermalData())
+    private val _liveData = MutableStateFlow(
+        LiveThermalData(
+            deviceModel = Build.MODEL,
+            deviceManufacturer = Build.MANUFACTURER,
+            osVersion = Build.VERSION.RELEASE,
+            apiLevel = Build.VERSION.SDK_INT,
+            board = Build.BOARD,
+            hardware = Build.HARDWARE,
+            bootloader = Build.BOOTLOADER,
+            cpuCores = Runtime.getRuntime().availableProcessors(),
+            cpuArch = System.getProperty("os.arch") ?: "Unknown"
+        )
+    )
     val liveData: StateFlow<LiveThermalData> = _liveData.asStateFlow()
 
     fun updateDataFromIntent(intent: Intent?) {
@@ -93,31 +104,39 @@ class ThermalMonitor private constructor(private val context: Context) {
                          plugged == BatteryManager.BATTERY_PLUGGED_USB ||
                          plugged == BatteryManager.BATTERY_PLUGGED_WIRELESS
 
-        val cpuTempC = getCpuTemperature()
-        
-        val (totRam, avRam) = getMemoryInfo()
-        val (totStore, avStore) = getStorageInfo()
-
         _liveData.value = _liveData.value.copy(
             batteryTemp = batteryTempC,
-            cpuTemp = cpuTempC,
             batteryLevel = batteryPct,
             batteryVoltage = voltage,
             batteryHealth = health,
             batteryTech = tech,
-            isCharging = isCharging,
+            isCharging = isCharging
+        )
+    }
+
+    /**
+     * Refreshes system specs (RAM, Storage, CPU thermal zones, Network IP, display refresh rate).
+     * Call this when displaying the device info tab or when the app is in the foreground.
+     */
+    fun refreshSystemSpecs() {
+        val cpuTempC = getCpuTemperature()
+        val (totRam, avRam) = getMemoryInfo()
+        val (totStore, avStore) = getStorageInfo()
+
+        _liveData.value = _liveData.value.copy(
+            cpuTemp = cpuTempC,
             totalRam = totRam,
             availRam = avRam,
             totalStorage = totStore,
             availStorage = avStore,
-            ipAddress = getIpAddress(),
+            ipAddress = "Air-Gapped (No Network)",
             uptime = SystemClock.elapsedRealtime(),
             refreshRate = getRefreshRate()
         )
     }
 
     fun forceUpdate() {
-        updateDataFromIntent(null)
+        refreshSystemSpecs()
     }
 
     private var monitoringJob: Job? = null
@@ -197,23 +216,6 @@ class ThermalMonitor private constructor(private val context: Context) {
             e.printStackTrace()
         }
         return if (foundReading) cpuTemp else -1f
-    }
-
-    private fun getIpAddress(): String {
-        try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val networkInterface = interfaces.nextElement()
-                val addresses = networkInterface.inetAddresses
-                while (addresses.hasMoreElements()) {
-                    val address = addresses.nextElement()
-                    if (!address.isLoopbackAddress && address.hostAddress?.indexOf(':') == -1) {
-                        return address.hostAddress ?: "Unknown"
-                    }
-                }
-            }
-        } catch (e: Exception) {}
-        return "Disconnected"
     }
 
     private fun getRefreshRate(): Float {

@@ -403,10 +403,11 @@ private fun getFilesForCategory(context: Context, categoryName: String): List<Fi
                 val date = cursor.getLong(dateCol) * 1000L // convert to ms
                 val contentUri = ContentUris.withAppendedId(baseUri, id)
                 
-                // For documents, filter out media types
+                // For documents, check extensions explicitly
                 if (categoryName == "Documents") {
-                    val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(File(path).extension.lowercase()) ?: ""
-                    if (!mimeType.startsWith("image/") && !mimeType.startsWith("video/") && !mimeType.startsWith("audio/")) {
+                    val ext = File(path).extension.lowercase()
+                    val docExtensions = setOf("pdf", "txt", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "csv", "rtf")
+                    if (ext in docExtensions) {
                         fileList.add(FileInfo(id, name, size, path, date, contentUri))
                     }
                 } else {

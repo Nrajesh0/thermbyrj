@@ -76,34 +76,39 @@ class ThermalTrackerService : Service() {
         return START_STICKY
     }
 
+    private var lastRecordedTime = 0L
+    private var lastRecordedTemp = -100f
+    private var lastWidgetTemp = -100f
+
     private fun startTrackingLoop() {
         serviceScope.launch {
-            var ticks = 0
-            var nextWakeTime = android.os.SystemClock.uptimeMillis()
-            while (true) {
-                nextWakeTime += 2000
-                val delayTime = nextWakeTime - android.os.SystemClock.uptimeMillis()
-                if (delayTime > 0) delay(delayTime)
+            thermalMonitor.liveData.collect { live ->
+                if (live.batteryTemp <= 0f) return@collect
 
-                thermalMonitor.forceUpdate()
-                val live = thermalMonitor.liveData.value
-                
                 checkThermalAlerts(live.batteryTemp)
 
-                ticks++
-                if (ticks >= 30) {
-                    if (live.batteryTemp > 0) {
-                        repository.insertRecord(
-                            ThermalRecord(
-                                timestamp = System.currentTimeMillis(),
-                                batteryTemp = live.batteryTemp,
-                                cpuTemp = live.cpuTemp,
-                                batteryLevel = live.batteryLevel
-                            )
+                val now = System.currentTimeMillis()
+                val tempDiff = kotlin.math.abs(live.batteryTemp - lastRecordedTemp)
+                val timeDiff = now - lastRecordedTime
+
+                // Record to DB if 60 seconds have passed or temperature changed by >= 0.5°C
+                if (timeDiff >= 60_000L || (tempDiff >= 0.5f && timeDiff >= 15_000L)) {
+                    repository.insertRecord(
+                        ThermalRecord(
+                            timestamp = now,
+                            batteryTemp = live.batteryTemp,
+                            cpuTemp = live.cpuTemp,
+                            batteryLevel = live.batteryLevel
                         )
-                        updateWidget(live.batteryTemp)
-                    }
-                    ticks = 0
+                    )
+                    lastRecordedTime = now
+                    lastRecordedTemp = live.batteryTemp
+                }
+
+                // Update widget if temperature changed noticeably
+                if (kotlin.math.abs(live.batteryTemp - lastWidgetTemp) >= 0.1f) {
+                    updateWidget(live.batteryTemp)
+                    lastWidgetTemp = live.batteryTemp
                 }
             }
         }

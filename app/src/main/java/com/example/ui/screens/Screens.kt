@@ -259,6 +259,10 @@ fun DeviceScreen(viewModel: ThermalViewModel) {
     val context = LocalContext.current
     val displayMetrics = context.resources.displayMetrics
 
+    LaunchedEffect(Unit) {
+        viewModel.thermalMonitor.refreshSystemSpecs()
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -364,12 +368,12 @@ fun DeviceScreen(viewModel: ThermalViewModel) {
 
         GlassCard(modifier = Modifier.fillMaxWidth()) {
             Text(
-                text = "CONNECTIVITY & DISPLAY", 
+                text = "NETWORK & DISPLAY", 
                 color = TextTertiary, 
                 style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 2.sp, fontWeight = FontWeight.Bold)
             )
             Spacer(modifier = Modifier.height(16.dp))
-            InfoRow("IP ADDRESS", liveData.ipAddress)
+            InfoRow("NETWORK STATUS", liveData.ipAddress)
             InfoRow("REFRESH RATE", "${liveData.refreshRate} Hz")
             InfoRow("RESOLUTION", "${displayMetrics.widthPixels} x ${displayMetrics.heightPixels}")
             InfoRow("DENSITY", "${displayMetrics.densityDpi} dpi")

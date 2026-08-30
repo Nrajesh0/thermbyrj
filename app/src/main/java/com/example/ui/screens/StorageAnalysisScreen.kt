@@ -148,7 +148,7 @@ fun StorageAnalysisScreen(onBack: () -> Unit) {
                 val imageSize = getMediaSize(context, MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
                 val videoSize = getMediaSize(context, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
                 val audioSize = getMediaSize(context, MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
-                val docsSize = getMediaSize(context, MediaStore.Files.getContentUri("external")) - imageSize - videoSize - audioSize
+                val docsSize = getDocumentSize(context)
 
                 val otherUsed = maxOf(0L, usedSpace - (imageSize + videoSize + audioSize + docsSize))
                 
@@ -351,6 +351,29 @@ private fun getMediaSize(context: Context, uri: android.net.Uri): Long {
             val sizeColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
             while (cursor.moveToNext()) {
                 size += cursor.getLong(sizeColumn)
+            }
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+    }
+    return size
+}
+
+private fun getDocumentSize(context: Context): Long {
+    var size = 0L
+    try {
+        val uri = MediaStore.Files.getContentUri("external")
+        val projection = arrayOf(MediaStore.MediaColumns.SIZE, MediaStore.MediaColumns.DATA)
+        context.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+            val sizeColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
+            val dataColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA)
+            val docExtensions = setOf("pdf", "txt", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "csv", "rtf")
+            while (cursor.moveToNext()) {
+                val path = cursor.getString(dataColumn) ?: ""
+                val ext = java.io.File(path).extension.lowercase()
+                if (ext in docExtensions) {
+                    size += cursor.getLong(sizeColumn)
+                }
             }
         }
     } catch (e: Exception) {
