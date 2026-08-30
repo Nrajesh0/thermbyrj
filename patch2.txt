@@ -1,0 +1,15 @@
+        Box(
+            modifier = Modifier.size(48.dp).clip(RoundedCornerShape(8.dp)).background(GlassBorder),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(Icons.Default.InsertDriveFile, contentDescription = null, tint = AuraCyan, modifier = Modifier.size(24.dp))
+            AsyncImage(
+                model = ImageRequest.Builder(LocalContext.current)
+                    .data(file.contentUri)
+                    .crossfade(true)
+                    .build(),
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
