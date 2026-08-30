@@ -27,32 +27,32 @@ jobs:
         with:
           gradle-version: '9.3.1'
           validate-wrappers: false
-          # cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
 
-      # - name: Decode Keystore File
-      #   run: |
-      #     echo "${{ secrets.SIGNING_KEY }}" | base64 --decode > keystore.jks
-
-      - name: Build Debug APK
-        # env:
-        #   KEYSTORE_PATH: ${{ github.workspace }}/keystore.jks
-        #   STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
-        #   KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-        #   KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      - name: Decode Keystore File
         run: |
-          gradle assembleDebug --no-daemon
+          echo "${{ secrets.SIGNING_KEY }}" | base64 --decode > keystore.jks
+
+      - name: Build and Sign Release APK
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/keystore.jks
+          STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          gradle assembleRelease --no-daemon
 
       - name: Upload APK as Workflow Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: therm-by-rj-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          name: therm-by-rj-signed-apk
+          path: app/build/outputs/apk/release/*.apk
           retention-days: 14
 
       - name: Upload APK to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: app/build/outputs/apk/debug/*.apk
+          files: app/build/outputs/apk/release/*.apk
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
