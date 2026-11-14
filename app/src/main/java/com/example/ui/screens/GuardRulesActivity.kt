@@ -227,8 +227,8 @@ fun GuardRulesScreen(onBack: () -> Unit) {
     }
 
     LaunchedEffect(refreshTrigger) {
-        withContext(Dispatchers.IO) {
-            discoveredSystemApps = GuardSystemAppDiscovery.discoverSystemSensorApps(context)
+        discoveredSystemApps = withContext(Dispatchers.IO) {
+            GuardSystemAppDiscovery.discoverSystemSensorApps(context)
         }
     }
 

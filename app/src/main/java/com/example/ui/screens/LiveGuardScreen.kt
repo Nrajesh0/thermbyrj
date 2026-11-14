@@ -272,18 +272,19 @@ fun LiveGuardScreen() {
         captureState.isClipboardAccessedRecently
     ) {
         if (!isScanning) {
-            withContext(Dispatchers.IO) {
-                val vectors = guardMonitor.runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = false)
-                val timeline = PrivacyAnalyzer.getPermissionAccessTimeline(
+            val (vectors, timeline) = withContext(Dispatchers.IO) {
+                val v = guardMonitor.runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = false)
+                val t = PrivacyAnalyzer.getPermissionAccessTimeline(
                     context,
                     includeSystemApps = false,
                     forceRefresh = globalRefreshVersion > 0
                 )
-                auditVectors = vectors
-                accessTimeline = timeline
-                if (selectedVector != null) {
-                    selectedVector = vectors.find { it.id == selectedVector?.id }
-                }
+                v to t
+            }
+            auditVectors = vectors
+            accessTimeline = timeline
+            if (selectedVector != null) {
+                selectedVector = vectors.find { it.id == selectedVector?.id }
             }
         }
     }

@@ -116,7 +116,10 @@ enum class InAppViewerType {
 data class ActiveFilePreview(
     val file: File,
     val contentUri: Uri? = null,
-    val type: InAppViewerType
+    val type: InAppViewerType,
+    val inMemoryBitmap: Bitmap? = null,
+    val inMemoryText: String? = null,
+    val displaySizeOverride: Long? = null
 )
 
 fun resolveInAppViewerType(file: File): InAppViewerType? {
@@ -167,18 +170,26 @@ fun BuiltInFilePreviewHost(
         InAppViewerType.IMAGE -> InAppImageViewerDialog(
             file = preview.file,
             contentUri = preview.contentUri,
+            inMemoryBitmap = preview.inMemoryBitmap,
+            displaySizeOverride = preview.displaySizeOverride,
             onDismiss = onDismiss,
             onShare = onShare?.let { fn -> { fn(preview.file, preview.contentUri) } },
             onVault = onVault?.let { fn -> { fn(preview.file, preview.contentUri); onDismiss() } },
             onDelete = onDelete?.let { fn -> { fn(preview.file, preview.contentUri); onDismiss() } },
             onDetails = onShowDetails?.let { fn -> { fn(preview.file) } },
-            onOpenExternal = { openExternalWithProvider(context, preview.file, preview.contentUri, "image/*") }
+            onOpenExternal = if (preview.inMemoryBitmap != null && !preview.file.exists()) null else {
+                { openExternalWithProvider(context, preview.file, preview.contentUri, "image/*") }
+            }
         )
 
         InAppViewerType.TEXT -> InAppTextViewerDialog(
             file = preview.file,
+            inMemoryText = preview.inMemoryText,
+            displaySizeOverride = preview.displaySizeOverride,
             onDismiss = onDismiss,
-            onOpenExternal = { openExternalWithProvider(context, preview.file, preview.contentUri, "text/plain") },
+            onOpenExternal = if (preview.inMemoryText != null && !preview.file.exists()) null else {
+                { openExternalWithProvider(context, preview.file, preview.contentUri, "text/plain") }
+            },
             onSaved = { onFileSaved?.invoke(preview.file) }
         )
 
@@ -211,19 +222,25 @@ fun BuiltInFilePreviewHost(
 private fun InAppImageViewerDialog(
     file: File,
     contentUri: Uri?,
+    inMemoryBitmap: Bitmap? = null,
+    displaySizeOverride: Long? = null,
     onDismiss: () -> Unit,
     onShare: (() -> Unit)?,
     onVault: (() -> Unit)?,
     onDelete: (() -> Unit)?,
     onDetails: (() -> Unit)?,
-    onOpenExternal: () -> Unit
+    onOpenExternal: (() -> Unit)?
 ) {
     val context = LocalContext.current
-    var bitmap by remember(file.absolutePath, contentUri) { mutableStateOf<Bitmap?>(null) }
+    var bitmap by remember(file.absolutePath, contentUri, inMemoryBitmap) { mutableStateOf(inMemoryBitmap) }
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
 
-    LaunchedEffect(file.absolutePath, contentUri) {
+    LaunchedEffect(file.absolutePath, contentUri, inMemoryBitmap) {
+        if (inMemoryBitmap != null) {
+            bitmap = inMemoryBitmap
+            return@LaunchedEffect
+        }
         bitmap = withContext(Dispatchers.IO) {
             try {
                 val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -252,7 +269,10 @@ private fun InAppImageViewerDialog(
 
     Dialog(
         onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false)
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false
+        )
     ) {
         Box(
             modifier = Modifier
@@ -262,6 +282,7 @@ private fun InAppImageViewerDialog(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
+                    .padding(top = 72.dp, bottom = 112.dp)
                     .pointerInput(Unit) {
                         detectTransformGestures { _, pan, zoom, _ ->
                             val newScale = (scale * zoom).coerceIn(1f, 4f)
@@ -295,9 +316,9 @@ private fun InAppImageViewerDialog(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .fillMaxWidth()
-                    .background(Color.Black.copy(alpha = 0.65f))
+                    .background(Color.Black.copy(alpha = 0.72f))
                     .statusBarsPadding()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 IconButton(onClick = onDismiss) {
@@ -312,37 +333,46 @@ private fun InAppImageViewerDialog(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    if (file.exists()) {
-                        Text(formatBytes(file.length()), color = TextSecondary, style = MaterialTheme.typography.labelSmall)
+                    val shownSize = displaySizeOverride ?: if (file.exists()) file.length() else null
+                    if (shownSize != null && shownSize > 0L) {
+                        Text(formatBytes(shownSize), color = TextSecondary, style = MaterialTheme.typography.labelSmall)
                     }
                 }
-                IconButton(onClick = onOpenExternal) {
-                    Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = "Open External", tint = AuraCyan)
+                if (onOpenExternal != null) {
+                    IconButton(onClick = onOpenExternal) {
+                        Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = "Open External", tint = AuraCyan)
+                    }
                 }
             }
 
-            // Bottom quick action bar
-            Row(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .background(Color.Black.copy(alpha = 0.72f))
-                    .navigationBarsPadding()
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                onShare?.let {
-                    ViewerBottomAction(Icons.Default.Share, "Share", AuraCyan, it)
-                }
-                onVault?.let {
-                    ViewerBottomAction(Icons.Default.Lock, "Vault", AuraPurple, it)
-                }
-                onDetails?.let {
-                    ViewerBottomAction(Icons.Default.Info, "Details", TextPrimary, it)
-                }
-                onDelete?.let {
-                    ViewerBottomAction(Icons.Default.Delete, "Delete", AuraRose, it)
+            // Floating bottom quick action bar (elevated above gesture bar / rounded screen corners)
+            val hasAnyActions = onShare != null || onVault != null || onDetails != null || onDelete != null
+            if (hasAnyActions) {
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .navigationBarsPadding()
+                        .padding(start = 20.dp, end = 20.dp, bottom = 28.dp, top = 8.dp)
+                        .clip(RoundedCornerShape(22.dp))
+                        .background(GlassPanel.copy(alpha = 0.94f))
+                        .border(1.dp, GlassBorder, RoundedCornerShape(22.dp))
+                        .padding(horizontal = 8.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    onShare?.let {
+                        ViewerBottomAction(Modifier.weight(1f), Icons.Default.Share, "Share", AuraCyan, it)
+                    }
+                    onVault?.let {
+                        ViewerBottomAction(Modifier.weight(1f), Icons.Default.Lock, "Vault", AuraPurple, it)
+                    }
+                    onDetails?.let {
+                        ViewerBottomAction(Modifier.weight(1f), Icons.Default.Info, "Details", TextPrimary, it)
+                    }
+                    onDelete?.let {
+                        ViewerBottomAction(Modifier.weight(1f), Icons.Default.Delete, "Delete", AuraRose, it)
+                    }
                 }
             }
         }
@@ -351,6 +381,7 @@ private fun InAppImageViewerDialog(
 
 @Composable
 private fun ViewerBottomAction(
+    modifier: Modifier = Modifier,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     label: String,
     tint: Color,
@@ -358,32 +389,45 @@ private fun ViewerBottomAction(
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier
-            .clip(RoundedCornerShape(12.dp))
+        modifier = modifier
+            .clip(RoundedCornerShape(14.dp))
             .clickable { onClick() }
-            .padding(horizontal = 14.dp, vertical = 6.dp)
+            .padding(horizontal = 6.dp, vertical = 8.dp)
     ) {
         Icon(icon, contentDescription = label, tint = tint, modifier = Modifier.size(20.dp))
-        Spacer(modifier = Modifier.height(3.dp))
-        Text(label, color = tint, style = MaterialTheme.typography.labelSmall)
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = label,
+            color = tint,
+            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }
 
 @Composable
 private fun InAppTextViewerDialog(
     file: File,
+    inMemoryText: String? = null,
+    displaySizeOverride: Long? = null,
     onDismiss: () -> Unit,
-    onOpenExternal: () -> Unit,
+    onOpenExternal: (() -> Unit)?,
     onSaved: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var content by remember(file.absolutePath) { mutableStateOf("") }
+    var content by remember(file.absolutePath, inMemoryText) { mutableStateOf(inMemoryText ?: "") }
     var isEditing by remember { mutableStateOf(false) }
     var truncated by remember { mutableStateOf(false) }
     var readError by remember { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(file.absolutePath) {
+    LaunchedEffect(file.absolutePath, inMemoryText) {
+        if (inMemoryText != null) {
+            content = inMemoryText
+            readError = null
+            return@LaunchedEffect
+        }
         withContext(Dispatchers.IO) {
             try {
                 val maxRead = 512 * 1024
@@ -433,13 +477,14 @@ private fun InAppTextViewerDialog(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+                    val shownSize = displaySizeOverride ?: file.length()
                     Text(
-                        "${formatBytes(file.length())}${if (truncated) " • Preview truncated at 512 KB" else ""}",
+                        "${formatBytes(shownSize)}${if (truncated) " • Preview truncated at 512 KB" else ""}",
                         color = TextTertiary,
                         style = MaterialTheme.typography.labelSmall
                     )
                 }
-                if (!truncated && file.canWrite() && readError == null) {
+                if (inMemoryText == null && !truncated && file.exists() && file.canWrite() && readError == null) {
                     IconButton(onClick = {
                         if (isEditing) {
                             scope.launch(Dispatchers.IO) {
@@ -472,8 +517,10 @@ private fun InAppTextViewerDialog(
                         )
                     }
                 }
-                IconButton(onClick = onOpenExternal) {
-                    Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = "Open External", tint = TextSecondary)
+                if (onOpenExternal != null) {
+                    IconButton(onClick = onOpenExternal) {
+                        Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = "Open External", tint = TextSecondary)
+                    }
                 }
             }
 

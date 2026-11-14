@@ -506,7 +506,7 @@ fun FilesScreen() {
             val docsSize = if (canScanMedia) queryDocsSize(context) else 0L
             val downloadsSize = if (canScanMedia) FileManagerOps.queryDownloadsSize(context) else 0L
             val apksSize = if (canScanMedia) FileManagerOps.queryApksSize(context) else 0L
-            val recents = if (canScanMedia) FileManagerOps.queryRecentFiles(context, limit = 12) else emptyList()
+            val recents = emptyList<RecentMediaFile>()
 
             val mediaTotal = imageSize + videoSize + audioSize + docsSize
             val otherUsed = max(0L, used - mediaTotal)
@@ -1406,25 +1406,6 @@ fun FilesScreen() {
                                 tag = "tool_apps"
                             ) {
                                 context.startActivity(Intent(context, AppListActivity::class.java))
-                            }
-                        }
-                    }
-
-                    if (recentFiles.isNotEmpty()) {
-                        item {
-                            Text(
-                                "RECENT FILES",
-                                style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 2.sp, fontWeight = FontWeight.Bold),
-                                color = TextTertiary
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                items(recentFiles, key = { it.contentUri.toString() }) { recent ->
-                                    RecentFileChipCard(recent) {
-                                        val f = File(recent.path)
-                                        openFileSmart(f, recent.contentUri)
-                                    }
-                                }
                             }
                         }
                     }

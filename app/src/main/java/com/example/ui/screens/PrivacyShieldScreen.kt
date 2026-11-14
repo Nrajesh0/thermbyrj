@@ -157,31 +157,32 @@ fun PrivacyShieldScreen() {
     LaunchedEffect(refreshTrigger, globalRefreshVersion, includeSystemApps) {
         isLoading = summary == null
         val forceFresh = refreshTrigger > 1 || globalRefreshVersion > 0
-        withContext(Dispatchers.IO) {
-            val privResult = PrivacyAnalyzer.analyzeDevicePrivacy(
+        val (privResult, changes, telemResult) = withContext(Dispatchers.IO) {
+            val priv = PrivacyAnalyzer.analyzeDevicePrivacy(
                 context,
                 includeSystemApps = includeSystemApps,
                 forceRefresh = forceFresh
             )
-            val changes = PrivacyAnalyzer.getPrivacyChanges(
+            val chg = PrivacyAnalyzer.getPrivacyChanges(
                 context = context,
-                currentReports = privResult.appReports,
+                currentReports = priv.appReports,
                 dispatchNotifications = true
             )
-            val telemResult = PrivacyAnalyzer.analyzeAppTelemetryAndTrackers(
+            val telem = PrivacyAnalyzer.analyzeAppTelemetryAndTrackers(
                 context,
                 includeSystemApps = includeSystemApps,
                 forceRefresh = forceFresh
             )
-            summary = privResult
-            changeEvents = changes
-            telemetrySummary = telemResult
-            if (selectedAppForModal != null) {
-                selectedAppForModal = privResult.appReports.find { r -> r.packageName == selectedAppForModal?.packageName }
-            }
-            if (selectedTrackerApp != null) {
-                selectedTrackerApp = telemResult.appReports.find { r -> r.packageName == selectedTrackerApp?.packageName }
-            }
+            Triple(priv, chg, telem)
+        }
+        summary = privResult
+        changeEvents = changes
+        telemetrySummary = telemResult
+        if (selectedAppForModal != null) {
+            selectedAppForModal = privResult.appReports.find { r -> r.packageName == selectedAppForModal?.packageName }
+        }
+        if (selectedTrackerApp != null) {
+            selectedTrackerApp = telemResult.appReports.find { r -> r.packageName == selectedTrackerApp?.packageName }
         }
         isLoading = false
     }

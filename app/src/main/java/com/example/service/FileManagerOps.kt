@@ -261,14 +261,20 @@ object FileManagerOps {
     }
 
     /**
-     * Encrypts a file into the AES-256-GCM Vault and cleans up both disk plaintext and MediaStore index.
+     * Encrypts a file into the AES-256-GCM Vault, records original path metadata,
+     * and securely shreds/cleans up both disk plaintext and MediaStore index.
      */
     fun encryptFileToVault(context: Context, sourceFile: File, contentUri: Uri? = null): Boolean {
         return try {
             if (!sourceFile.exists() || !sourceFile.isFile) return false
+            val originalName = sourceFile.name
+            val originalParent = sourceFile.parentFile?.absolutePath
+            val originalSize = sourceFile.length()
             val uuid = UUID.randomUUID().toString()
             val vaultDir = VaultManager.getVaultDir(context)
             val destFile = File(vaultDir, "$uuid.enc")
+            if (destFile.exists()) destFile.delete()
+
             val encryptedFile = EncryptedFile.Builder(
                 context,
                 destFile,
@@ -281,17 +287,36 @@ object FileManagerOps {
                     input.copyTo(output)
                 }
             }
-            VaultManager.getRegistry(context).edit().putString(uuid, sourceFile.name).apply()
 
-            // Cleanup plaintext copy & MediaStore index cleanly
+            if (!destFile.exists() || (originalSize > 0L && destFile.length() == 0L)) {
+                destFile.delete()
+                return false
+            }
+
+            VaultManager.registerVaultEntry(
+                context = context,
+                uuid = uuid,
+                originalName = originalName,
+                originalParentPath = originalParent,
+                originalSizeBytes = originalSize
+            )
+
+            // Securely shred plaintext blocks (NIST 1-Pass) + clean up MediaStore index
             val targetUri = contentUri ?: FileShredder.findMediaContentUriForFile(context, sourceFile)
-            val deleted = sourceFile.delete()
-            if (deleted) {
-                FileShredder.cleanupMediaStoreEntry(context, sourceFile.absolutePath, targetUri)
-            } else if (targetUri != null) {
-                try {
-                    context.contentResolver.delete(targetUri, null, null)
-                } catch (_: Exception) {
+            val shredResult = FileShredder.shredTargets(
+                context = context,
+                targets = listOf(ShredTarget(sourceFile, targetUri)),
+                standard = ShredStandard.NIST_SP_800_88
+            )
+            if (shredResult.shreddedCount == 0 && sourceFile.exists()) {
+                val deleted = sourceFile.delete()
+                if (deleted) {
+                    FileShredder.cleanupMediaStoreEntry(context, sourceFile.absolutePath, targetUri)
+                } else if (targetUri != null) {
+                    try {
+                        context.contentResolver.delete(targetUri, null, null)
+                    } catch (_: Exception) {
+                    }
                 }
             }
             StorageScanCache.invalidate()

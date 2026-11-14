@@ -211,63 +211,9 @@ class ThermalTrackerService : Service() {
     }
 
     private fun sendGuardNotification(payload: GuardAlertPayload) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            return
+        if (::liveGuardMonitor.isInitialized) {
+            liveGuardMonitor.sendGuardNotificationDirect(payload)
         }
-        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-
-        val rulesIntent = Intent(this, GuardRulesActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        }
-        val contentPi = PendingIntent.getActivity(
-            this,
-            3001,
-            rulesIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val snoozeIntent = Intent(this, GuardAlertActionReceiver::class.java).apply {
-            action = GuardAlertActionReceiver.ACTION_SNOOZE_1H
-            putExtra(GuardAlertActionReceiver.EXTRA_PACKAGE_NAME, payload.packageName)
-            putExtra(GuardAlertActionReceiver.EXTRA_SENSOR_TYPE, payload.sensorType.name)
-            putExtra(GuardAlertActionReceiver.EXTRA_NOTIFICATION_ID, GUARD_ALERT_NOTIFICATION_ID)
-        }
-        val snoozePi = PendingIntent.getBroadcast(
-            this,
-            3002 + (payload.packageName?.hashCode() ?: payload.sensorType.ordinal),
-            snoozeIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val builder = NotificationCompat.Builder(this, GUARD_ALERT_CHANNEL_ID)
-            .setContentTitle(payload.title)
-            .setContentText(payload.message)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(payload.message))
-            .setSmallIcon(android.R.drawable.ic_dialog_alert)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setAutoCancel(true)
-            .setContentIntent(contentPi)
-            .addAction(0, "Snooze 1h", snoozePi)
-
-        if (!payload.packageName.isNullOrBlank()) {
-            val trustIntent = Intent(this, GuardAlertActionReceiver::class.java).apply {
-                action = GuardAlertActionReceiver.ACTION_TRUST_APP
-                putExtra(GuardAlertActionReceiver.EXTRA_PACKAGE_NAME, payload.packageName)
-                putExtra(GuardAlertActionReceiver.EXTRA_SENSOR_TYPE, payload.sensorType.name)
-                putExtra(GuardAlertActionReceiver.EXTRA_NOTIFICATION_ID, GUARD_ALERT_NOTIFICATION_ID)
-            }
-            val trustPi = PendingIntent.getBroadcast(
-                this,
-                3100 + payload.packageName.hashCode(),
-                trustIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            builder.addAction(0, "Trust App", trustPi)
-        }
-
-        notificationManager.notify(GUARD_ALERT_NOTIFICATION_ID, builder.build())
     }
 
     private fun createNotification(content: String): Notification {
