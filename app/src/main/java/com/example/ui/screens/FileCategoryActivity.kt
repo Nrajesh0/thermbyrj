@@ -1,26 +1,27 @@
 package com.example.ui.screens
 
 import android.app.Activity
-import android.app.RecoverableSecurityException
 import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.provider.MediaStore
-import android.webkit.MimeTypeMap
+import android.util.Size
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,7 +31,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -43,22 +44,36 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.ViewList
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
+import androidx.compose.material.icons.automirrored.filled.Sort
+import androidx.compose.material.icons.filled.AudioFile
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteForever
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.GridView
-import androidx.compose.material.icons.filled.InsertDriveFile
-import androidx.compose.material.icons.filled.Sort
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.PlayCircleOutline
+import androidx.compose.material.icons.filled.RadioButtonUnchecked
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.SelectAll
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.VideoLibrary
+import androidx.compose.material.icons.automirrored.filled.ViewList
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.FilterChipDefaults
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -68,6 +83,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -76,20 +92,18 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
-import coil.ImageLoader
-import coil.compose.AsyncImage
-import coil.decode.VideoFrameDecoder
-import coil.request.ImageRequest
+import com.example.GlassCard
 import com.example.formatBytes
 import com.example.ui.theme.AppTheme
 import com.example.ui.theme.AuraCyan
+import com.example.ui.theme.AuraGreen
 import com.example.ui.theme.AuraOrange
 import com.example.ui.theme.AuraRose
 import com.example.ui.theme.GlassBorder
@@ -97,6 +111,7 @@ import com.example.ui.theme.GlassPanel
 import com.example.ui.theme.Obsidian
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import com.example.ui.theme.TextTertiary
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -106,165 +121,310 @@ import java.security.SecureRandom
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.UUID
+
+data class FileItem(
+    val id: Long,
+    val name: String,
+    val size: Long,
+    val dateModified: Long,
+    val path: String,
+    val contentUri: Uri,
+    val mimeType: String
+)
 
 class FileCategoryActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
         val categoryName = intent.getStringExtra("CATEGORY_NAME") ?: "Files"
+        enableEdgeToEdge()
         setContent {
             AppTheme {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = Obsidian
-                ) {
-                    FileCategoryScreen(
-                        categoryName = categoryName,
-                        onBack = { finish() }
-                    )
+                Surface(modifier = Modifier.fillMaxSize(), color = Obsidian) {
+                    FileCategoryScreen(categoryName = categoryName, onBack = { finish() })
                 }
             }
         }
     }
 }
 
-data class FileInfo(
-    val id: Long,
-    val name: String,
-    val size: Long,
-    val path: String,
-    val dateModified: Long,
-    val contentUri: Uri
-)
-
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
     val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
-    var files by remember { mutableStateOf<List<FileInfo>>(emptyList()) }
+    val scope = rememberCoroutineScope()
+    var files by remember { mutableStateOf<List<FileItem>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
-    var fileToDelete by remember { mutableStateOf<FileInfo?>(null) }
+    var searchQuery by remember { mutableStateOf("") }
+    var sortOption by remember { mutableStateOf("Size (High to Low)") }
+    var showSortMenu by remember { mutableStateOf(false) }
 
-    var viewMode by remember { mutableStateOf("List") }
-    var filterOption by remember { mutableStateOf("All") }
-    var sortOption by remember { mutableStateOf("Date") }
-
-    val sharedImageLoader = remember(context) {
-        ImageLoader.Builder(context)
-            .components { add(VideoFrameDecoder.Factory()) }
-            .build()
+    var isGridView by remember {
+        mutableStateOf(categoryName == "Images" || categoryName == "Videos")
     }
 
-    val loadFiles: () -> Unit = {
-        coroutineScope.launch {
-            isLoading = true
-            files = withContext(Dispatchers.IO) {
-                getFilesForCategory(context, categoryName)
-            }
+    var selectedItems by remember { mutableStateOf<Set<FileItem>>(emptySet()) }
+    val isSelectionMode = selectedItems.isNotEmpty()
+
+    var showShredDialog by remember { mutableStateOf(false) }
+    var isShredding by remember { mutableStateOf(false) }
+    var shredProgress by remember { mutableFloatStateOf(0f) }
+
+    val deleteLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            files = files.filterNot { it in selectedItems }
+            selectedItems = emptySet()
+            Toast.makeText(context, "Files deleted", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(context, "Deletion cancelled or denied", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    BackHandler(enabled = isSelectionMode) {
+        selectedItems = emptySet()
+    }
+
+    LaunchedEffect(categoryName) {
+        isLoading = true
+        withContext(Dispatchers.IO) {
+            files = fetchFilesForCategory(context, categoryName)
             isLoading = false
         }
     }
 
-    val deleteIntentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartIntentSenderForResult()
-    ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            Toast.makeText(context, "File deleted", Toast.LENGTH_SHORT).show()
-            loadFiles()
+    val sortedFiles = remember(files, sortOption, searchQuery) {
+        val filtered = if (searchQuery.isBlank()) {
+            files
         } else {
-            Toast.makeText(context, "Deletion cancelled", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    LaunchedEffect(categoryName) { loadFiles() }
-
-    val filteredFiles = remember(files, filterOption, sortOption) {
-        val filtered = when (filterOption) {
-            "> 50MB" -> files.filter { it.size > 50L * 1024L * 1024L }
-            "Recent" -> {
-                val weekAgo = System.currentTimeMillis() - (7L * 24 * 60 * 60 * 1000L)
-                files.filter { it.dateModified > weekAgo }
-            }
-            else -> files
+            val q = searchQuery.trim().lowercase()
+            files.filter { it.name.lowercase().contains(q) }
         }
         when (sortOption) {
-            "Size" -> filtered.sortedByDescending { it.size }
-            "Name" -> filtered.sortedBy { it.name.lowercase() }
-            else -> filtered.sortedByDescending { it.dateModified }
+            "Size (High to Low)" -> filtered.sortedByDescending { it.size }
+            "Size (Low to High)" -> filtered.sortedBy { it.size }
+            "Date (Newest)" -> filtered.sortedByDescending { it.dateModified }
+            "Date (Oldest)" -> filtered.sortedBy { it.dateModified }
+            "Name (A-Z)" -> filtered.sortedBy { it.name.lowercase() }
+            else -> filtered
         }
     }
 
-    if (fileToDelete != null) {
-        val target = fileToDelete!!
-        val hasAllFilesAccess = Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
-        AlertDialog(
-            onDismissRequest = { fileToDelete = null },
-            title = { Text(if (hasAllFilesAccess) "Secure Delete" else "Delete File", color = TextPrimary) },
-            text = {
-                Text(
-                    if (hasAllFilesAccess) {
-                        "Are you sure you want to securely wipe '${target.name}'? This overwrites the file before removal and cannot be undone."
-                    } else {
-                        "Delete '${target.name}' from device storage?"
-                    },
-                    color = TextSecondary
-                )
-            },
-            containerColor = GlassPanel,
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        fileToDelete = null
-                        if (hasAllFilesAccess) {
-                            coroutineScope.launch {
-                                isLoading = true
-                                val success = withContext(Dispatchers.IO) {
-                                    secureDeleteFile(context, target)
-                                }
-                                Toast.makeText(
-                                    context,
-                                    if (success) "File securely wiped" else "Secure wipe failed",
-                                    Toast.LENGTH_SHORT
-                                ).show()
-                                loadFiles()
-                            }
-                        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                            try {
-                                val pi = MediaStore.createDeleteRequest(context.contentResolver, listOf(target.contentUri))
-                                deleteIntentLauncher.launch(IntentSenderRequest.Builder(pi.intentSender).build())
-                            } catch (e: Exception) {
-                                Toast.makeText(context, "Unable to delete file: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
-                            }
-                        } else {
-                            coroutineScope.launch {
-                                try {
-                                    val rows = withContext(Dispatchers.IO) {
-                                        context.contentResolver.delete(target.contentUri, null, null)
-                                    }
-                                    if (rows > 0) {
-                                        Toast.makeText(context, "File deleted", Toast.LENGTH_SHORT).show()
-                                        loadFiles()
-                                    }
-                                } catch (e: Exception) {
-                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && e is RecoverableSecurityException) {
-                                        val request = IntentSenderRequest.Builder(e.userAction.actionIntent.intentSender).build()
-                                        deleteIntentLauncher.launch(request)
-                                    } else {
-                                        Toast.makeText(context, "Delete failed", Toast.LENGTH_SHORT).show()
-                                    }
-                                }
-                            }
+    fun toggleSelection(item: FileItem) {
+        selectedItems = if (selectedItems.contains(item)) {
+            selectedItems - item
+        } else {
+            selectedItems + item
+        }
+    }
+
+    fun openFile(item: FileItem) {
+        try {
+            val uri: Uri = if (item.path.isNotBlank() && File(item.path).exists()) {
+                FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", File(item.path))
+            } else {
+                item.contentUri
+            }
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, item.mimeType)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(Intent.createChooser(intent, "Open with"))
+        } catch (_: Exception) {
+            Toast.makeText(context, "No application available to open this file", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun shareSelectedFiles() {
+        val uris = ArrayList<Uri>()
+        selectedItems.forEach { item ->
+            try {
+                val uri = if (item.path.isNotBlank() && File(item.path).exists()) {
+                    FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", File(item.path))
+                } else {
+                    item.contentUri
+                }
+                uris.add(uri)
+            } catch (_: Exception) {
+            }
+        }
+        if (uris.isEmpty()) return
+        try {
+            val intent = if (uris.size == 1) {
+                Intent(Intent.ACTION_SEND).apply {
+                    type = selectedItems.first().mimeType
+                    putExtra(Intent.EXTRA_STREAM, uris.first())
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+            } else {
+                Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                    type = "*/*"
+                    putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+            }
+            context.startActivity(Intent.createChooser(intent, "Share Files"))
+        } catch (_: Exception) {
+            Toast.makeText(context, "Unable to share selected files", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun deleteSelectedStandard() {
+        val itemsToDelete = selectedItems.toList()
+        scope.launch(Dispatchers.IO) {
+            val failedUris = mutableListOf<Uri>()
+            val deletedItems = mutableSetOf<FileItem>()
+
+            for (item in itemsToDelete) {
+                try {
+                    var deleted = false
+                    if (item.path.isNotBlank()) {
+                        val f = File(item.path)
+                        if (f.exists() && f.delete()) {
+                            deleted = true
                         }
                     }
-                ) {
-                    Text(if (hasAllFilesAccess) "Wipe File" else "Delete", color = AuraRose)
+                    val rows = context.contentResolver.delete(item.contentUri, null, null)
+                    if (rows > 0 || deleted) {
+                        deletedItems.add(item)
+                    } else {
+                        failedUris.add(item.contentUri)
+                    }
+                } catch (_: SecurityException) {
+                    failedUris.add(item.contentUri)
+                } catch (_: Exception) {
+                    failedUris.add(item.contentUri)
+                }
+            }
+
+            withContext(Dispatchers.Main) {
+                if (deletedItems.isNotEmpty()) {
+                    files = files.filterNot { it in deletedItems }
+                    selectedItems = selectedItems - deletedItems
+                }
+                if (failedUris.isNotEmpty() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    try {
+                        val pendingIntent = MediaStore.createDeleteRequest(context.contentResolver, failedUris)
+                        deleteLauncher.launch(IntentSenderRequest.Builder(pendingIntent.intentSender).build())
+                    } catch (_: Exception) {
+                        Toast.makeText(context, "Could not delete some protected files", Toast.LENGTH_SHORT).show()
+                    }
+                } else if (deletedItems.isNotEmpty()) {
+                    Toast.makeText(context, "Deleted ${deletedItems.size} files", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    fun shredSelectedFiles() {
+        isShredding = true
+        shredProgress = 0f
+        scope.launch(Dispatchers.IO) {
+            val total = selectedItems.size
+            var current = 0
+            val random = SecureRandom()
+            val buffer = ByteArray(65536)
+            val failedUris = mutableListOf<Uri>()
+            val deletedItems = mutableSetOf<FileItem>()
+
+            selectedItems.forEach { item ->
+                try {
+                    val file = File(item.path)
+                    if (file.exists() && file.canWrite()) {
+                        val length = file.length()
+                        RandomAccessFile(file, "rws").use { raf ->
+                            raf.seek(0)
+                            var written = 0L
+                            java.util.Arrays.fill(buffer, 0.toByte())
+                            while (written < length) {
+                                val toWrite = minOf(buffer.size.toLong(), length - written).toInt()
+                                raf.write(buffer, 0, toWrite)
+                                written += toWrite
+                            }
+                        }
+                        RandomAccessFile(file, "rws").use { raf ->
+                            raf.seek(0)
+                            var written = 0L
+                            while (written < length) {
+                                random.nextBytes(buffer)
+                                val toWrite = minOf(buffer.size.toLong(), length - written).toInt()
+                                raf.write(buffer, 0, toWrite)
+                                written += toWrite
+                            }
+                        }
+                        file.delete()
+                    }
+                    val rows = context.contentResolver.delete(item.contentUri, null, null)
+                    if (rows > 0 || !file.exists()) {
+                        deletedItems.add(item)
+                    } else {
+                        failedUris.add(item.contentUri)
+                    }
+                } catch (_: Exception) {
+                    failedUris.add(item.contentUri)
+                }
+                current++
+                shredProgress = current.toFloat() / total.toFloat()
+            }
+            withContext(Dispatchers.Main) {
+                files = files.filterNot { it in deletedItems }
+                selectedItems = selectedItems - deletedItems
+                isShredding = false
+                showShredDialog = false
+
+                if (failedUris.isNotEmpty() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    try {
+                        val pendingIntent = MediaStore.createDeleteRequest(context.contentResolver, failedUris)
+                        deleteLauncher.launch(IntentSenderRequest.Builder(pendingIntent.intentSender).build())
+                    } catch (_: Exception) {
+                        Toast.makeText(context, "Grant All Files Access in Storage Analysis for full DoD Shredding", Toast.LENGTH_LONG).show()
+                    }
+                } else {
+                    Toast.makeText(context, "Securely shredded ${deletedItems.size} files!", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    if (showShredDialog) {
+        AlertDialog(
+            onDismissRequest = { if (!isShredding) showShredDialog = false },
+            containerColor = GlassPanel,
+            title = { Text("Military-Grade Shredder", color = AuraRose, fontWeight = FontWeight.Bold) },
+            text = {
+                if (isShredding) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                        Text("Overwriting sectors with cryptographic noise...", color = TextSecondary)
+                        Spacer(modifier = Modifier.height(16.dp))
+                        LinearProgressIndicator(
+                            progress = { shredProgress },
+                            color = AuraRose,
+                            trackColor = GlassBorder,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                } else {
+                    Text(
+                        "Permanently overwrite and destroy ${selectedItems.size} selected files so they cannot be recovered.",
+                        color = TextPrimary
+                    )
+                }
+            },
+            confirmButton = {
+                if (!isShredding) {
+                    Button(
+                        onClick = { shredSelectedFiles() },
+                        colors = ButtonDefaults.buttonColors(containerColor = AuraRose)
+                    ) {
+                        Text("SHRED FOREVER", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
                 }
             },
             dismissButton = {
-                TextButton(onClick = { fileToDelete = null }) {
-                    Text("Cancel", color = TextSecondary)
+                if (!isShredding) {
+                    TextButton(onClick = { showShredDialog = false }) {
+                        Text("Cancel", color = TextSecondary)
+                    }
                 }
             }
         )
@@ -274,106 +434,173 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
         containerColor = Color.Transparent,
         topBar = {
             TopAppBar(
-                title = { Text(categoryName, color = TextPrimary, fontWeight = FontWeight.Bold) },
+                title = {
+                    if (isSelectionMode) {
+                        Text("${selectedItems.size} Selected", color = AuraCyan, fontWeight = FontWeight.Bold)
+                    } else {
+                        Text("$categoryName (${sortedFiles.size})", color = TextPrimary, fontWeight = FontWeight.Bold)
+                    }
+                },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = TextPrimary)
+                    if (isSelectionMode) {
+                        IconButton(onClick = { selectedItems = emptySet() }) {
+                            Icon(Icons.Default.Close, contentDescription = "Clear Selection", tint = TextPrimary)
+                        }
+                    } else {
+                        IconButton(onClick = onBack) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = TextPrimary)
+                        }
                     }
                 },
                 actions = {
-                    IconButton(onClick = { viewMode = if (viewMode == "List") "Grid" else "List" }) {
-                        Icon(
-                            if (viewMode == "List") Icons.Default.GridView else Icons.AutoMirrored.Filled.ViewList,
-                            contentDescription = "Toggle View",
-                            tint = TextPrimary
-                        )
-                    }
-                    var expanded by remember { mutableStateOf(false) }
-                    IconButton(onClick = { expanded = true }) {
-                        Icon(Icons.Default.Sort, contentDescription = "Sort", tint = TextPrimary)
-                    }
-                    DropdownMenu(
-                        expanded = expanded,
-                        onDismissRequest = { expanded = false },
-                        containerColor = GlassPanel
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("Sort by Date", color = if (sortOption == "Date") AuraCyan else TextPrimary) },
-                            onClick = { sortOption = "Date"; expanded = false }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Sort by Size", color = if (sortOption == "Size") AuraCyan else TextPrimary) },
-                            onClick = { sortOption = "Size"; expanded = false }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Sort by Name", color = if (sortOption == "Name") AuraCyan else TextPrimary) },
-                            onClick = { sortOption = "Name"; expanded = false }
-                        )
+                    if (isSelectionMode) {
+                        IconButton(onClick = {
+                            selectedItems = if (selectedItems.size == sortedFiles.size) emptySet() else sortedFiles.toSet()
+                        }) {
+                            Icon(Icons.Default.SelectAll, contentDescription = "Select All", tint = TextPrimary)
+                        }
+                        IconButton(onClick = { shareSelectedFiles() }) {
+                            Icon(Icons.Default.Share, contentDescription = "Share Selected", tint = AuraCyan)
+                        }
+                        IconButton(onClick = { deleteSelectedStandard() }) {
+                            Icon(Icons.Default.Delete, contentDescription = "Delete Selected", tint = TextPrimary)
+                        }
+                        IconButton(onClick = { showShredDialog = true }) {
+                            Icon(Icons.Default.DeleteForever, contentDescription = "Secure Shred", tint = AuraRose)
+                        }
+                    } else {
+                        IconButton(onClick = { isGridView = !isGridView }) {
+                            Icon(
+                                if (isGridView) Icons.AutoMirrored.Filled.ViewList else Icons.Default.GridView,
+                                contentDescription = "Toggle View",
+                                tint = AuraCyan
+                            )
+                        }
+                        Box {
+                            IconButton(onClick = { showSortMenu = true }) {
+                                Icon(Icons.AutoMirrored.Filled.Sort, contentDescription = "Sort", tint = TextPrimary)
+                            }
+                            DropdownMenu(
+                                expanded = showSortMenu,
+                                onDismissRequest = { showSortMenu = false },
+                                modifier = Modifier.background(GlassPanel)
+                            ) {
+                                listOf(
+                                    "Size (High to Low)",
+                                    "Size (Low to High)",
+                                    "Date (Newest)",
+                                    "Date (Oldest)",
+                                    "Name (A-Z)"
+                                ).forEach { option ->
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                option,
+                                                color = if (option == sortOption) AuraCyan else TextPrimary
+                                            )
+                                        },
+                                        onClick = {
+                                            sortOption = option
+                                            showSortMenu = false
+                                        }
+                                    )
+                                }
+                            }
+                        }
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)
             )
         }
     ) { padding ->
-        if (isLoading) {
-            Box(modifier = Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(color = AuraCyan)
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+        ) {
+            if (!isLoading && files.isNotEmpty()) {
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    placeholder = { Text("Search $categoryName...", color = TextTertiary) },
+                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = AuraCyan) },
+                    trailingIcon = {
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(onClick = { searchQuery = "" }) {
+                                Icon(Icons.Default.Close, contentDescription = "Clear", tint = TextSecondary)
+                            }
+                        }
+                    },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = AuraCyan,
+                        unfocusedBorderColor = GlassBorder,
+                        focusedTextColor = TextPrimary,
+                        unfocusedTextColor = TextPrimary
+                    ),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp, vertical = 8.dp)
+                )
             }
-        } else {
-            Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    listOf("All", "> 50MB", "Recent").forEach { opt ->
-                        FilterChip(
-                            selected = filterOption == opt,
-                            onClick = { filterOption = opt },
-                            label = { Text(opt) },
-                            colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = AuraCyan.copy(alpha = 0.2f),
-                                selectedLabelColor = AuraCyan,
-                                labelColor = TextSecondary,
-                                containerColor = Color.Transparent
-                            ),
-                            border = if (filterOption == opt) BorderStroke(1.dp, AuraCyan) else BorderStroke(1.dp, GlassBorder)
-                        )
-                    }
-                }
 
-                if (filteredFiles.isEmpty()) {
-                    Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                        Text("No files match criteria", color = TextSecondary)
-                    }
-                } else if (viewMode == "List") {
-                    LazyColumn(
-                        modifier = Modifier.fillMaxSize().navigationBarsPadding(),
-                        contentPadding = PaddingValues(bottom = 32.dp)
+            if (isLoading) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(color = AuraCyan)
+                }
+            } else if (sortedFiles.isEmpty()) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text(
+                        if (searchQuery.isNotBlank()) "No matching files found"
+                        else "No files found in $categoryName",
+                        color = TextSecondary
+                    )
+                }
+            } else {
+                if (isGridView) {
+                    LazyVerticalGrid(
+                        columns = GridCells.Fixed(3),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(horizontal = 16.dp),
+                        contentPadding = PaddingValues(bottom = 24.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        items(filteredFiles, key = { it.id }) { file ->
-                            CompactFileRow(
+                        items(sortedFiles, key = { "${it.id}_${it.path}" }) { file ->
+                            val isSelected = selectedItems.contains(file)
+                            FileGridItem(
                                 file = file,
-                                imageLoader = sharedImageLoader,
-                                onClick = { openFile(context, file) },
-                                onDeleteClick = { fileToDelete = file }
+                                category = categoryName,
+                                isSelected = isSelected,
+                                isSelectionMode = isSelectionMode,
+                                onClick = {
+                                    if (isSelectionMode) toggleSelection(file) else openFile(file)
+                                },
+                                onLongClick = { toggleSelection(file) }
                             )
-                            HorizontalDivider(color = Color.White.copy(alpha = 0.05f), modifier = Modifier.padding(horizontal = 24.dp))
                         }
                     }
                 } else {
-                    LazyVerticalGrid(
-                        columns = GridCells.Fixed(3),
-                        modifier = Modifier.fillMaxSize().navigationBarsPadding().padding(horizontal = 8.dp),
-                        contentPadding = PaddingValues(bottom = 32.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(horizontal = 24.dp),
+                        contentPadding = PaddingValues(bottom = 24.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        items(filteredFiles, key = { it.id }) { file ->
-                            GridFileItem(
+                        items(sortedFiles, key = { "${it.id}_${it.path}" }) { file ->
+                            val isSelected = selectedItems.contains(file)
+                            FileListItem(
                                 file = file,
-                                imageLoader = sharedImageLoader,
-                                onClick = { openFile(context, file) },
-                                onDeleteClick = { fileToDelete = file }
+                                category = categoryName,
+                                isSelected = isSelected,
+                                isSelectionMode = isSelectionMode,
+                                onClick = {
+                                    if (isSelectionMode) toggleSelection(file) else openFile(file)
+                                },
+                                onLongClick = { toggleSelection(file) }
                             )
                         }
                     }
@@ -383,256 +610,238 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
     }
 }
 
-private fun secureDeleteFile(context: Context, fileInfo: FileInfo): Boolean {
-    val file = File(fileInfo.path)
-    if (!file.exists()) {
-        return try {
-            context.contentResolver.delete(fileInfo.contentUri, null, null) > 0
-        } catch (_: Exception) {
-            false
+@Composable
+fun MediaThumbnail(
+    file: FileItem,
+    category: String,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    var bitmap by remember(file.contentUri) { mutableStateOf<Bitmap?>(null) }
+
+    LaunchedEffect(file.contentUri) {
+        if (category == "Images" || category == "Videos") {
+            withContext(Dispatchers.IO) {
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        bitmap = context.contentResolver.loadThumbnail(file.contentUri, Size(256, 256), null)
+                    }
+                } catch (_: Exception) {
+                }
+            }
         }
     }
 
-    return try {
-        val length = file.length()
-        if (length > 0) {
-            val raf = RandomAccessFile(file, "rws")
-            val bufferSize = 4096
-            val zeros = ByteArray(bufferSize) { 0x00 }
-            val ones = ByteArray(bufferSize) { 0xFF.toByte() }
-            val randomBuf = ByteArray(bufferSize)
-            val secureRandom = SecureRandom()
+    val (icon, color) = when (category) {
+        "Images" -> Pair(Icons.Default.Image, AuraCyan)
+        "Videos" -> Pair(Icons.Default.VideoLibrary, AuraOrange)
+        "Audio" -> Pair(Icons.Default.AudioFile, AuraRose)
+        "Documents" -> Pair(Icons.Default.Description, AuraGreen)
+        else -> Pair(Icons.AutoMirrored.Filled.InsertDriveFile, Color.Gray)
+    }
 
-            raf.seek(0)
-            var i = 0L
-            while (i < length) {
-                val writeLen = minOf(bufferSize.toLong(), length - i).toInt()
-                raf.write(zeros, 0, writeLen)
-                i += writeLen
+    Box(
+        modifier = modifier.background(color.copy(alpha = 0.15f)),
+        contentAlignment = Alignment.Center
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap!!.asImageBitmap(),
+                contentDescription = file.name,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+            if (category == "Videos") {
+                Box(
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.5f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Default.PlayCircleOutline, contentDescription = null, tint = Color.White)
+                }
             }
-
-            raf.seek(0)
-            i = 0L
-            while (i < length) {
-                val writeLen = minOf(bufferSize.toLong(), length - i).toInt()
-                raf.write(ones, 0, writeLen)
-                i += writeLen
-            }
-
-            raf.seek(0)
-            i = 0L
-            while (i < length) {
-                val writeLen = minOf(bufferSize.toLong(), length - i).toInt()
-                secureRandom.nextBytes(randomBuf)
-                raf.write(randomBuf, 0, writeLen)
-                i += writeLen
-            }
-
-            raf.fd.sync()
-            raf.setLength(0)
-            raf.close()
-        }
-
-        file.setLastModified(0L)
-        val dummyFile = File(file.parent, UUID.randomUUID().toString())
-        if (file.renameTo(dummyFile)) {
-            dummyFile.delete()
         } else {
-            file.delete()
+            Icon(icon, contentDescription = null, tint = color, modifier = Modifier.size(28.dp))
         }
-
-        try {
-            context.contentResolver.delete(fileInfo.contentUri, null, null)
-        } catch (_: Exception) {
-        }
-        true
-    } catch (_: Exception) {
-        val deleted = file.delete()
-        try {
-            context.contentResolver.delete(fileInfo.contentUri, null, null)
-        } catch (_: Exception) {
-        }
-        deleted
     }
 }
 
-private fun openFile(context: Context, fileInfo: FileInfo) {
-    try {
-        val ext = File(fileInfo.name).extension.lowercase()
-        val mimeType = context.contentResolver.getType(fileInfo.contentUri)
-            ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
-            ?: "*/*"
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun FileGridItem(
+    file: FileItem,
+    category: String,
+    isSelected: Boolean,
+    isSelectionMode: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .aspectRatio(1f)
+            .clip(RoundedCornerShape(12.dp))
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+    ) {
+        MediaThumbnail(file = file, category = category, modifier = Modifier.fillMaxSize())
 
-        val uri = try {
-            val file = File(fileInfo.path)
-            if (file.exists() && file.canRead()) {
-                FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-            } else {
-                fileInfo.contentUri
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .background(Color.Black.copy(alpha = 0.6f))
+                .padding(horizontal = 6.dp, vertical = 4.dp)
+        ) {
+            Text(
+                text = formatBytes(file.size),
+                style = MaterialTheme.typography.labelSmall,
+                color = Color.White,
+                maxLines = 1
+            )
+        }
+
+        if (isSelectionMode) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(if (isSelected) AuraCyan.copy(alpha = 0.25f) else Color.Transparent)
+                    .padding(6.dp),
+                contentAlignment = Alignment.TopEnd
+            ) {
+                Icon(
+                    imageVector = if (isSelected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
+                    contentDescription = null,
+                    tint = if (isSelected) AuraCyan else Color.White
+                )
             }
-        } catch (_: Exception) {
-            fileInfo.contentUri
         }
-
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, mimeType)
-            flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK
-        }
-        context.startActivity(Intent.createChooser(intent, "Open with"))
-    } catch (_: Exception) {
-        Toast.makeText(context, "No app available to open this file", Toast.LENGTH_SHORT).show()
     }
 }
 
-private fun getFilesForCategory(context: Context, categoryName: String): List<FileInfo> {
-    val fileList = mutableListOf<FileInfo>()
-    val baseUri = when (categoryName) {
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun FileListItem(
+    file: FileItem,
+    category: String,
+    isSelected: Boolean,
+    isSelectionMode: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
+) {
+    val dateFormat = remember { SimpleDateFormat("MMM dd, yyyy", Locale.getDefault()) }
+
+    GlassCard(
+        modifier = Modifier
+            .fillMaxWidth()
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            MediaThumbnail(
+                file = file,
+                category = category,
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(RoundedCornerShape(12.dp))
+            )
+            Spacer(modifier = Modifier.width(16.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = file.name,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (isSelected) AuraCyan else TextPrimary,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "${formatBytes(file.size)}  •  ${dateFormat.format(Date(file.dateModified * 1000))}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextTertiary
+                )
+            }
+            if (isSelectionMode) {
+                Spacer(modifier = Modifier.width(12.dp))
+                Icon(
+                    imageVector = if (isSelected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
+                    contentDescription = null,
+                    tint = if (isSelected) AuraCyan else TextTertiary
+                )
+            }
+        }
+    }
+}
+
+private fun fetchFilesForCategory(context: Context, category: String): List<FileItem> {
+    val list = mutableListOf<FileItem>()
+    val baseUri: Uri = when (category) {
         "Images" -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
         "Videos" -> MediaStore.Video.Media.EXTERNAL_CONTENT_URI
         "Audio" -> MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
-        "Documents" -> MediaStore.Files.getContentUri("external")
-        else -> null
-    } ?: return emptyList()
+        else -> MediaStore.Files.getContentUri("external")
+    }
+
+    val defaultMime = when (category) {
+        "Images" -> "image/*"
+        "Videos" -> "video/*"
+        "Audio" -> "audio/*"
+        else -> "*/*"
+    }
 
     val projection = arrayOf(
         MediaStore.MediaColumns._ID,
         MediaStore.MediaColumns.DISPLAY_NAME,
         MediaStore.MediaColumns.SIZE,
+        MediaStore.MediaColumns.DATE_MODIFIED,
         MediaStore.MediaColumns.DATA,
-        MediaStore.MediaColumns.DATE_MODIFIED
+        MediaStore.MediaColumns.MIME_TYPE
     )
 
     try {
-        context.contentResolver.query(baseUri, projection, null, null, null)?.use { cursor ->
+        context.contentResolver.query(
+            baseUri,
+            projection,
+            null,
+            null,
+            "${MediaStore.MediaColumns.SIZE} DESC"
+        )?.use { cursor ->
             val idCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
             val nameCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
             val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
-            val pathCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
             val dateCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_MODIFIED)
+            val dataCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
+            val mimeCol = cursor.getColumnIndex(MediaStore.MediaColumns.MIME_TYPE)
 
-            val docExtensions = setOf("pdf", "txt", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "csv", "rtf")
+            val docExtensions = setOf(
+                "pdf", "txt", "doc", "docx", "ppt", "pptx", "xls", "xlsx",
+                "csv", "rtf", "zip", "apk", "json", "xml", "md", "epub"
+            )
+
             while (cursor.moveToNext()) {
                 val id = cursor.getLong(idCol)
-                val name = cursor.getString(nameCol) ?: "Unknown"
+                val path = if (dataCol >= 0) cursor.getString(dataCol) ?: "" else ""
+                val rawName = cursor.getString(nameCol)
+                val name = if (!rawName.isNullOrBlank()) rawName else File(path).name.ifBlank { "Item_$id" }
                 val size = cursor.getLong(sizeCol)
-                val path = if (pathCol >= 0) cursor.getString(pathCol) ?: "" else ""
-                val date = cursor.getLong(dateCol) * 1000L
-                val contentUri = ContentUris.withAppendedId(baseUri, id)
+                val date = cursor.getLong(dateCol)
+                val mime = (if (mimeCol >= 0) cursor.getString(mimeCol) else null) ?: defaultMime
 
-                if (categoryName == "Documents") {
-                    val candidate = path.ifBlank { name }
-                    val ext = File(candidate).extension.lowercase()
-                    if (ext in docExtensions) {
-                        fileList.add(FileInfo(id, name, size, path, date, contentUri))
-                    }
-                } else {
-                    fileList.add(FileInfo(id, name, size, path, date, contentUri))
+                if (size <= 0) continue
+
+                if (category == "Documents") {
+                    val ext = File(path.ifBlank { name }).extension.lowercase()
+                    if (ext !in docExtensions) continue
                 }
+
+                val itemUri = ContentUris.withAppendedId(baseUri, id)
+                list.add(FileItem(id, name, size, date, path, itemUri, mime))
             }
         }
     } catch (_: Exception) {
     }
-    return fileList
-}
-
-@Composable
-fun CompactFileRow(
-    file: FileInfo,
-    imageLoader: ImageLoader,
-    onClick: () -> Unit,
-    onDeleteClick: () -> Unit
-) {
-    val context = LocalContext.current
-    val dateFormat = remember { SimpleDateFormat("MMM dd, yyyy", Locale.getDefault()) }
-    val dateString = dateFormat.format(Date(file.dateModified))
-
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onClick() }
-            .padding(vertical = 12.dp, horizontal = 24.dp)
-    ) {
-        Box(
-            modifier = Modifier.size(48.dp).clip(RoundedCornerShape(8.dp)).background(GlassBorder),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(Icons.Default.InsertDriveFile, contentDescription = null, tint = AuraCyan, modifier = Modifier.size(24.dp))
-            AsyncImage(
-                model = ImageRequest.Builder(context)
-                    .data(file.contentUri)
-                    .crossfade(true)
-                    .build(),
-                imageLoader = imageLoader,
-                contentDescription = file.name,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize()
-            )
-        }
-        Spacer(modifier = Modifier.width(16.dp))
-        Column(modifier = Modifier.weight(1f)) {
-            Text(file.name, style = MaterialTheme.typography.bodyMedium, color = TextPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Spacer(modifier = Modifier.padding(top = 2.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(formatBytes(file.size), style = MaterialTheme.typography.bodySmall, color = AuraOrange)
-                Text(" • $dateString", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-            }
-        }
-        Spacer(modifier = Modifier.width(8.dp))
-        IconButton(onClick = onDeleteClick) {
-            Icon(Icons.Default.DeleteForever, contentDescription = "Delete ${file.name}", tint = AuraRose)
-        }
-    }
-}
-
-@Composable
-fun GridFileItem(
-    file: FileInfo,
-    imageLoader: ImageLoader,
-    onClick: () -> Unit,
-    onDeleteClick: () -> Unit
-) {
-    val context = LocalContext.current
-    Box(
-        modifier = Modifier
-            .aspectRatio(1f)
-            .clip(RoundedCornerShape(8.dp))
-            .background(GlassBorder)
-            .clickable { onClick() }
-    ) {
-        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Icon(Icons.Default.InsertDriveFile, contentDescription = null, tint = AuraCyan, modifier = Modifier.size(32.dp))
-        }
-        AsyncImage(
-            model = ImageRequest.Builder(context)
-                .data(file.contentUri)
-                .crossfade(true)
-                .build(),
-            imageLoader = imageLoader,
-            contentDescription = file.name,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxSize()
-        )
-
-        Box(modifier = Modifier.fillMaxSize().padding(4.dp)) {
-            IconButton(
-                onClick = onDeleteClick,
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .size(36.dp)
-                    .background(Color.Black.copy(alpha = 0.6f), CircleShape)
-            ) {
-                Icon(Icons.Default.DeleteForever, contentDescription = "Delete ${file.name}", tint = AuraRose, modifier = Modifier.size(18.dp))
-            }
-
-            Box(
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(4.dp))
-                    .padding(horizontal = 4.dp, vertical = 2.dp)
-            ) {
-                Text(formatBytes(file.size), style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp), color = Color.White)
-            }
-        }
-    }
+    return list
 }

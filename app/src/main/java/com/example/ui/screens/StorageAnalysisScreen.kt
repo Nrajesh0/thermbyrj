@@ -482,7 +482,10 @@ private fun getDocumentSize(context: Context): Long {
             val sizeColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
             val nameColumn = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
             val dataColumn = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
-            val docExtensions = setOf("pdf", "txt", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "csv", "rtf")
+            val docExtensions = setOf(
+                "pdf", "txt", "doc", "docx", "ppt", "pptx", "xls", "xlsx",
+                "csv", "rtf", "zip", "apk", "json", "xml", "md", "epub"
+            )
             while (cursor.moveToNext()) {
                 val path = if (dataColumn >= 0) cursor.getString(dataColumn) ?: "" else ""
                 val displayName = if (nameColumn >= 0) cursor.getString(nameColumn) ?: "" else ""

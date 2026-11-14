@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#80000000"
+    android:background="#CC050811"
     android:gravity="center"
     android:orientation="vertical"
-    android:padding="8dp">
+    android:padding="10dp">
 
     <TextView
         android:id="@+id/widget_temp_text"
@@ -13,13 +14,15 @@
         android:layout_height="wrap_content"
         android:text="--°C"
         android:textColor="#FFFFFF"
-        android:textSize="24sp"
+        android:textSize="22sp"
         android:textStyle="bold" />
 
     <ImageView
         android:id="@+id/widget_sparkline"
         android:layout_width="match_parent"
         android:layout_height="0dp"
+        android:layout_marginTop="4dp"
         android:layout_weight="1"
+        android:contentDescription="@string/app_name"
         android:scaleType="fitCenter" />
 </LinearLayout>
