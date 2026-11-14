@@ -13,7 +13,7 @@ interface ThermalDao {
 
     @Query("SELECT * FROM thermal_records WHERE timestamp >= :since ORDER BY timestamp ASC")
     fun getRecordsSince(since: Long): Flow<List<ThermalRecord>>
-    
+
     @Query("SELECT * FROM thermal_records WHERE timestamp >= :since ORDER BY timestamp ASC")
     suspend fun getRecordsSinceSync(since: Long): List<ThermalRecord>
 
@@ -22,6 +22,9 @@ interface ThermalDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertRecords(records: List<ThermalRecord>)
+
+    @Query("DELETE FROM thermal_records WHERE timestamp < :cutoff")
+    suspend fun deleteRecordsOlderThan(cutoff: Long)
 
     @Query("SELECT COUNT(*) FROM thermal_records")
     suspend fun getRecordCount(): Int

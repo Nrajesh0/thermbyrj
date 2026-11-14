@@ -23,7 +23,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.Locale
 
@@ -43,7 +42,6 @@ class ThermalTrackerService : Service() {
 
     private var lastAlertState = 0 // 0: Normal, 1: Elevated, 2: Critical
     private var trackingJob: Job? = null
-    private var periodicSamplingJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -64,10 +62,16 @@ class ThermalTrackerService : Service() {
         repository = ThermalRepository(db.thermalDao())
 
         createNotificationChannels()
+
+        // Prune records older than 8 days once on service startup to keep DB fast and compact
+        serviceScope.launch {
+            val eightDaysAgo = System.currentTimeMillis() - (8L * 24 * 60 * 60 * 1000L)
+            repository.deleteRecordsOlderThan(eightDaysAgo)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val notification = createNotification("Monitoring device thermals...")
+        val notification = createNotification("Monitoring device thermals & privacy guard...")
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             ServiceCompat.startForeground(
@@ -108,18 +112,6 @@ class ThermalTrackerService : Service() {
                 }
             }
         }
-
-        if (periodicSamplingJob?.isActive != true) {
-            periodicSamplingJob = serviceScope.launch {
-                while (isActive) {
-                    delay(30_000L)
-                    val live = thermalMonitor.liveData.value
-                    if (live.batteryTemp > 0f) {
-                        maybeRecordAndUpdateWidget(live)
-                    }
-                }
-            }
-        }
     }
 
     private suspend fun maybeRecordAndUpdateWidget(live: LiveThermalData) {
@@ -127,8 +119,8 @@ class ThermalTrackerService : Service() {
         val tempDiff = kotlin.math.abs(live.batteryTemp - lastRecordedTemp)
         val timeDiff = now - lastRecordedTime
 
-        // Record immediately on first valid reading, every 30s, or on >= 0.5°C delta after 10s
-        if (lastRecordedTime == 0L || timeDiff >= 30_000L || (tempDiff >= 0.5f && timeDiff >= 10_000L)) {
+        // Record on first reading, every 3 minutes, or when temperature shifts >= 0.5°C after 30s
+        if (lastRecordedTime == 0L || timeDiff >= 180_000L || (tempDiff >= 0.5f && timeDiff >= 30_000L)) {
             repository.insertRecord(
                 ThermalRecord(
                     timestamp = now,
@@ -141,7 +133,7 @@ class ThermalTrackerService : Service() {
             lastRecordedTemp = live.batteryTemp
         }
 
-        if (kotlin.math.abs(live.batteryTemp - lastWidgetTemp) >= 0.1f) {
+        if (kotlin.math.abs(live.batteryTemp - lastWidgetTemp) >= 0.2f) {
             updateWidget(live.batteryTemp)
             lastWidgetTemp = live.batteryTemp
         }
@@ -282,7 +274,7 @@ class ThermalTrackerService : Service() {
 
     private fun createNotification(content: String): Notification {
         return NotificationCompat.Builder(this, TRACKER_CHANNEL_ID)
-            .setContentTitle("Thermal Monitor Active")
+            .setContentTitle("dot Shield Active")
             .setContentText(content)
             .setSmallIcon(android.R.drawable.ic_menu_info_details)
             .setPriority(NotificationCompat.PRIORITY_LOW)

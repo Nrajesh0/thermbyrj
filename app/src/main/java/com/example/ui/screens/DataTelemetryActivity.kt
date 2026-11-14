@@ -422,7 +422,7 @@ private fun TelemetryAppRow(
         "LIGHT" -> AuraCyan
         else -> AuraGreen
     }
-    val bmp = remember(app.packageName) { app.icon.toSafeBitmap().asImageBitmap() }
+    val bmp = remember(app.packageName) { getCachedAppIconBitmap(app.packageName, app.icon) }
     val allTags = remember(app) {
         app.detectedAdNetworks + app.detectedAnalyticsSdks + app.telemetrySignals
     }
@@ -521,7 +521,7 @@ private fun TelemetryDetailSheet(
     onUninstallClick: () -> Unit,
     onClose: () -> Unit
 ) {
-    val bmp = remember(app.packageName) { app.icon.toSafeBitmap().asImageBitmap() }
+    val bmp = remember(app.packageName) { getCachedAppIconBitmap(app.packageName, app.icon) }
 
     Column(
         modifier = Modifier

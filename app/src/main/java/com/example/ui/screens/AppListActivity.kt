@@ -551,12 +551,31 @@ fun AppItemCard(app: AppItem, onClick: () -> Unit) {
     }
 }
 
-internal fun Drawable.toSafeBitmap(): Bitmap {
-    if (this is BitmapDrawable && this.bitmap != null) {
-        return this.bitmap
+private val globalAppIconCache = android.util.LruCache<String, ImageBitmap>(220)
+
+internal fun getCachedAppIconBitmap(packageName: String, drawable: Drawable): ImageBitmap {
+    synchronized(globalAppIconCache) {
+        globalAppIconCache.get(packageName)?.let { return it }
     }
-    val width = if (intrinsicWidth > 0) intrinsicWidth else 96
-    val height = if (intrinsicHeight > 0) intrinsicHeight else 96
+    val bmp = drawable.toSafeBitmap(maxSizePx = 96).asImageBitmap()
+    synchronized(globalAppIconCache) {
+        globalAppIconCache.put(packageName, bmp)
+    }
+    return bmp
+}
+
+internal fun Drawable.toSafeBitmap(maxSizePx: Int = 96): Bitmap {
+    if (this is BitmapDrawable && this.bitmap != null) {
+        val src = this.bitmap
+        if (src.width <= maxSizePx && src.height <= maxSizePx) {
+            return src
+        }
+        return Bitmap.createScaledBitmap(src, maxSizePx, maxSizePx, true)
+    }
+    val rawW = if (intrinsicWidth > 0) intrinsicWidth else maxSizePx
+    val rawH = if (intrinsicHeight > 0) intrinsicHeight else maxSizePx
+    val width = rawW.coerceIn(1, maxSizePx)
+    val height = rawH.coerceIn(1, maxSizePx)
     val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
     val canvas = Canvas(bitmap)
     setBounds(0, 0, canvas.width, canvas.height)
@@ -564,9 +583,9 @@ internal fun Drawable.toSafeBitmap(): Bitmap {
     return bitmap
 }
 
-private fun drawableToImageBitmap(drawable: Drawable): ImageBitmap? {
+private fun drawableToImageBitmap(packageName: String, drawable: Drawable): ImageBitmap? {
     return try {
-        drawable.toSafeBitmap().asImageBitmap()
+        getCachedAppIconBitmap(packageName, drawable)
     } catch (_: Exception) {
         null
     }
@@ -653,7 +672,7 @@ private fun fetchInstalledApps(context: Context): List<AppItem> {
         }
 
         val icon = try {
-            drawableToImageBitmap(pm.getApplicationIcon(appInfo))
+            drawableToImageBitmap(pkgInfo.packageName, pm.getApplicationIcon(appInfo))
         } catch (_: Exception) {
             null
         }

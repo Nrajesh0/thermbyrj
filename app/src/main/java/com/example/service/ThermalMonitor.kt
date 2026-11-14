@@ -12,6 +12,7 @@ import android.os.Environment
 import android.os.StatFs
 import android.os.SystemClock
 import android.view.Display
+import com.example.queryDeviceStorageTotals
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -27,8 +28,6 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
-import java.net.Inet4Address
-import java.net.NetworkInterface
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -61,9 +60,8 @@ data class LiveThermalData(
     val cpuCores: Int = Runtime.getRuntime().availableProcessors(),
     val cpuArch: String = System.getProperty("os.arch") ?: "Unknown",
 
-    val ipAddress: String = "Offline",
     val uptime: Long = 0L,
-    val refreshRate: Float = 0f
+    val refreshRate: Float = 60f
 )
 
 class ThermalMonitor private constructor(private val context: Context) {
@@ -95,6 +93,12 @@ class ThermalMonitor private constructor(private val context: Context) {
         )
     )
     val liveData: StateFlow<LiveThermalData> = _liveData.asStateFlow()
+
+    // Cache the discovered CPU thermal zone file so we never scan /sys/class/thermal/ repeatedly
+    @Volatile
+    private var cpuSensorDiscoveryDone = false
+    @Volatile
+    private var cachedCpuTempFile: File? = null
 
     fun updateDataFromIntent(intent: Intent?) {
         if (intent == null) return
@@ -187,7 +191,8 @@ class ThermalMonitor private constructor(private val context: Context) {
     }
 
     /**
-     * Refreshes system specs (RAM, Storage, CPU thermal zones, Network IP, display refresh rate).
+     * Refreshes system specs (RAM, Storage, CPU thermal sensor, display refresh rate).
+     * Offline-only: zero network or socket calls.
      */
     fun refreshSystemSpecs() {
         val cpuTempC = getCpuTemperature()
@@ -200,7 +205,6 @@ class ThermalMonitor private constructor(private val context: Context) {
             availRam = avRam,
             totalStorage = totStore,
             availStorage = avStore,
-            ipAddress = getNetworkIpAddress(),
             uptime = SystemClock.elapsedRealtime(),
             refreshRate = getRefreshRate()
         )
@@ -222,9 +226,10 @@ class ThermalMonitor private constructor(private val context: Context) {
     fun startMonitoring() {
         if (monitoringJob?.isActive == true) return
 
-        // Synchronously pull sticky battery state immediately
+        // Pull initial state once
         forceUpdate()
 
+        // Event-driven battery monitoring via OS broadcasts (zero polling overhead)
         monitoringJob = callbackFlow {
             val receiver = object : BroadcastReceiver() {
                 override fun onReceive(ctx: Context?, intent: Intent?) {
@@ -246,11 +251,12 @@ class ThermalMonitor private constructor(private val context: Context) {
             updateDataFromIntent(intent)
         }.launchIn(monitorScope)
 
+        // Low-frequency 15s refresh for RAM & current mA (down from 2s to save battery)
         tickerJob?.cancel()
         tickerJob = monitorScope.launch {
             while (isActive) {
-                delay(2000L)
-                forceUpdate()
+                delay(15_000L)
+                refreshSystemSpecs()
             }
         }
     }
@@ -274,67 +280,44 @@ class ThermalMonitor private constructor(private val context: Context) {
     }
 
     private fun getStorageInfo(): Pair<Long, Long> {
-        return try {
-            val statFs = StatFs(Environment.getDataDirectory().path)
-            Pair(statFs.totalBytes, statFs.availableBytes)
-        } catch (_: Exception) {
-            Pair(0L, 0L)
-        }
+        return queryDeviceStorageTotals(context)
     }
 
     private fun getCpuTemperature(): Float {
-        var cpuTemp = -1f
-        var foundReading = false
         try {
-            val dir = File("/sys/class/thermal/")
-            if (dir.exists()) {
-                val files = dir.listFiles()
-                files?.forEach { file ->
-                    if (file.name.startsWith("thermal_zone")) {
-                        val tempFile = File(file, "temp")
-                        val typeFile = File(file, "type")
-                        if (tempFile.exists() && typeFile.exists() && tempFile.canRead() && typeFile.canRead()) {
+            if (!cpuSensorDiscoveryDone) {
+                cpuSensorDiscoveryDone = true
+                val dir = File("/sys/class/thermal/")
+                if (dir.exists() && dir.canRead()) {
+                    val zones = dir.listFiles() ?: emptyArray()
+                    for (zone in zones) {
+                        if (!zone.name.startsWith("thermal_zone")) continue
+                        val typeFile = File(zone, "type")
+                        val tempFile = File(zone, "temp")
+                        if (typeFile.canRead() && tempFile.canRead()) {
                             val type = typeFile.readText().trim()
                             if (type.contains("cpu", ignoreCase = true) || type.contains("soc", ignoreCase = true)) {
-                                val temp = tempFile.readText().trim().toFloatOrNull()
-                                if (temp != null) {
-                                    val tempC = if (temp > 1000f) temp / 1000f else temp
-                                    if (tempC in 1f..150f && tempC > cpuTemp) {
-                                        cpuTemp = tempC
-                                        foundReading = true
+                                val raw = tempFile.readText().trim().toFloatOrNull()
+                                if (raw != null) {
+                                    val tempC = if (raw > 1000f) raw / 1000f else raw
+                                    if (tempC in 1f..150f) {
+                                        cachedCpuTempFile = tempFile
+                                        return tempC
                                     }
                                 }
                             }
                         }
                     }
                 }
+            } else {
+                val tempFile = cachedCpuTempFile ?: return -1f
+                val raw = tempFile.readText().trim().toFloatOrNull() ?: return -1f
+                val tempC = if (raw > 1000f) raw / 1000f else raw
+                if (tempC in 1f..150f) return tempC
             }
         } catch (_: Exception) {
         }
-        return if (foundReading) cpuTemp else -1f
-    }
-
-    private fun getNetworkIpAddress(): String {
-        return try {
-            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return "Offline"
-            val candidates = mutableListOf<String>()
-            while (interfaces.hasMoreElements()) {
-                val intf = interfaces.nextElement()
-                if (!intf.isUp || intf.isLoopback) continue
-                val addrs = intf.inetAddresses
-                while (addrs.hasMoreElements()) {
-                    val addr = addrs.nextElement()
-                    if (!addr.isLoopbackAddress && addr is Inet4Address) {
-                        addr.hostAddress?.let { ip ->
-                            candidates.add(ip)
-                        }
-                    }
-                }
-            }
-            candidates.firstOrNull() ?: "Offline"
-        } catch (_: Exception) {
-            "Offline"
-        }
+        return -1f
     }
 
     private fun getRefreshRate(): Float {

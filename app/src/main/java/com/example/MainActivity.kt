@@ -1,12 +1,16 @@
 package com.example
 
 import android.Manifest
+import android.app.usage.StorageStatsManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.os.StatFs
+import android.os.storage.StorageManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -16,11 +20,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -30,6 +30,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -50,9 +51,11 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Shield
@@ -61,6 +64,7 @@ import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Speed
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationRail
@@ -111,6 +115,7 @@ import com.example.ui.screens.FilesScreen
 import com.example.ui.screens.LiveGuardScreen
 import com.example.ui.screens.PrivacyShieldScreen
 import com.example.ui.screens.VitalsScreen
+import com.example.ui.theme.AccentPreset
 import com.example.ui.theme.AppTheme
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
@@ -119,10 +124,15 @@ import com.example.ui.theme.AuraRose
 import com.example.ui.theme.GlassBorder
 import com.example.ui.theme.GlassPanel
 import com.example.ui.theme.Obsidian
+import com.example.ui.theme.SurfacePreset
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import androidx.lifecycle.lifecycleScope
+import com.example.service.PrivacyAnalyzer
 import com.example.ui.theme.TextTertiary
+import com.example.ui.theme.ThemeState
 import com.example.viewmodel.ThermalViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.log10
@@ -135,8 +145,21 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         val prefs = getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
+        ThemeState.loadFromPrefs(this)
         if (prefs.getBoolean("background_monitoring", true)) {
             startTrackingServiceSafely(this)
+        }
+
+        // Pre-warm Privacy & Guard caches on background IO thread so tab switches are 0ms instant
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val summary = PrivacyAnalyzer.analyzeDevicePrivacy(applicationContext, includeSystemApps = false)
+                PrivacyAnalyzer.getPrivacyChanges(applicationContext, summary.appReports)
+                PrivacyAnalyzer.analyzeAppTelemetryAndTrackers(applicationContext, includeSystemApps = false)
+                LiveGuardMonitor.getInstance(applicationContext).runDeepSecurityAudit(includeSystemApps = false)
+                PrivacyAnalyzer.getPermissionAccessTimeline(applicationContext, includeSystemApps = false)
+            } catch (_: Exception) {
+            }
         }
 
         enableEdgeToEdge()
@@ -187,6 +210,9 @@ fun MainScreen(viewModel: ThermalViewModel) {
                 "haptic_feedback" -> hapticEnabled = sp.getBoolean("haptic_feedback", true)
                 "background_monitoring" -> bgMonitoringEnabled = sp.getBoolean("background_monitoring", true)
                 "live_guard_alerts" -> liveGuardAlertsEnabled = sp.getBoolean("live_guard_alerts", true)
+                "theme_accent", "theme_surface", "ultra_minimal_cards", "ambient_glow" -> {
+                    ThemeState.loadFromPrefs(context)
+                }
             }
         }
         prefs.registerOnSharedPreferenceChangeListener(listener)
@@ -224,7 +250,7 @@ fun MainScreen(viewModel: ThermalViewModel) {
     val ambientColor = when {
         captureState.isScreenRecordingOrCasting -> AuraRose
         pagerState.currentPage == 0 -> AuraCyan
-        pagerState.currentPage == 1 -> AuraGreen
+        pagerState.currentPage == 1 -> AuraCyan
         pagerState.currentPage == 2 -> if (captureState.isMicActive || captureState.isCameraActive) AuraOrange else AuraCyan
         liveData.batteryTemp >= criticalTemp -> AuraRose
         liveData.batteryTemp >= warningTemp -> AuraOrange
@@ -235,30 +261,32 @@ fun MainScreen(viewModel: ThermalViewModel) {
     BoxWithConstraints(modifier = Modifier.fillMaxSize().background(Obsidian)) {
         val isExpandedScreen = maxWidth > 600.dp
 
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            drawCircle(
-                brush = Brush.radialGradient(
-                    colors = listOf(ambientColor.copy(alpha = 0.15f), Color.Transparent),
-                    center = Offset(size.width * 0.8f, size.height * 0.1f),
-                    radius = size.width * 0.7f
+        if (ThemeState.showAmbientGlow) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(ambientColor.copy(alpha = 0.14f), Color.Transparent),
+                        center = Offset(size.width * 0.8f, size.height * 0.1f),
+                        radius = size.width * 0.7f
+                    )
                 )
-            )
-            drawCircle(
-                brush = Brush.radialGradient(
-                    colors = listOf(ambientColor.copy(alpha = 0.08f), Color.Transparent),
-                    center = Offset(size.width * 0.2f, size.height * 0.6f),
-                    radius = size.width * 0.8f
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(ambientColor.copy(alpha = 0.07f), Color.Transparent),
+                        center = Offset(size.width * 0.2f, size.height * 0.6f),
+                        radius = size.width * 0.8f
+                    )
                 )
-            )
+            }
         }
 
         if (isExpandedScreen) {
             Row(modifier = Modifier.fillMaxSize()) {
                 NavigationRail(
-                    modifier = Modifier.fillMaxHeight().width(100.dp).statusBarsPadding(),
-                    containerColor = Color(0xFF10121A).copy(alpha = 0.65f)
+                    modifier = Modifier.fillMaxHeight().width(92.dp).statusBarsPadding(),
+                    containerColor = GlassPanel.copy(alpha = 0.8f)
                 ) {
-                    Spacer(Modifier.height(24.dp))
+                    Spacer(Modifier.height(20.dp))
                     tabs.forEachIndexed { index, tab ->
                         val selected = pagerState.currentPage == index
                         NavigationRailItem(
@@ -309,12 +337,12 @@ fun MainScreen(viewModel: ThermalViewModel) {
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .navigationBarsPadding()
-                    .padding(bottom = 16.dp)
+                    .padding(bottom = 12.dp)
                     .fillMaxWidth(0.92f)
                     .clip(RoundedCornerShape(100.dp))
-                    .background(Color(0xFF10121A).copy(alpha = 0.82f))
+                    .background(GlassPanel.copy(alpha = 0.92f))
                     .border(1.dp, GlassBorder, RoundedCornerShape(100.dp))
-                    .padding(horizontal = 8.dp, vertical = 6.dp)
+                    .padding(horizontal = 6.dp, vertical = 5.dp)
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -328,21 +356,21 @@ fun MainScreen(viewModel: ThermalViewModel) {
                             modifier = Modifier
                                 .testTag("nav_tab_${tab.title.lowercase()}")
                                 .clip(RoundedCornerShape(100.dp))
-                                .background(if (selected) Color.White.copy(alpha = 0.12f) else Color.Transparent)
+                                .background(if (selected) AuraCyan.copy(alpha = 0.16f) else Color.Transparent)
                                 .clickable {
                                     if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                     coroutineScope.launch {
                                         pagerState.animateScrollToPage(index)
                                     }
                                 }
-                                .padding(horizontal = if (selected) 16.dp else 14.dp, vertical = 12.dp)
+                                .padding(horizontal = if (selected) 16.dp else 14.dp, vertical = 10.dp)
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Icon(
                                     imageVector = if (selected) tab.selectedIcon else tab.unselectedIcon,
                                     contentDescription = tab.title,
-                                    tint = if (selected) TextPrimary else TextSecondary,
-                                    modifier = Modifier.size(22.dp)
+                                    tint = if (selected) AuraCyan else TextSecondary,
+                                    modifier = Modifier.size(20.dp)
                                 )
                                 AnimatedVisibility(visible = selected) {
                                     Row {
@@ -352,7 +380,7 @@ fun MainScreen(viewModel: ThermalViewModel) {
                                             color = TextPrimary,
                                             style = MaterialTheme.typography.labelMedium.copy(
                                                 fontWeight = FontWeight.SemiBold,
-                                                letterSpacing = 0.5.sp
+                                                letterSpacing = 0.4.sp
                                             )
                                         )
                                     }
@@ -376,34 +404,62 @@ fun MainScreen(viewModel: ThermalViewModel) {
 
 @Composable
 fun GlassCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
+    val corner = if (ThemeState.ultraMinimalCards) 16.dp else 24.dp
+    val pad = if (ThemeState.ultraMinimalCards) 14.dp else 20.dp
     Box(
         modifier = modifier
-            .clip(RoundedCornerShape(32.dp))
-            .background(GlassPanel.copy(alpha = 0.55f))
-            .border(1.dp, GlassBorder, RoundedCornerShape(32.dp))
+            .clip(RoundedCornerShape(corner))
+            .background(GlassPanel.copy(alpha = 0.65f))
+            .border(1.dp, GlassBorder, RoundedCornerShape(corner))
     ) {
-        Column(modifier = Modifier.padding(24.dp), content = content)
+        Column(modifier = Modifier.padding(pad), content = content)
     }
 }
 
 @Composable
 fun InfoRow(label: String, value: String) {
     Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
         Text(label, style = MaterialTheme.typography.labelSmall, color = TextTertiary)
         Spacer(modifier = Modifier.width(12.dp))
-        Text(value, style = MaterialTheme.typography.bodyMedium, color = TextPrimary, fontWeight = FontWeight.Medium)
+        Text(value, style = MaterialTheme.typography.bodySmall, color = TextPrimary, fontWeight = FontWeight.Medium)
     }
 }
 
 fun formatBytes(bytes: Long): String {
     if (bytes <= 0) return "0 B"
     val units = arrayOf("B", "KB", "MB", "GB", "TB")
-    val digitGroups = (log10(bytes.toDouble()) / log10(1024.0)).toInt().coerceIn(0, units.lastIndex)
-    return String.format(Locale.US, "%.1f %s", bytes / 1024.0.pow(digitGroups.toDouble()), units[digitGroups])
+    val digitGroups = (log10(bytes.toDouble()) / log10(1000.0)).toInt().coerceIn(0, units.lastIndex)
+    return String.format(Locale.US, "%.1f %s", bytes / 1000.0.pow(digitGroups.toDouble()), units[digitGroups])
+}
+
+/**
+ * Returns (totalBytes, freeBytes) matching Android Settings -> Storage using StorageStatsManager on API 26+,
+ * with fallback to StatFs.
+ */
+fun queryDeviceStorageTotals(context: Context): Pair<Long, Long> {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        try {
+            val ssm = context.getSystemService(Context.STORAGE_STATS_SERVICE) as? StorageStatsManager
+            if (ssm != null) {
+                val total = ssm.getTotalBytes(StorageManager.UUID_DEFAULT)
+                val free = ssm.getFreeBytes(StorageManager.UUID_DEFAULT)
+                if (total > 0L) {
+                    return Pair(total, free.coerceIn(0L, total))
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+    return try {
+        val statFs = StatFs(Environment.getDataDirectory().path)
+        Pair(statFs.totalBytes, statFs.availableBytes)
+    } catch (_: Exception) {
+        Pair(0L, 0L)
+    }
 }
 
 fun formatUptime(millis: Long): String {
@@ -430,25 +486,10 @@ fun MorphingSettingsOrb(
         isExpanded = false
     }
 
-    val infiniteTransition = rememberInfiniteTransition(label = "orb_rotation")
-    val rotation by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(4000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
+    val rotation by animateFloatAsState(
+        targetValue = if (isExpanded) 180f else 0f,
+        animationSpec = tween(400, easing = FastOutSlowInEasing),
         label = "orb_rotation_anim"
-    )
-
-    val pulse by infiniteTransition.animateFloat(
-        initialValue = 0.85f,
-        targetValue = 1.15f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1500, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "orb_pulse_anim"
     )
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -457,14 +498,14 @@ fun MorphingSettingsOrb(
             modifier = Modifier
                 .align(Alignment.TopEnd)
                 .statusBarsPadding()
-                .padding(top = 12.dp, end = 16.dp)
-                .size(48.dp)
+                .padding(top = 10.dp, end = 16.dp)
+                .size(44.dp)
                 .testTag("settings_orb_button")
                 .semantics {
                     contentDescription = "Open system preferences"
                     role = Role.Button
                 }
-                .clip(RoundedCornerShape(24.dp))
+                .clip(RoundedCornerShape(22.dp))
                 .clickable {
                     if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                     isExpanded = !isExpanded
@@ -472,18 +513,16 @@ fun MorphingSettingsOrb(
             contentAlignment = Alignment.Center
         ) {
             Canvas(
-                modifier = Modifier.size(32.dp).graphicsLayer {
-                    scaleX = pulse
-                    scaleY = pulse
+                modifier = Modifier.size(28.dp).graphicsLayer {
                     rotationZ = rotation
                 }
             ) {
                 drawArc(
-                    color = AuraCyan.copy(alpha = 0.65f),
+                    color = AuraCyan.copy(alpha = 0.75f),
                     startAngle = 0f,
                     sweepAngle = 270f,
                     useCenter = false,
-                    style = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round)
+                    style = Stroke(width = 3.5.dp.toPx(), cap = StrokeCap.Round)
                 )
                 drawArc(
                     color = AuraRose.copy(alpha = 0.85f),
@@ -500,22 +539,22 @@ fun MorphingSettingsOrb(
         // Full Screen Overlay
         AnimatedVisibility(
             visible = isExpanded,
-            enter = fadeIn(tween(300)) + scaleIn(
+            enter = fadeIn(tween(250)) + scaleIn(
                 initialScale = 0.1f,
                 transformOrigin = TransformOrigin(0.9f, 0.1f),
-                animationSpec = tween(300, easing = FastOutSlowInEasing)
+                animationSpec = tween(250, easing = FastOutSlowInEasing)
             ),
-            exit = fadeOut(tween(250)) + scaleOut(
+            exit = fadeOut(tween(200)) + scaleOut(
                 targetScale = 0.1f,
                 transformOrigin = TransformOrigin(0.9f, 0.1f),
-                animationSpec = tween(250, easing = FastOutSlowInEasing)
+                animationSpec = tween(200, easing = FastOutSlowInEasing)
             ),
             modifier = Modifier.fillMaxSize()
         ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Obsidian.copy(alpha = 0.96f))
+                    .background(Obsidian.copy(alpha = 0.97f))
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null
@@ -527,21 +566,141 @@ fun MorphingSettingsOrb(
                         .statusBarsPadding()
                         .navigationBarsPadding()
                         .verticalScroll(rememberScrollState())
-                        .padding(horizontal = 28.dp, vertical = 24.dp)
+                        .padding(horizontal = 24.dp, vertical = 20.dp)
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null
                         ) { /* Consume background clicks */ }
                 ) {
-                    Spacer(modifier = Modifier.height(24.dp))
+                    Spacer(modifier = Modifier.height(16.dp))
 
                     Text(
-                        "SYSTEM PREFERENCES",
-                        style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 4.sp, fontWeight = FontWeight.Bold),
+                        "THEME & APPEARANCE",
+                        style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 3.sp, fontWeight = FontWeight.Bold),
                         color = AuraCyan
                     )
 
-                    Spacer(modifier = Modifier.height(32.dp))
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Accent Color Swatches
+                    Text("Accent Color", color = TextPrimary, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        AccentPreset.entries.forEach { preset ->
+                            val selected = ThemeState.accentPreset == preset
+                            Row(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(100.dp))
+                                    .background(if (selected) preset.color.copy(alpha = 0.2f) else GlassPanel)
+                                    .border(1.5.dp, if (selected) preset.color else GlassBorder, RoundedCornerShape(100.dp))
+                                    .clickable {
+                                        ThemeState.accentPreset = preset
+                                        prefs.edit().putString("theme_accent", preset.key).apply()
+                                    }
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(16.dp)
+                                        .clip(CircleShape)
+                                        .background(preset.color),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (selected) {
+                                        Icon(Icons.Default.Check, contentDescription = null, tint = Color.Black, modifier = Modifier.size(11.dp))
+                                    }
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = preset.label,
+                                    color = if (selected) TextPrimary else TextSecondary,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold)
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(18.dp))
+
+                    // Background Surface Mode (Pure White, Soft White, OLED Black, Obsidian, Dark Slate)
+                    Text("Background Surface", color = TextPrimary, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        SurfacePreset.entries.forEach { preset ->
+                            val selected = ThemeState.surfacePreset == preset
+                            Row(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(if (selected) AuraCyan.copy(alpha = 0.16f) else GlassPanel)
+                                    .border(1.5.dp, if (selected) AuraCyan else GlassBorder, RoundedCornerShape(12.dp))
+                                    .clickable {
+                                        ThemeState.surfacePreset = preset
+                                        prefs.edit().putString("theme_surface", preset.key).apply()
+                                    }
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(14.dp)
+                                        .clip(CircleShape)
+                                        .background(preset.bg)
+                                        .border(1.dp, if (preset.isLight) Color(0xFF94A3B8) else Color(0x55FFFFFF), CircleShape)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = preset.label,
+                                    color = if (selected) AuraCyan else TextSecondary,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    SettingsToggleRow(
+                        title = "Ultra-Minimal Compact Cards",
+                        subtitle = "Sleek, compact spacing and minimal card padding",
+                        checked = ThemeState.ultraMinimalCards,
+                        onCheckedChange = { enabled ->
+                            ThemeState.ultraMinimalCards = enabled
+                            prefs.edit().putBoolean("ultra_minimal_cards", enabled).apply()
+                        }
+                    )
+
+                    SettingsToggleRow(
+                        title = "Ambient Background Glow",
+                        subtitle = "Subtle neon radial backdrop (turn off for pure OLED)",
+                        checked = ThemeState.showAmbientGlow,
+                        onCheckedChange = { enabled ->
+                            ThemeState.showAmbientGlow = enabled
+                            prefs.edit().putBoolean("ambient_glow", enabled).apply()
+                        }
+                    )
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    HorizontalDivider(color = GlassBorder)
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Text(
+                        "SYSTEM PREFERENCES",
+                        style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 3.sp, fontWeight = FontWeight.Bold),
+                        color = AuraCyan
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
 
                     SettingsToggleRow(
                         title = "Haptic Feedback",
@@ -555,7 +714,7 @@ fun MorphingSettingsOrb(
 
                     SettingsToggleRow(
                         title = "Live Screen & Mic Guard Alerts",
-                        subtitle = "Warn immediately if an app records screen or audio in background",
+                        subtitle = "Warn immediately if an app records screen or audio",
                         checked = liveGuardAlertsEnabled,
                         onCheckedChange = { enabled ->
                             if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -565,7 +724,7 @@ fun MorphingSettingsOrb(
 
                     SettingsToggleRow(
                         title = "Background Guard & Thermal Service",
-                        subtitle = "Keep screen-recording guard & thermal telemetry active in background",
+                        subtitle = "Keep guard & thermal monitor active in background",
                         checked = bgMonitoringEnabled,
                         onCheckedChange = { enabled ->
                             if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -586,8 +745,7 @@ fun MorphingSettingsOrb(
                         }
                     )
 
-                    Spacer(modifier = Modifier.weight(1f, fill = false))
-                    Spacer(modifier = Modifier.height(32.dp))
+                    Spacer(modifier = Modifier.height(16.dp))
 
                     Box(
                         modifier = Modifier
@@ -595,8 +753,9 @@ fun MorphingSettingsOrb(
                             .testTag("settings_close_button")
                             .clip(RoundedCornerShape(100.dp))
                             .clickable { isExpanded = false }
-                            .background(Color.White.copy(alpha = 0.12f))
-                            .padding(horizontal = 36.dp, vertical = 14.dp)
+                            .background(GlassPanel)
+                            .border(1.dp, GlassBorder, RoundedCornerShape(100.dp))
+                            .padding(horizontal = 36.dp, vertical = 12.dp)
                     ) {
                         Text(
                             "CLOSE",
@@ -605,7 +764,7 @@ fun MorphingSettingsOrb(
                         )
                     }
 
-                    Spacer(modifier = Modifier.height(24.dp))
+                    Spacer(modifier = Modifier.height(20.dp))
                 }
             }
         }
@@ -621,21 +780,21 @@ fun SettingsSliderRow(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 16.dp)
+            .padding(vertical = 10.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(title, color = TextPrimary, style = MaterialTheme.typography.bodyLarge)
+            Text(title, color = TextPrimary, style = MaterialTheme.typography.bodyMedium)
             Text(
                 "${value.toInt()}°C (Crit ${(value + 5).toInt()}°C)",
                 color = AuraCyan,
-                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold)
+                style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold)
             )
         }
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(4.dp))
         Slider(
             value = value.coerceIn(30f, 50f),
             onValueChange = onValueChange,
@@ -661,14 +820,14 @@ fun SettingsToggleRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable { onCheckedChange(!checked) }
-            .padding(vertical = 14.dp),
+            .padding(vertical = 10.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
-            Text(title, color = if (checked) TextPrimary else TextSecondary, style = MaterialTheme.typography.bodyLarge)
+            Text(title, color = if (checked) TextPrimary else TextSecondary, style = MaterialTheme.typography.bodyMedium)
             Spacer(modifier = Modifier.height(2.dp))
-            Text(subtitle, color = TextTertiary, style = MaterialTheme.typography.bodySmall)
+            Text(subtitle, color = TextTertiary, style = MaterialTheme.typography.labelSmall)
         }
         Switch(
             checked = checked,

@@ -21,15 +21,26 @@ class ExampleRobolectricTest {
     fun `read string from context`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val appName = context.getString(R.string.app_name)
-        assertEquals("Therm by Rj", appName)
+        assertEquals("dot", appName)
     }
 
     @Test
     fun `formatBytes formats sizes accurately`() {
         assertEquals("0 B", formatBytes(0L))
         assertEquals("512.0 B", formatBytes(512L))
-        assertEquals("1.0 KB", formatBytes(1024L))
-        assertEquals("1.5 MB", formatBytes(1572864L))
+        assertEquals("1.0 KB", formatBytes(1_000L))
+        assertEquals("1.5 MB", formatBytes(1_500_000L))
+        assertEquals("92.0 GB", formatBytes(92_000_000_000L))
+    }
+
+    @Test
+    fun `privacy analyzer tracks baseline and permission changes`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val summary = PrivacyAnalyzer.analyzeDevicePrivacy(context, includeSystemApps = false)
+        val initialChanges = PrivacyAnalyzer.getPrivacyChanges(context, summary.appReports)
+        assertTrue(initialChanges.size >= 0)
+        val cleared = PrivacyAnalyzer.clearPrivacyChangeLog(context, summary.appReports)
+        assertTrue(cleared.isEmpty())
     }
 
     @Test
@@ -68,5 +79,30 @@ class ExampleRobolectricTest {
         val telemetry = PrivacyAnalyzer.analyzeAppTelemetryAndTrackers(context, includeSystemApps = false)
         assertTrue(telemetry.totalAppsScanned >= 0)
         assertTrue(telemetry.appReports.all { it.telemetryScore in 0..100 })
+    }
+
+    @Test
+    fun `brand and oem packages are recognized and excluded from sideload warnings`() {
+        assertTrue(PrivacyAnalyzer.isBrandOrOemPackage("com.miui.screenrecorder"))
+        assertTrue(PrivacyAnalyzer.isBrandOrOemPackage("com.xiaomi.market"))
+        assertTrue(PrivacyAnalyzer.isBrandOrOemPackage("com.samsung.android.app.smartcapture"))
+        assertFalse(PrivacyAnalyzer.isBrandOrOemPackage("org.random.unknown.sideloaded"))
+
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val timeline = PrivacyAnalyzer.getPermissionAccessTimeline(context, includeSystemApps = false)
+        assertTrue(timeline.size >= 0)
+    }
+
+    @Test
+    fun `hidden settings catalog and white surface presets are properly configured`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val catalog = com.example.ui.screens.buildHiddenSettingsCatalog(context)
+        assertTrue(catalog.size >= 24)
+        assertTrue(catalog.all { it.title.isNotBlank() && it.subtitle.isNotBlank() && it.targets.isNotEmpty() })
+
+        val pureWhite = com.example.ui.theme.SurfacePreset.PURE_WHITE
+        val softWhite = com.example.ui.theme.SurfacePreset.SOFT_WHITE
+        assertTrue(pureWhite.isLight)
+        assertTrue(softWhite.isLight)
     }
 }

@@ -3,8 +3,6 @@ package com.example.service
 import android.Manifest
 import android.app.AppOpsManager
 import android.app.admin.DevicePolicyManager
-import android.app.usage.NetworkStats
-import android.app.usage.NetworkStatsManager
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
@@ -12,8 +10,6 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
-import android.net.ConnectivityManager
-import android.net.TrafficStats
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -107,6 +103,37 @@ data class DeviceTelemetrySummary(
     val totalTrackersDetected: Int,
     val bootTrackersCount: Int,
     val appReports: List<AppTelemetryReport>
+)
+
+enum class PrivacyChangeType(val label: String) {
+    PERM_REVOKED("Revoked"),
+    PERM_ADDED("Granted"),
+    NEW_APP("New App"),
+    APP_REMOVED("Removed")
+}
+
+data class PrivacyChangeEvent(
+    val id: Long,
+    val timestamp: Long,
+    val packageName: String,
+    val appName: String,
+    val changeType: PrivacyChangeType,
+    val permissionTitle: String,
+    val detail: String
+)
+
+data class PermissionAccessEvent(
+    val id: String,
+    val packageName: String,
+    val appName: String,
+    val icon: Drawable,
+    val permissionTitle: String,
+    val shortTag: String,
+    val category: PermissionCategory,
+    val riskLevel: PermissionRiskLevel,
+    val timestamp: Long,
+    val accessContext: String, // e.g. "Active Now", "AppOps Verified", "Foreground Session", "Background Service"
+    val permissionInfo: PlainPermissionInfo
 )
 
 object PrivacyAnalyzer {
@@ -421,7 +448,58 @@ object PrivacyAnalyzer {
         }
     }
 
-    fun analyzeDevicePrivacy(context: Context, includeSystemApps: Boolean = false): DevicePrivacySummary {
+    @Volatile
+    private var cachedPrivacyUser: DevicePrivacySummary? = null
+    @Volatile
+    private var cachedPrivacySystem: DevicePrivacySummary? = null
+    @Volatile
+    private var cachedPrivacyUserTimeMs: Long = 0L
+    @Volatile
+    private var cachedPrivacySystemTimeMs: Long = 0L
+
+    @Volatile
+    private var cachedTelemetryUser: DeviceTelemetrySummary? = null
+    @Volatile
+    private var cachedTelemetrySystem: DeviceTelemetrySummary? = null
+    @Volatile
+    private var cachedTelemetryUserTimeMs: Long = 0L
+    @Volatile
+    private var cachedTelemetrySystemTimeMs: Long = 0L
+
+    @Volatile
+    private var cachedTimelineUser: List<PermissionAccessEvent>? = null
+    @Volatile
+    private var cachedTimelineSystem: List<PermissionAccessEvent>? = null
+    @Volatile
+    private var cachedTimelineTimeMs: Long = 0L
+
+    @Volatile
+    private var cachedChangeEvents: List<PrivacyChangeEvent>? = null
+
+    fun peekCachedPrivacySummary(includeSystemApps: Boolean = false): DevicePrivacySummary? =
+        if (includeSystemApps) cachedPrivacySystem else cachedPrivacyUser
+
+    fun peekCachedTelemetry(includeSystemApps: Boolean = false): DeviceTelemetrySummary? =
+        if (includeSystemApps) cachedTelemetrySystem else cachedTelemetryUser
+
+    fun peekCachedTimeline(includeSystemApps: Boolean = false): List<PermissionAccessEvent>? =
+        if (includeSystemApps) cachedTimelineSystem else cachedTimelineUser
+
+    fun peekCachedChanges(): List<PrivacyChangeEvent>? = cachedChangeEvents
+
+    fun analyzeDevicePrivacy(
+        context: Context,
+        includeSystemApps: Boolean = false,
+        forceRefresh: Boolean = false
+    ): DevicePrivacySummary {
+        val nowCheck = System.currentTimeMillis()
+        if (!forceRefresh) {
+            val cached = if (includeSystemApps) cachedPrivacySystem else cachedPrivacyUser
+            val cachedTs = if (includeSystemApps) cachedPrivacySystemTimeMs else cachedPrivacyUserTimeMs
+            if (cached != null && (nowCheck - cachedTs) < 25_000L) {
+                return cached
+            }
+        }
         val pm = context.packageManager
         val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
         val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
@@ -441,12 +519,25 @@ object PrivacyAnalyzer {
             emptyList()
         }
 
-        val trustedInstallers = setOf(
+        val trustedStoreInstallers = setOf(
             "com.android.vending",
             "com.google.android.feedback",
-            "com.google.android.packageinstaller",
+            "com.sec.android.app.samsungapps",
             "com.samsung.android.app.omcagent",
-            "com.sec.android.app.samsungapps"
+            "com.xiaomi.market",
+            "com.xiaomi.discover",
+            "com.miui.packageinstaller",
+            "com.miui.securitycenter",
+            "com.miui.cloudbackup",
+            "com.miui.backup",
+            "com.android.updater",
+            "com.heytap.market",
+            "com.oppo.market",
+            "com.oneplus.backuprestore",
+            "com.vivo.appstore",
+            "com.bbk.appstore",
+            "com.huawei.appmarket",
+            "com.amazon.venezia"
         )
 
         val reports = mutableListOf<AppPrivacyReport>()
@@ -457,6 +548,7 @@ object PrivacyAnalyzer {
             val appInfo = pkgInfo.applicationInfo ?: continue
             if (pkgInfo.packageName == context.packageName) continue
 
+            val isBrandOem = isBrandOrOemPackage(pkgInfo.packageName)
             val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0 ||
                 (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
             if (isSystem && !includeSystemApps) continue
@@ -512,7 +604,7 @@ object PrivacyAnalyzer {
             }
 
             val installer = getInstallerPackage(pm, pkgInfo.packageName)
-            val isSideloaded = !isSystem && (installer == null || installer !in trustedInstallers)
+            val isSideloaded = !isSystem && !isBrandOem && (installer == null || installer !in trustedStoreInstallers)
 
             val lastUsed = usageMap[pkgInfo.packageName] ?: 0L
             val isUnusedRecently = lastUsed in 1L until (now - sevenDaysMs)
@@ -550,13 +642,13 @@ object PrivacyAnalyzer {
                     appName = appName,
                     packageName = pkgInfo.packageName,
                     icon = icon,
-                    isSystem = isSystem,
+                    isSystem = isSystem || isBrandOem,
                     grantedPermissions = grantedList.sortedByDescending { it.riskLevel.weight },
                     riskScore = cappedRisk,
                     riskBadge = badge,
                     lastTimeUsedMs = lastUsed,
                     isSideloaded = isSideloaded,
-                    installerName = formatInstallerName(installer, isSystem),
+                    installerName = formatInstallerName(installer, isSystem, isBrandOem),
                     hasInternetAccess = hasInternet,
                     canUploadSensitiveData = canUpload,
                     hasOverlayPermission = hasOverlay,
@@ -604,7 +696,7 @@ object PrivacyAnalyzer {
 
         val tips = buildShortActionTips(sortedReports.filter { !it.isSystem }.ifEmpty { sortedReports }, unusedRiskyCount)
 
-        return DevicePrivacySummary(
+        val result = DevicePrivacySummary(
             privacyScore = privacyScore,
             letterGrade = grade,
             statusHeadline = headline,
@@ -619,6 +711,14 @@ object PrivacyAnalyzer {
             topActionTips = tips,
             appReports = sortedReports
         )
+        if (includeSystemApps) {
+            cachedPrivacySystem = result
+            cachedPrivacySystemTimeMs = System.currentTimeMillis()
+        } else {
+            cachedPrivacyUser = result
+            cachedPrivacyUserTimeMs = System.currentTimeMillis()
+        }
+        return result
     }
 
     /**
@@ -627,8 +727,17 @@ object PrivacyAnalyzer {
      */
     fun analyzeAppTelemetryAndTrackers(
         context: Context,
-        includeSystemApps: Boolean = false
+        includeSystemApps: Boolean = false,
+        forceRefresh: Boolean = false
     ): DeviceTelemetrySummary {
+        val nowCheck = System.currentTimeMillis()
+        if (!forceRefresh) {
+            val cached = if (includeSystemApps) cachedTelemetrySystem else cachedTelemetryUser
+            val cachedTs = if (includeSystemApps) cachedTelemetrySystemTimeMs else cachedTelemetryUserTimeMs
+            if (cached != null && (nowCheck - cachedTs) < 30_000L) {
+                return cached
+            }
+        }
         val pm = context.packageManager
         val flags = PackageManager.GET_PERMISSIONS or
             PackageManager.GET_SERVICES or
@@ -718,8 +827,6 @@ object PrivacyAnalyzer {
                 if (usesWakeLock && hasInternet) add("Background WakeLock")
             }
 
-            val (txBytes, rxBytes) = queryUidNetworkTraffic(context, appInfo.uid)
-
             var score = 0
             if (hasInternet) {
                 score += detectedAds.size * 16
@@ -729,7 +836,6 @@ object PrivacyAnalyzer {
                 if (readsPhoneId) score += 8
                 if (scansWifiOrBt) score += 6
                 if (usesWakeLock) score += 5
-                if (txBytes > 10L * 1024 * 1024) score += 8
             }
             val finalScore = score.coerceIn(0, 100)
 
@@ -763,8 +869,8 @@ object PrivacyAnalyzer {
                     usesAdId = usesAdId,
                     runsAtBoot = runsAtBoot,
                     usesWakeLock = usesWakeLock,
-                    uploadedBytes = txBytes,
-                    downloadedBytes = rxBytes,
+                    uploadedBytes = 0L,
+                    downloadedBytes = 0L,
                     telemetryScore = finalScore,
                     severityBadge = badge
                 )
@@ -774,11 +880,10 @@ object PrivacyAnalyzer {
         val sorted = reports.sortedWith(
             compareByDescending<AppTelemetryReport> { it.telemetryScore }
                 .thenByDescending { it.detectedAdNetworks.size + it.detectedAnalyticsSdks.size }
-                .thenByDescending { it.uploadedBytes }
                 .thenBy { it.appName.lowercase() }
         )
 
-        return DeviceTelemetrySummary(
+        val result = DeviceTelemetrySummary(
             totalAppsScanned = sorted.size,
             heavyCollectorsCount = sorted.count { it.telemetryScore >= 45 },
             adIdAppsCount = sorted.count { it.usesAdId },
@@ -786,43 +891,14 @@ object PrivacyAnalyzer {
             bootTrackersCount = sorted.count { it.runsAtBoot && it.telemetryScore >= 22 },
             appReports = sorted
         )
-    }
-
-    @Suppress("DEPRECATION")
-    private fun queryUidNetworkTraffic(context: Context, uid: Int): Pair<Long, Long> {
-        val tx = try {
-            TrafficStats.getUidTxBytes(uid).coerceAtLeast(0L)
-        } catch (_: Exception) {
-            0L
+        if (includeSystemApps) {
+            cachedTelemetrySystem = result
+            cachedTelemetrySystemTimeMs = System.currentTimeMillis()
+        } else {
+            cachedTelemetryUser = result
+            cachedTelemetryUserTimeMs = System.currentTimeMillis()
         }
-        val rx = try {
-            TrafficStats.getUidRxBytes(uid).coerceAtLeast(0L)
-        } catch (_: Exception) {
-            0L
-        }
-        if (tx > 0L || rx > 0L) return tx to rx
-
-        // Fallback to NetworkStatsManager when Usage Access is granted
-        return try {
-            val nsm = context.getSystemService(Context.NETWORK_STATS_SERVICE) as NetworkStatsManager
-            val now = System.currentTimeMillis()
-            val monthAgo = now - (30L * 24 * 60 * 60 * 1000L)
-            var totalTx = 0L
-            var totalRx = 0L
-            for (netType in listOf(ConnectivityManager.TYPE_WIFI, ConnectivityManager.TYPE_MOBILE)) {
-                val stats = nsm.queryDetailsForUid(netType, null, monthAgo, now, uid)
-                val bucket = NetworkStats.Bucket()
-                while (stats.hasNextBucket()) {
-                    stats.getNextBucket(bucket)
-                    totalTx += bucket.txBytes.coerceAtLeast(0L)
-                    totalRx += bucket.rxBytes.coerceAtLeast(0L)
-                }
-                stats.close()
-            }
-            totalTx to totalRx
-        } catch (_: Exception) {
-            0L to 0L
-        }
+        return result
     }
 
     private fun buildShortActionTips(reports: List<AppPrivacyReport>, unusedRiskyCount: Int): List<String> {
@@ -874,6 +950,59 @@ object PrivacyAnalyzer {
         }
     }
 
+    fun isBrandOrOemPackage(packageName: String): Boolean {
+        val pkg = packageName.lowercase()
+        val brandPrefixes = listOf(
+            "com.miui.",
+            "com.xiaomi.",
+            "com.mi.",
+            "org.mipay.",
+            "com.duokan.",
+            "com.bsp.",
+            "cn.wps.moffice_eng.xiaomi",
+            "com.sohu.inputmethod.sogou.xiaomi",
+            "com.baidu.input_mi",
+            "com.facemoji.lite.xiaomi",
+            "com.poco.",
+            "com.blackshark.",
+            "com.google.",
+            "com.android.",
+            "android.",
+            "com.qualcomm.",
+            "com.qti.",
+            "com.mediatek.",
+            "org.codeaurora.",
+            "com.samsung.",
+            "com.sec.",
+            "com.oplus.",
+            "com.coloros.",
+            "com.heytap.",
+            "com.oppo.",
+            "com.oneplus.",
+            "com.realme.",
+            "com.nearme.",
+            "com.vivo.",
+            "com.bbk.",
+            "com.iqoo.",
+            "com.nothing.",
+            "com.motorola.",
+            "com.asus.",
+            "com.sony.",
+            "com.sonymobile.",
+            "com.huawei.",
+            "com.hihonor.",
+            "com.transsion.",
+            "com.infinix.",
+            "com.tecno."
+        )
+        if (pkg == "android" || brandPrefixes.any { pkg.startsWith(it) }) return true
+        val devBrand = Build.BRAND?.lowercase()?.takeIf { it.length >= 3 }
+        val devMfr = Build.MANUFACTURER?.lowercase()?.takeIf { it.length >= 3 }
+        if (devBrand != null && (pkg.startsWith("com.$devBrand.") || pkg.contains(".$devBrand."))) return true
+        if (devMfr != null && (pkg.startsWith("com.$devMfr.") || pkg.contains(".$devMfr."))) return true
+        return false
+    }
+
     fun getEnabledInputMethods(context: Context): List<String> {
         return try {
             val raw = Settings.Secure.getString(
@@ -884,12 +1013,20 @@ object PrivacyAnalyzer {
                 "com.google.android.inputmethod",
                 "com.android.inputmethod",
                 "com.samsung.android.honeyboard",
-                "com.sec.android.inputmethod"
+                "com.sec.android.inputmethod",
+                "com.miui.",
+                "com.xiaomi.",
+                "com.sohu.inputmethod.sogou.xiaomi",
+                "com.baidu.input_mi",
+                "com.facemoji.lite.xiaomi",
+                "com.oplus.",
+                "com.coloros.",
+                "com.vivo."
             )
             raw.split(":")
                 .mapNotNull { it.substringBefore("/", "").takeIf { pkg -> pkg.isNotBlank() } }
                 .distinct()
-                .filter { pkg -> trustedPrefixes.none { pkg.startsWith(it) } }
+                .filter { pkg -> trustedPrefixes.none { pkg.startsWith(it) } && !isBrandOrOemPackage(pkg) }
         } catch (_: Exception) {
             emptyList()
         }
@@ -937,15 +1074,216 @@ object PrivacyAnalyzer {
         }
     }
 
-    private fun formatInstallerName(installerPkg: String?, isSystem: Boolean): String {
+    private fun formatInstallerName(installerPkg: String?, isSystem: Boolean, isBrandOem: Boolean = false): String {
         if (isSystem) return "System App"
+        if (isBrandOem) return "Brand App"
         return when (installerPkg) {
-            "com.android.vending" -> "Play Store"
-            "com.sec.android.app.samsungapps" -> "Galaxy Store"
-            "com.google.android.packageinstaller" -> "APK Installer"
+            "com.android.vending", "com.google.android.feedback" -> "Play Store"
+            "com.sec.android.app.samsungapps", "com.samsung.android.app.omcagent" -> "Galaxy Store"
+            "com.xiaomi.market", "com.xiaomi.discover", "com.miui.packageinstaller", "com.android.updater" -> "Xiaomi Store"
+            "com.heytap.market", "com.oppo.market" -> "App Market"
+            "com.vivo.appstore", "com.bbk.appstore" -> "V-Appstore"
+            "com.huawei.appmarket" -> "AppGallery"
+            "com.google.android.packageinstaller", "com.android.packageinstaller" -> "APK Installer"
             null -> "Sideloaded APK"
             else -> installerPkg
         }
+    }
+
+    fun hasUsageStatsPermission(context: Context): Boolean {
+        return try {
+            val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), context.packageName)
+            } else {
+                @Suppress("DEPRECATION")
+                appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), context.packageName)
+            }
+            mode == AppOpsManager.MODE_ALLOWED
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun getPermissionAccessTimeline(
+        context: Context,
+        includeSystemApps: Boolean = false
+    ): List<PermissionAccessEvent> {
+        val summary = analyzeDevicePrivacy(context, includeSystemApps = includeSystemApps)
+        val reports = summary.appReports.filter { it.grantedPermissions.isNotEmpty() }
+        val appOpsTimes = queryAppOpsLastAccessMap(context)
+        val sessionTimes = queryRecentUsageSessionsMap(context)
+        val pm = context.packageManager
+
+        val timeline = mutableListOf<PermissionAccessEvent>()
+
+        for (app in reports) {
+            val pkgOps = appOpsTimes[app.packageName] ?: emptyMap()
+            val (lastFgTime, lastSvcTime) = sessionTimes[app.packageName] ?: (app.lastTimeUsedMs to 0L)
+            val fallbackInstallTime = try {
+                pm.getPackageInfo(app.packageName, 0).lastUpdateTime
+            } catch (_: Exception) {
+                0L
+            }
+
+            // Show up to the most important sensitive permissions per app with their exact access timestamps
+            for (perm in app.grantedPermissions) {
+                val appOpTime = pkgOps[perm.permissionName] ?: 0L
+                val bestTimestamp: Long
+                val contextLabel: String
+
+                when {
+                    appOpTime > 0L -> {
+                        bestTimestamp = appOpTime
+                        contextLabel = "System AppOps"
+                    }
+                    lastSvcTime > 0L && lastSvcTime >= lastFgTime -> {
+                        bestTimestamp = lastSvcTime
+                        contextLabel = "Background service"
+                    }
+                    lastFgTime > 0L -> {
+                        bestTimestamp = lastFgTime
+                        contextLabel = "Foreground session"
+                    }
+                    app.lastTimeUsedMs > 0L -> {
+                        bestTimestamp = app.lastTimeUsedMs
+                        contextLabel = "Recent session"
+                    }
+                    else -> {
+                        bestTimestamp = fallbackInstallTime
+                        contextLabel = "Granted on install"
+                    }
+                }
+
+                if (bestTimestamp > 0L) {
+                    timeline.add(
+                        PermissionAccessEvent(
+                            id = "${app.packageName}_${perm.permissionName}",
+                            packageName = app.packageName,
+                            appName = app.appName,
+                            icon = app.icon,
+                            permissionTitle = perm.friendlyTitle,
+                            shortTag = perm.shortTag,
+                            category = perm.category,
+                            riskLevel = perm.riskLevel,
+                            timestamp = bestTimestamp,
+                            accessContext = contextLabel,
+                            permissionInfo = perm
+                        )
+                    )
+                }
+            }
+        }
+
+        val sortedTimeline = timeline.sortedWith(
+            compareByDescending<PermissionAccessEvent> { it.timestamp }
+                .thenByDescending { it.riskLevel.weight }
+        )
+        if (includeSystemApps) {
+            cachedTimelineSystem = sortedTimeline
+        } else {
+            cachedTimelineUser = sortedTimeline
+        }
+        cachedTimelineTimeMs = System.currentTimeMillis()
+        return sortedTimeline
+    }
+
+    private fun queryRecentUsageSessionsMap(context: Context): Map<String, Pair<Long, Long>> {
+        val result = mutableMapOf<String, Pair<Long, Long>>()
+        try {
+            val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+            val end = System.currentTimeMillis()
+            val start = end - (7L * 24 * 60 * 60 * 1000L)
+
+            // 1. Base usage stats (lastTimeUsed + lastTimeForegroundServiceUsed)
+            val stats = usm.queryUsageStats(UsageStatsManager.INTERVAL_WEEKLY, start, end)
+            stats?.forEach { st ->
+                val fg = st.lastTimeUsed
+                val svc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    st.lastTimeForegroundServiceUsed
+                } else 0L
+                val existing = result[st.packageName]
+                result[st.packageName] = maxOf(existing?.first ?: 0L, fg) to maxOf(existing?.second ?: 0L, svc)
+            }
+
+            // 2. Exact event stream from last 24 hours
+            val events = usm.queryEvents(end - (24L * 60 * 60 * 1000L), end)
+            val event = android.app.usage.UsageEvents.Event()
+            while (events != null && events.hasNextEvent()) {
+                events.getNextEvent(event)
+                val pkg = event.packageName ?: continue
+                val ts = event.timeStamp
+                val cur = result[pkg] ?: (0L to 0L)
+                when (event.eventType) {
+                    android.app.usage.UsageEvents.Event.ACTIVITY_RESUMED -> {
+                        if (ts > cur.first) result[pkg] = ts to cur.second
+                    }
+                    android.app.usage.UsageEvents.Event.FOREGROUND_SERVICE_START -> {
+                        if (ts > cur.second) result[pkg] = cur.first to ts
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return result
+    }
+
+    private fun queryAppOpsLastAccessMap(context: Context): Map<String, Map<String, Long>> {
+        val map = mutableMapOf<String, MutableMap<String, Long>>()
+        try {
+            val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+            val getPackagesForOps = appOps.javaClass.getMethod("getPackagesForOps", IntArray::class.java)
+            val pkgOpsList = getPackagesForOps.invoke(appOps, null) as? List<*> ?: return emptyMap()
+
+            for (pkgOps in pkgOpsList) {
+                if (pkgOps == null) continue
+                val pkgName = pkgOps.javaClass.getMethod("getPackageName").invoke(pkgOps) as? String ?: continue
+                val ops = pkgOps.javaClass.getMethod("getOps").invoke(pkgOps) as? List<*> ?: continue
+                val permTimes = map.getOrPut(pkgName) { mutableMapOf() }
+
+                for (opEntry in ops) {
+                    if (opEntry == null) continue
+                    val opStr = try {
+                        opEntry.javaClass.getMethod("getOpStr").invoke(opEntry) as? String
+                    } catch (_: Exception) {
+                        null
+                    } ?: continue
+
+                    val lastTime = try {
+                        val m = opEntry.javaClass.getMethod("getLastAccessTime", Int::class.javaPrimitiveType)
+                        (m.invoke(opEntry, 0x1f) as? Long) ?: 0L
+                    } catch (_: Exception) {
+                        try {
+                            val m2 = opEntry.javaClass.getMethod("getTime")
+                            (m2.invoke(opEntry) as? Long) ?: 0L
+                        } catch (_: Exception) {
+                            0L
+                        }
+                    }
+
+                    if (lastTime > 0L) {
+                        val mappedPerm = when (opStr) {
+                            AppOpsManager.OPSTR_CAMERA -> Manifest.permission.CAMERA
+                            AppOpsManager.OPSTR_RECORD_AUDIO -> Manifest.permission.RECORD_AUDIO
+                            AppOpsManager.OPSTR_FINE_LOCATION -> Manifest.permission.ACCESS_FINE_LOCATION
+                            AppOpsManager.OPSTR_COARSE_LOCATION -> Manifest.permission.ACCESS_COARSE_LOCATION
+                            AppOpsManager.OPSTR_READ_CONTACTS -> Manifest.permission.READ_CONTACTS
+                            AppOpsManager.OPSTR_READ_SMS -> Manifest.permission.READ_SMS
+                            AppOpsManager.OPSTR_READ_CALL_LOG -> Manifest.permission.READ_CALL_LOG
+                            AppOpsManager.OPSTR_READ_PHONE_STATE -> Manifest.permission.READ_PHONE_STATE
+                            AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW -> Manifest.permission.SYSTEM_ALERT_WINDOW
+                            AppOpsManager.OPSTR_READ_EXTERNAL_STORAGE -> Manifest.permission.READ_EXTERNAL_STORAGE
+                            else -> null
+                        }
+                        if (mappedPerm != null) {
+                            permTimes[mappedPerm] = maxOf(permTimes[mappedPerm] ?: 0L, lastTime)
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return map
     }
 
     private fun getRecentUsageMap(context: Context): Map<String, Long> {
@@ -959,5 +1297,285 @@ object PrivacyAnalyzer {
         } catch (_: Exception) {
             emptyMap()
         }
+    }
+
+    private const val PREFS_PRIVACY_DIFF = "privacy_baseline_prefs"
+    private const val KEY_HAS_BASELINE = "has_baseline_v1"
+    private const val KEY_SNAPSHOT = "baseline_snapshot_v1"
+    private const val KEY_CHANGE_LOG = "change_log_v1"
+
+    fun openAppPermissionScreen(context: Context, packageName: String) {
+        val appPermsIntent = Intent("android.intent.action.MANAGE_APP_PERMISSIONS").apply {
+            putExtra(Intent.EXTRA_PACKAGE_NAME, packageName)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            context.startActivity(appPermsIntent)
+        } catch (_: Exception) {
+            try {
+                context.startActivity(
+                    Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.fromParts("package", packageName, null)
+                    ).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+                )
+            } catch (_: Exception) {}
+        }
+    }
+
+    @Synchronized
+    fun getPrivacyChanges(context: Context, currentReports: List<AppPrivacyReport>): List<PrivacyChangeEvent> {
+        val prefs = context.getSharedPreferences(PREFS_PRIVACY_DIFF, Context.MODE_PRIVATE)
+        val pm = context.packageManager
+        val now = System.currentTimeMillis()
+
+        // Always compare against non-system + current reports so toggling "System" doesn't create false diffs
+        val userReports = currentReports.filter { !it.isSystem }
+        val hasBaseline = prefs.getBoolean(KEY_HAS_BASELINE, false)
+        val existingLog = decodeChangeLog(prefs.getString(KEY_CHANGE_LOG, "") ?: "").toMutableList()
+
+        if (!hasBaseline) {
+            // Seed initial recent activity from recently installed/updated user apps so CHANGES tab is immediately useful
+            val seeded = mutableListOf<PrivacyChangeEvent>()
+            var idSeq = now - 1000L
+            val recentApps = userReports
+                .filter { it.grantedPermissions.isNotEmpty() }
+                .map { report ->
+                    val installTime = try {
+                        pm.getPackageInfo(report.packageName, 0).lastUpdateTime.takeIf { it > 0L } ?: now
+                    } catch (_: Exception) {
+                        now
+                    }
+                    report to installTime
+                }
+                .sortedByDescending { it.second }
+                .take(6)
+
+            for ((app, ts) in recentApps) {
+                seeded.add(
+                    PrivacyChangeEvent(
+                        id = idSeq++,
+                        timestamp = ts,
+                        packageName = app.packageName,
+                        appName = app.appName,
+                        changeType = PrivacyChangeType.NEW_APP,
+                        permissionTitle = "${app.grantedPermissions.size} permissions active",
+                        detail = app.grantedPermissions.take(3).joinToString(", ") { it.shortTag }
+                    )
+                )
+                app.grantedPermissions.take(2).forEach { perm ->
+                    seeded.add(
+                        PrivacyChangeEvent(
+                            id = idSeq++,
+                            timestamp = ts,
+                            packageName = app.packageName,
+                            appName = app.appName,
+                            changeType = PrivacyChangeType.PERM_ADDED,
+                            permissionTitle = perm.friendlyTitle,
+                            detail = perm.shortTag
+                        )
+                    )
+                }
+            }
+
+            val snapshotStr = encodeSnapshot(userReports)
+            val combined = (seeded.sortedByDescending { it.timestamp } + existingLog).take(100)
+            prefs.edit()
+                .putBoolean(KEY_HAS_BASELINE, true)
+                .putString(KEY_SNAPSHOT, snapshotStr)
+                .putString(KEY_CHANGE_LOG, encodeChangeLog(combined))
+                .apply()
+            return combined
+        }
+
+        val oldSnapshot = decodeSnapshot(prefs.getString(KEY_SNAPSHOT, "") ?: "")
+        val newEvents = mutableListOf<PrivacyChangeEvent>()
+        var nextId = (existingLog.maxOfOrNull { it.id } ?: now).coerceAtLeast(now) + 1L
+
+        val currentMap = userReports.associateBy { it.packageName }
+
+        // Check for newly installed apps or permission additions/revocations
+        for (app in userReports) {
+            val prevEntry = oldSnapshot[app.packageName]
+            val currentPermSet = app.grantedPermissions.map { it.permissionName }.toSet()
+            if (prevEntry == null) {
+                if (app.grantedPermissions.isNotEmpty()) {
+                    newEvents.add(
+                        PrivacyChangeEvent(
+                            id = nextId++,
+                            timestamp = now,
+                            packageName = app.packageName,
+                            appName = app.appName,
+                            changeType = PrivacyChangeType.NEW_APP,
+                            permissionTitle = "${app.grantedPermissions.size} permissions granted",
+                            detail = app.grantedPermissions.take(3).joinToString(", ") { it.shortTag }
+                        )
+                    )
+                }
+            } else {
+                val prevPerms = prevEntry.second
+                // Newly added permissions
+                for (perm in app.grantedPermissions) {
+                    if (perm.permissionName !in prevPerms) {
+                        newEvents.add(
+                            PrivacyChangeEvent(
+                                id = nextId++,
+                                timestamp = now,
+                                packageName = app.packageName,
+                                appName = app.appName,
+                                changeType = PrivacyChangeType.PERM_ADDED,
+                                permissionTitle = perm.friendlyTitle,
+                                detail = "Permission granted"
+                            )
+                        )
+                    }
+                }
+                // Newly revoked permissions
+                for (oldPermName in prevPerms) {
+                    if (oldPermName !in currentPermSet) {
+                        val info = permissionCatalog[oldPermName]
+                        val title = info?.friendlyTitle ?: oldPermName.substringAfterLast('.')
+                        newEvents.add(
+                            PrivacyChangeEvent(
+                                id = nextId++,
+                                timestamp = now,
+                                packageName = app.packageName,
+                                appName = app.appName,
+                                changeType = PrivacyChangeType.PERM_REVOKED,
+                                permissionTitle = title,
+                                detail = "Permission revoked"
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+        // Check for apps that had all permissions revoked or were uninstalled
+        for ((pkg, pair) in oldSnapshot) {
+            if (pkg !in currentMap) {
+                val oldAppName = pair.first
+                val oldPerms = pair.second
+                val isStillInstalled = try {
+                    pm.getPackageInfo(pkg, 0)
+                    true
+                } catch (_: Exception) {
+                    false
+                }
+                if (!isStillInstalled) {
+                    newEvents.add(
+                        PrivacyChangeEvent(
+                            id = nextId++,
+                            timestamp = now,
+                            packageName = pkg,
+                            appName = oldAppName,
+                            changeType = PrivacyChangeType.APP_REMOVED,
+                            permissionTitle = "App uninstalled",
+                            detail = "${oldPerms.size} permissions removed"
+                        )
+                    )
+                } else {
+                    for (oldPermName in oldPerms) {
+                        val info = permissionCatalog[oldPermName]
+                        val title = info?.friendlyTitle ?: oldPermName.substringAfterLast('.')
+                        newEvents.add(
+                            PrivacyChangeEvent(
+                                id = nextId++,
+                                timestamp = now,
+                                packageName = pkg,
+                                appName = oldAppName,
+                                changeType = PrivacyChangeType.PERM_REVOKED,
+                                permissionTitle = title,
+                                detail = "Permission revoked"
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+        val updatedLog = if (newEvents.isNotEmpty()) {
+            (newEvents + existingLog).take(100)
+        } else {
+            existingLog
+        }
+
+        prefs.edit()
+            .putString(KEY_SNAPSHOT, encodeSnapshot(userReports))
+            .putString(KEY_CHANGE_LOG, encodeChangeLog(updatedLog))
+            .apply()
+
+        cachedChangeEvents = updatedLog
+        return updatedLog
+    }
+
+    @Synchronized
+    fun clearPrivacyChangeLog(context: Context, currentReports: List<AppPrivacyReport>): List<PrivacyChangeEvent> {
+        val prefs = context.getSharedPreferences(PREFS_PRIVACY_DIFF, Context.MODE_PRIVATE)
+        val userReports = currentReports.filter { !it.isSystem }
+        prefs.edit()
+            .putBoolean(KEY_HAS_BASELINE, true)
+            .putString(KEY_SNAPSHOT, encodeSnapshot(userReports))
+            .putString(KEY_CHANGE_LOG, "")
+            .apply()
+        cachedChangeEvents = emptyList()
+        return emptyList()
+    }
+
+    private fun encodeSnapshot(reports: List<AppPrivacyReport>): String {
+        return reports.joinToString("\n") { app ->
+            val cleanName = app.appName.replace("|", " ").replace("\n", " ")
+            val perms = app.grantedPermissions.joinToString(",") { it.permissionName }
+            "${app.packageName}|$cleanName|$perms"
+        }
+    }
+
+    private fun decodeSnapshot(raw: String): Map<String, Pair<String, Set<String>>> {
+        if (raw.isBlank()) return emptyMap()
+        val map = mutableMapOf<String, Pair<String, Set<String>>>()
+        raw.lineSequence().forEach { line ->
+            val parts = line.split("|")
+            if (parts.size >= 3) {
+                val pkg = parts[0]
+                val name = parts[1]
+                val perms = parts[2].split(",").filter { it.isNotBlank() }.toSet()
+                map[pkg] = name to perms
+            }
+        }
+        return map
+    }
+
+    private fun encodeChangeLog(events: List<PrivacyChangeEvent>): String {
+        return events.joinToString("\n") { ev ->
+            val safeApp = ev.appName.replace("|", " ").replace("\n", " ")
+            val safeTitle = ev.permissionTitle.replace("|", " ").replace("\n", " ")
+            val safeDetail = ev.detail.replace("|", " ").replace("\n", " ")
+            "${ev.id}|${ev.timestamp}|${ev.packageName}|$safeApp|${ev.changeType.name}|$safeTitle|$safeDetail"
+        }
+    }
+
+    private fun decodeChangeLog(raw: String): List<PrivacyChangeEvent> {
+        if (raw.isBlank()) return emptyList()
+        return raw.lineSequence().mapNotNull { line ->
+            val p = line.split("|")
+            if (p.size >= 7) {
+                val id = p[0].toLongOrNull() ?: return@mapNotNull null
+                val ts = p[1].toLongOrNull() ?: 0L
+                val type = try {
+                    PrivacyChangeType.valueOf(p[4])
+                } catch (_: Exception) {
+                    PrivacyChangeType.PERM_ADDED
+                }
+                PrivacyChangeEvent(
+                    id = id,
+                    timestamp = ts,
+                    packageName = p[2],
+                    appName = p[3],
+                    changeType = type,
+                    permissionTitle = p[5],
+                    detail = p[6]
+                )
+            } else null
+        }.toList()
     }
 }

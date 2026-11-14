@@ -127,6 +127,7 @@ import androidx.security.crypto.EncryptedFile
 import com.example.GlassCard
 import com.example.InfoRow
 import com.example.formatBytes
+import com.example.queryDeviceStorageTotals
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
 import com.example.ui.theme.AuraOrange
@@ -196,6 +197,15 @@ private fun checkMediaPermission(context: Context): Boolean {
     }
 }
 
+@Volatile
+private var cachedFilesTotal: Long = 0L
+@Volatile
+private var cachedFilesUsed: Long = 0L
+@Volatile
+private var cachedFilesFree: Long = 0L
+@Volatile
+private var cachedFilesCategories: List<StorageCategory> = emptyList()
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun FilesScreen() {
@@ -205,11 +215,11 @@ fun FilesScreen() {
     val bookmarkPrefs = remember { context.getSharedPreferences("file_bookmarks_prefs", Context.MODE_PRIVATE) }
 
     var activeSubTab by remember { mutableStateOf("SMART_HUB") } // "SMART_HUB" or "FOLDER_BROWSER"
-    var categories by remember { mutableStateOf<List<StorageCategory>>(emptyList()) }
-    var totalSpace by remember { mutableLongStateOf(0L) }
-    var usedSpace by remember { mutableLongStateOf(0L) }
-    var freeSpace by remember { mutableLongStateOf(0L) }
-    var isAnalyzing by remember { mutableStateOf(true) }
+    var categories by remember { mutableStateOf(cachedFilesCategories) }
+    var totalSpace by remember { mutableLongStateOf(cachedFilesTotal) }
+    var usedSpace by remember { mutableLongStateOf(cachedFilesUsed) }
+    var freeSpace by remember { mutableLongStateOf(cachedFilesFree) }
+    var isAnalyzing by remember { mutableStateOf(cachedFilesCategories.isEmpty()) }
 
     var hasUsageAccess by remember { mutableStateOf(checkUsageStatsPermission(context)) }
     var hasManageStorage by remember {
@@ -301,11 +311,9 @@ fun FilesScreen() {
     }
 
     LaunchedEffect(refreshTrigger, hasPermission, hasUsageAccess, hasManageStorage) {
-        isAnalyzing = true
+        if (categories.isEmpty()) isAnalyzing = true
         withContext(Dispatchers.IO) {
-            val statFs = StatFs(Environment.getDataDirectory().path)
-            val tot = statFs.totalBytes
-            val free = statFs.availableBytes
+            val (tot, free) = queryDeviceStorageTotals(context)
             val used = max(0L, tot - free)
 
             val imageSize = if (hasPermission || hasManageStorage) queryMediaSize(context, MediaStore.Images.Media.EXTERNAL_CONTENT_URI) else 0L
@@ -336,10 +344,7 @@ fun FilesScreen() {
             val appSize = if (exactAppSize > 0L) min(exactAppSize, otherUsed) else (otherUsed * 0.4).toLong()
             val systemSize = max(0L, otherUsed - appSize)
 
-            totalSpace = tot
-            freeSpace = free
-            usedSpace = used
-            categories = listOf(
+            val newCats = listOf(
                 StorageCategory("Images", imageSize, AuraCyan, Icons.Default.Image),
                 StorageCategory("Videos", videoSize, AuraOrange, Icons.Default.VideoLibrary),
                 StorageCategory("Audio", audioSize, AuraRose, Icons.Default.AudioFile),
@@ -347,6 +352,16 @@ fun FilesScreen() {
                 StorageCategory("Apps & Data", appSize, AuraPurple, Icons.Default.Apps),
                 StorageCategory("System", systemSize, Color.Gray, Icons.Default.SystemUpdate)
             ).sortedByDescending { it.size }
+
+            cachedFilesTotal = tot
+            cachedFilesFree = free
+            cachedFilesUsed = used
+            cachedFilesCategories = newCats
+
+            totalSpace = tot
+            freeSpace = free
+            usedSpace = used
+            categories = newCats
             isAnalyzing = false
         }
     }

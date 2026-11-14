@@ -22,6 +22,6 @@ dependencyResolutionManagement {
   }
 }
 
-rootProject.name = "Therm by Rj"
+rootProject.name = "dot"
 
 include(":app")

@@ -18,6 +18,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -88,6 +89,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.GlassCard
 import com.example.formatBytes
+import com.example.queryDeviceStorageTotals
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
 import com.example.ui.theme.AuraOrange
@@ -211,9 +213,7 @@ fun StorageAnalysisScreen(onBack: () -> Unit) {
     LaunchedEffect(analysisTrigger, hasPermission, hasUsageAccess) {
         isAnalyzing = true
         withContext(Dispatchers.IO) {
-            val statFs = StatFs(Environment.getDataDirectory().path)
-            val tot = statFs.totalBytes
-            val free = statFs.availableBytes
+            val (tot, free) = queryDeviceStorageTotals(context)
             val used = max(0L, tot - free)
 
             val imageSize = if (hasPermission) getMediaSize(context, MediaStore.Images.Media.EXTERNAL_CONTENT_URI) else 0L
@@ -508,75 +508,78 @@ fun StorageDonutChart(total: Long, used: Long, free: Long, categories: List<Stor
     val usedPct = ((used.toFloat() / safeTotal.toFloat()) * 100f).toInt().coerceIn(0, 100)
 
     GlassCard(modifier = Modifier.fillMaxWidth()) {
-        Column(
+        Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalAlignment = Alignment.CenterHorizontally
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Box(contentAlignment = Alignment.Center, modifier = Modifier.size(200.dp)) {
-                Canvas(modifier = Modifier.size(160.dp)) {
-                    val strokeWidth = 20.dp.toPx()
-                    drawCircle(
-                        color = GlassBorder,
-                        radius = size.width / 2,
-                        style = Stroke(width = strokeWidth)
-                    )
-
-                    if (total > 0L) {
-                        var startAngle = -90f
-                        categories.forEach { cat ->
-                            val sweepAngle = (cat.size.toFloat() / safeTotal.toFloat()) * 360f
-                            if (sweepAngle > 2.5f) {
-                                drawArc(
-                                    color = cat.color,
-                                    startAngle = startAngle,
-                                    sweepAngle = sweepAngle - 2f,
-                                    useCenter = false,
-                                    style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
-                                )
-                                startAngle += sweepAngle
-                            }
-                        }
-                    }
-                }
-
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(
-                        text = "$usedPct%",
-                        style = MaterialTheme.typography.headlineLarge,
-                        color = TextPrimary,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text("USED", style = MaterialTheme.typography.labelSmall, color = TextTertiary)
-                }
+            Column {
+                Text(
+                    text = "${formatBytes(free)} Free",
+                    style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+                    color = AuraCyan
+                )
+                Text(
+                    text = "${formatBytes(used)} used of ${formatBytes(total)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSecondary
+                )
             }
-
-            Spacer(modifier = Modifier.height(16.dp))
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceAround) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("TOTAL", style = MaterialTheme.typography.labelSmall, color = TextTertiary)
-                    Text(formatBytes(total), style = MaterialTheme.typography.bodyLarge, color = TextPrimary)
-                }
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("USED", style = MaterialTheme.typography.labelSmall, color = TextTertiary)
-                    Text(formatBytes(used), style = MaterialTheme.typography.bodyLarge, color = AuraOrange)
-                }
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("FREE", style = MaterialTheme.typography.labelSmall, color = TextTertiary)
-                    Text(formatBytes(free), style = MaterialTheme.typography.bodyLarge, color = AuraCyan)
-                }
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-            FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(100.dp))
+                    .background(AuraCyan.copy(alpha = 0.14f))
+                    .border(1.dp, AuraCyan.copy(alpha = 0.35f), RoundedCornerShape(100.dp))
+                    .padding(horizontal = 10.dp, vertical = 4.dp)
             ) {
-                categories.filter { it.size > 0 }.forEach { cat ->
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(cat.color))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(cat.name, style = MaterialTheme.typography.labelSmall, color = TextSecondary)
-                    }
+                Text(
+                    text = "$usedPct% USED",
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                    color = AuraCyan
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Segmented horizontal storage bar
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(8.dp)
+                .clip(RoundedCornerShape(4.dp))
+                .background(Color.White.copy(alpha = 0.07f))
+        ) {
+            categories.filter { it.size > 0L }.forEach { cat ->
+                val weightVal = (cat.size.toFloat() / safeTotal.toFloat()).coerceIn(0.01f, 1f)
+                Box(
+                    modifier = Modifier
+                        .weight(weightVal)
+                        .height(8.dp)
+                        .background(cat.color)
+                )
+            }
+            val freeWeight = (free.toFloat() / safeTotal.toFloat()).coerceIn(0f, 1f)
+            if (freeWeight > 0.01f) {
+                Spacer(modifier = Modifier.weight(freeWeight))
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            categories.filter { it.size > 0 }.forEach { cat ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(cat.color))
+                    Spacer(modifier = Modifier.width(5.dp))
+                    Text(
+                        text = "${cat.name} (${formatBytes(cat.size)})",
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                        color = TextSecondary
+                    )
                 }
             }
         }
@@ -596,31 +599,31 @@ fun CategoryItemRow(cat: StorageCategory, totalSpace: Long, onClick: () -> Unit 
         modifier = Modifier
             .fillMaxWidth()
             .then(modifier)
-            .padding(vertical = 8.dp),
+            .padding(vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(
             modifier = Modifier
-                .size(40.dp)
+                .size(32.dp)
                 .clip(CircleShape)
-                .background(cat.color.copy(alpha = 0.2f)),
+                .background(cat.color.copy(alpha = 0.16f)),
             contentAlignment = Alignment.Center
         ) {
-            Icon(cat.icon, contentDescription = cat.name, tint = cat.color, modifier = Modifier.size(20.dp))
+            Icon(cat.icon, contentDescription = cat.name, tint = cat.color, modifier = Modifier.size(16.dp))
         }
-        Spacer(modifier = Modifier.width(16.dp))
+        Spacer(modifier = Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
-            Text(cat.name, style = MaterialTheme.typography.bodyMedium, color = TextPrimary)
-            Spacer(modifier = Modifier.height(4.dp))
+            Text(cat.name, style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold), color = TextPrimary)
+            Spacer(modifier = Modifier.height(3.dp))
             LinearProgressIndicator(
                 progress = { (cat.size.toFloat() / safeTotal.toFloat()).coerceIn(0f, 1f) },
-                modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
+                modifier = Modifier.fillMaxWidth().height(3.dp).clip(RoundedCornerShape(2.dp)),
                 color = cat.color,
                 trackColor = Color.White.copy(alpha = 0.05f),
                 strokeCap = StrokeCap.Round
             )
         }
-        Spacer(modifier = Modifier.width(16.dp))
-        Text(formatBytes(cat.size), style = MaterialTheme.typography.bodyMedium, color = TextSecondary)
+        Spacer(modifier = Modifier.width(12.dp))
+        Text(formatBytes(cat.size), style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold), color = TextSecondary)
     }
 }

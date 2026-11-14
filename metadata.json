@@ -1,6 +1,6 @@
 {
-  "name": "Therm by Rj",
-  "description": "Production-ready battery temperature and hardware thermal stats monitoring application.",
+  "name": "dot",
+  "description": "Offline thermal, storage, privacy guard, and hidden Android settings utility.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
