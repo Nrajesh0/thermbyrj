@@ -44,13 +44,28 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import android.app.Activity
+import android.graphics.Bitmap
+import android.util.LruCache
+import androidx.activity.result.IntentSenderRequest
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.DriveFileMove
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
+import androidx.compose.material.icons.automirrored.filled.ViewList
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Android
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Archive
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.CheckBox
 import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
@@ -65,17 +80,20 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.DoneAll
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FilterNone
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.FolderZip
+import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.NoteAdd
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
-import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.SdStorage
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Star
@@ -89,6 +107,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -104,19 +124,21 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -129,22 +151,30 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import androidx.security.crypto.EncryptedFile
-import android.app.Activity
-import androidx.activity.result.IntentSenderRequest
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.GlassCard
 import com.example.InfoRow
 import com.example.formatBytes
 import com.example.queryDeviceStorageTotals
+import com.example.service.FileManagerOps
 import com.example.service.FileShredder
+import com.example.service.PendingExplorerNavigation
 import com.example.service.PermissionUtils
 import com.example.service.PreferencesBackupManager
+import com.example.service.RecentMediaFile
+import com.example.service.SharedClipboardHolder
+import com.example.service.SharedClipboardOp
 import com.example.service.ShredJobCoordinator
 import com.example.service.ShredStandard
 import com.example.service.ShredTarget
+import com.example.service.AppRefreshCoordinator
 import com.example.service.StorageScanCache
+import com.example.ui.components.ActiveFilePreview
+import com.example.ui.components.BuiltInFilePreviewHost
+import com.example.ui.components.ExpandableSearchBar
+import com.example.ui.components.SearchIconToggleButton
+import com.example.ui.components.openExternalWithProvider
+import com.example.ui.components.resolveInAppViewerType
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
 import com.example.ui.theme.AuraOrange
@@ -159,19 +189,10 @@ import com.example.ui.theme.TextTertiary
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.BufferedInputStream
-import java.io.BufferedOutputStream
 import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.UUID
-import java.util.zip.ZipEntry
-import java.util.zip.ZipInputStream
-import java.util.zip.ZipOutputStream
 import kotlin.math.max
 import kotlin.math.min
 
@@ -191,14 +212,7 @@ data class BrowserFileItem(
     val childCount: Int
 )
 
-private enum class ClipboardOperation {
-    COPY, MOVE
-}
-
-private data class FileClipboard(
-    val paths: Set<String>,
-    val operation: ClipboardOperation
-)
+private val explorerThumbCache = LruCache<String, Bitmap>(96)
 
 @Suppress("DEPRECATION")
 private fun checkUsageStatsPermission(context: Context): Boolean {
@@ -231,6 +245,8 @@ private var cachedFilesFree: Long = 0L
 @Volatile
 private var cachedFilesCategories: List<StorageCategory> = emptyList()
 @Volatile
+private var cachedRecentFiles: List<RecentMediaFile> = emptyList()
+@Volatile
 private var cachedFilesTimeMs: Long = 0L
 @Volatile
 private var cachedFilesPermKey: String = ""
@@ -249,6 +265,7 @@ fun FilesScreen() {
 
     var activeSubTab by rememberSaveable { mutableStateOf("SMART_HUB") } // "SMART_HUB" or "FOLDER_BROWSER"
     var categories by remember { mutableStateOf(cachedFilesCategories) }
+    var recentFiles by remember { mutableStateOf(cachedRecentFiles) }
     var totalSpace by remember { mutableLongStateOf(cachedFilesTotal) }
     var usedSpace by remember { mutableLongStateOf(cachedFilesUsed) }
     var freeSpace by remember { mutableLongStateOf(cachedFilesFree) }
@@ -262,12 +279,21 @@ fun FilesScreen() {
     }
     var hasPermission by remember { mutableStateOf(checkMediaPermission(context)) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
+    val globalRefreshVersion by AppRefreshCoordinator.refreshVersion.collectAsStateWithLifecycle()
+    LaunchedEffect(globalRefreshVersion) {
+        if (globalRefreshVersion > 0) {
+            forceFilesRescan = true
+            refreshTrigger++
+        }
+    }
     var mediaPermPromptAttempted by rememberSaveable { mutableStateOf(false) }
 
-    // Folder Browser state (saved across recreation so Explorer stays in current folder)
-    val rootDir = remember {
-        val ext = Environment.getExternalStorageDirectory()
-        if (ext != null && ext.exists()) ext else context.filesDir
+    // Storage Volumes & Folder Browser state
+    val storageVolumes = remember(hasManageStorage) { FileManagerOps.getAvailableStorageVolumes(context) }
+    var selectedVolumeRootPath by rememberSaveable { mutableStateOf(storageVolumes.first().rootDir.absolutePath) }
+    val rootDir = remember(selectedVolumeRootPath, storageVolumes) {
+        storageVolumes.firstOrNull { it.rootDir.absolutePath == selectedVolumeRootPath }?.rootDir
+            ?: storageVolumes.first().rootDir
     }
     var currentDirPath by rememberSaveable { mutableStateOf(rootDir.absolutePath) }
     val currentDir = remember(currentDirPath, rootDir) {
@@ -278,8 +304,14 @@ fun FilesScreen() {
     }
     var browserItems by remember { mutableStateOf<List<BrowserFileItem>>(emptyList()) }
     var isBrowserLoading by remember { mutableStateOf(false) }
+    var searchExpanded by rememberSaveable { mutableStateOf(false) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
+    var searchRecursive by rememberSaveable { mutableStateOf(false) }
+    var recursiveResults by remember { mutableStateOf<List<BrowserFileItem>>(emptyList()) }
+    var isRecursiveSearching by remember { mutableStateOf(false) }
     var sortBy by rememberSaveable { mutableStateOf("Date") } // "Name", "Size", "Date"
+    var sortAscending by rememberSaveable { mutableStateOf(false) }
+    var isExplorerGrid by rememberSaveable { mutableStateOf(false) }
     var showHiddenFiles by rememberSaveable { mutableStateOf(false) }
     var showOnlyStarred by rememberSaveable { mutableStateOf(false) }
     var starredPaths by remember {
@@ -287,23 +319,55 @@ fun FilesScreen() {
     }
 
     var selectedPaths by remember { mutableStateOf<Set<String>>(emptySet()) }
-    var clipboard by remember { mutableStateOf<FileClipboard?>(null) }
+    val clipboard by SharedClipboardHolder.clipboard.collectAsStateWithLifecycle()
 
     // Action sheet & Dialog states
     var itemForMenu by remember { mutableStateOf<BrowserFileItem?>(null) }
     var itemForDetails by remember { mutableStateOf<BrowserFileItem?>(null) }
     var itemForRename by remember { mutableStateOf<BrowserFileItem?>(null) }
     var renameInput by remember { mutableStateOf("") }
+    var showCreateMenu by remember { mutableStateOf(false) }
     var showCreateFolderDialog by remember { mutableStateOf(false) }
     var newFolderName by remember { mutableStateOf("") }
+    var showCreateFileDialog by remember { mutableStateOf(false) }
+    var newFileName by remember { mutableStateOf("") }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var deleteWithShredder by remember { mutableStateOf(false) }
     var selectedShredStandard by remember { mutableStateOf(ShredStandard.DOD_5220_22_M) }
     var pendingDeletePaths by rememberSaveable { mutableStateOf<List<String>>(emptyList()) }
+    var activeFilePreview by remember { mutableStateOf<ActiveFilePreview?>(null) }
     var interruptedShredPath by remember { mutableStateOf(FileShredder.peekInterruptedShredPath(context)) }
 
     val shredState by ShredJobCoordinator.state.collectAsStateWithLifecycle()
     var lastHandledShredCompletionId by rememberSaveable { mutableStateOf(shredState.completionId) }
+    val pendingNavTarget by PendingExplorerNavigation.targetFolderPath.collectAsStateWithLifecycle()
+
+    LaunchedEffect(pendingNavTarget) {
+        val target = PendingExplorerNavigation.consume()
+        if (!target.isNullOrBlank()) {
+            val f = File(target)
+            if (f.exists() && f.isDirectory) {
+                storageVolumes.firstOrNull { f.absolutePath.startsWith(it.rootDir.absolutePath) }?.let { vol ->
+                    selectedVolumeRootPath = vol.rootDir.absolutePath
+                }
+                showOnlyStarred = false
+                searchExpanded = false
+                searchQuery = ""
+                updateCurrentDir(f)
+                activeSubTab = "FOLDER_BROWSER"
+                refreshTrigger++
+            }
+        }
+    }
+
+    fun openFileSmart(file: File, uri: Uri? = null) {
+        val viewerType = resolveInAppViewerType(file)
+        if (viewerType != null) {
+            activeFilePreview = ActiveFilePreview(file = file, contentUri = uri, type = viewerType)
+        } else {
+            openExternalWithProvider(context, file, uri)
+        }
+    }
 
     fun toggleStar(path: String) {
         val updated = if (path in starredPaths) starredPaths - path else starredPaths + path
@@ -425,6 +489,7 @@ fun FilesScreen() {
             freeSpace = cachedFilesFree
             usedSpace = cachedFilesUsed
             categories = cachedFilesCategories
+            recentFiles = cachedRecentFiles
             isAnalyzing = false
             return@LaunchedEffect
         }
@@ -434,10 +499,14 @@ fun FilesScreen() {
             val (tot, free) = queryDeviceStorageTotals(context)
             val used = max(0L, tot - free)
 
-            val imageSize = if (hasPermission || hasManageStorage) queryMediaSize(context, MediaStore.Images.Media.EXTERNAL_CONTENT_URI) else 0L
-            val videoSize = if (hasPermission || hasManageStorage) queryMediaSize(context, MediaStore.Video.Media.EXTERNAL_CONTENT_URI) else 0L
-            val audioSize = if (hasPermission || hasManageStorage) queryMediaSize(context, MediaStore.Audio.Media.EXTERNAL_CONTENT_URI) else 0L
-            val docsSize = if (hasPermission || hasManageStorage) queryDocsSize(context) else 0L
+            val canScanMedia = hasPermission || hasManageStorage
+            val imageSize = if (canScanMedia) queryMediaSize(context, MediaStore.Images.Media.EXTERNAL_CONTENT_URI) else 0L
+            val videoSize = if (canScanMedia) queryMediaSize(context, MediaStore.Video.Media.EXTERNAL_CONTENT_URI) else 0L
+            val audioSize = if (canScanMedia) queryMediaSize(context, MediaStore.Audio.Media.EXTERNAL_CONTENT_URI) else 0L
+            val docsSize = if (canScanMedia) queryDocsSize(context) else 0L
+            val downloadsSize = if (canScanMedia) FileManagerOps.queryDownloadsSize(context) else 0L
+            val apksSize = if (canScanMedia) FileManagerOps.queryApksSize(context) else 0L
+            val recents = if (canScanMedia) FileManagerOps.queryRecentFiles(context, limit = 12) else emptyList()
 
             val mediaTotal = imageSize + videoSize + audioSize + docsSize
             val otherUsed = max(0L, used - mediaTotal)
@@ -469,6 +538,8 @@ fun FilesScreen() {
                 StorageCategory("Videos", videoSize, AuraOrange, Icons.Default.VideoLibrary),
                 StorageCategory("Audio", audioSize, AuraRose, Icons.Default.AudioFile),
                 StorageCategory("Documents", max(0L, docsSize), AuraGreen, Icons.Default.Description),
+                StorageCategory("Downloads", downloadsSize, AuraCyan, Icons.Default.Download),
+                StorageCategory("APKs", apksSize, AuraGreen, Icons.Default.Android),
                 StorageCategory("Apps & Data", appSize, AuraPurple, Icons.Default.Apps),
                 StorageCategory("System", systemSize, Color.Gray, Icons.Default.SystemUpdate)
             ).sortedByDescending { it.size }
@@ -477,6 +548,7 @@ fun FilesScreen() {
             cachedFilesFree = free
             cachedFilesUsed = used
             cachedFilesCategories = newCats
+            cachedRecentFiles = recents
             cachedFilesTimeMs = System.currentTimeMillis()
             cachedFilesPermKey = permKey
             cachedFilesGeneration = currentGen
@@ -485,6 +557,7 @@ fun FilesScreen() {
             freeSpace = free
             usedSpace = used
             categories = newCats
+            recentFiles = recents
             isAnalyzing = false
         }
     }
@@ -506,21 +579,39 @@ fun FilesScreen() {
         }
     }
 
-    val filteredBrowserItems = remember(browserItems, searchQuery, sortBy) {
-        val searched = if (searchQuery.isBlank()) {
+    LaunchedEffect(searchQuery, searchRecursive, currentDir, showHiddenFiles, refreshTrigger, activeSubTab) {
+        if (activeSubTab == "FOLDER_BROWSER" && searchRecursive && searchQuery.trim().length >= 2) {
+            isRecursiveSearching = true
+            val found = withContext(Dispatchers.IO) {
+                FileManagerOps.searchFilesRecursively(currentDir, searchQuery, showHiddenFiles)
+                    .map { toBrowserFileItem(it) }
+            }
+            recursiveResults = found
+            isRecursiveSearching = false
+        } else {
+            recursiveResults = emptyList()
+            isRecursiveSearching = false
+        }
+    }
+
+    val filteredBrowserItems = remember(browserItems, recursiveResults, searchQuery, searchRecursive, sortBy, sortAscending) {
+        val baseList = if (searchRecursive && searchQuery.trim().length >= 2) {
+            recursiveResults
+        } else if (searchQuery.isBlank()) {
             browserItems
         } else {
             browserItems.filter { it.name.contains(searchQuery.trim(), ignoreCase = true) }
         }
-        searched.sortedWith { a, b ->
+        baseList.sortedWith { a, b ->
             if (a.isDirectory != b.isDirectory) {
                 if (a.isDirectory) -1 else 1
             } else {
-                when (sortBy) {
-                    "Size" -> b.sizeBytes.compareTo(a.sizeBytes)
+                val cmp = when (sortBy) {
+                    "Size" -> a.sizeBytes.compareTo(b.sizeBytes)
                     "Name" -> a.name.lowercase().compareTo(b.name.lowercase())
-                    else -> b.lastModified.compareTo(a.lastModified)
+                    else -> a.lastModified.compareTo(b.lastModified)
                 }
+                if (sortAscending) cmp else -cmp
             }
         }
     }
@@ -579,6 +670,62 @@ fun FilesScreen() {
         )
     }
 
+    // Create New Text File Dialog
+    if (showCreateFileDialog) {
+        AlertDialog(
+            onDismissRequest = { showCreateFileDialog = false },
+            containerColor = GlassPanel,
+            title = { Text("New Text File", color = TextPrimary, fontWeight = FontWeight.Bold) },
+            text = {
+                OutlinedTextField(
+                    value = newFileName,
+                    onValueChange = { newFileName = it },
+                    label = { Text("File name (e.g., notes.txt)", color = TextSecondary) },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = AuraCyan,
+                        unfocusedBorderColor = GlassBorder,
+                        focusedTextColor = TextPrimary,
+                        unfocusedTextColor = TextPrimary
+                    )
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val trimmed = newFileName.trim()
+                        if (trimmed.isNotEmpty()) {
+                            val finalName = if (trimmed.contains('.')) trimmed else "$trimmed.txt"
+                            val targetFile = File(currentDir, finalName)
+                            val created = try {
+                                if (!targetFile.exists()) targetFile.createNewFile() else false
+                            } catch (_: Exception) {
+                                false
+                            }
+                            newFileName = ""
+                            showCreateFileDialog = false
+                            if (created) {
+                                StorageScanCache.invalidate()
+                                forceFilesRescan = true
+                                refreshTrigger++
+                                openFileSmart(targetFile)
+                            } else {
+                                Toast.makeText(context, "Could not create file (check All Files Access)", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                ) {
+                    Text("CREATE & EDIT", color = AuraCyan, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCreateFileDialog = false }) {
+                    Text("CANCEL", color = TextSecondary)
+                }
+            }
+        )
+    }
+
     // Rename Dialog
     if (itemForRename != null) {
         val target = itemForRename!!
@@ -605,17 +752,15 @@ fun FilesScreen() {
                     onClick = {
                         val newName = renameInput.trim()
                         if (newName.isNotEmpty() && newName != target.name) {
-                            val dest = File(target.file.parentFile, newName)
-                            val ok = try {
-                                target.file.renameTo(dest)
-                            } catch (_: Exception) {
-                                false
+                            coroutineScope.launch {
+                                val ok = withContext(Dispatchers.IO) {
+                                    FileManagerOps.renameFileSafely(context, target.file, newName)
+                                }
+                                Toast.makeText(context, if (ok) "Renamed to $newName" else "Rename failed", Toast.LENGTH_SHORT).show()
+                                selectedPaths = emptySet()
+                                forceFilesRescan = true
+                                refreshTrigger++
                             }
-                            Toast.makeText(context, if (ok) "Renamed to $newName" else "Rename failed", Toast.LENGTH_SHORT).show()
-                            selectedPaths = emptySet()
-                            StorageScanCache.invalidate()
-                            forceFilesRescan = true
-                            refreshTrigger++
                         }
                         itemForRename = null
                     }
@@ -885,12 +1030,12 @@ fun FilesScreen() {
                         itemForRename = target
                     }
                     SimpleSheetAction(Icons.Default.ContentCopy, "Copy", AuraCyan) {
-                        clipboard = FileClipboard(setOf(path), ClipboardOperation.COPY)
+                        SharedClipboardHolder.setClipboard(setOf(path), SharedClipboardOp.COPY)
                         itemForMenu = null
                         Toast.makeText(context, "Copied — open destination folder to paste", Toast.LENGTH_SHORT).show()
                     }
                     SimpleSheetAction(Icons.AutoMirrored.Filled.DriveFileMove, "Move", AuraOrange) {
-                        clipboard = FileClipboard(setOf(path), ClipboardOperation.MOVE)
+                        SharedClipboardHolder.setClipboard(setOf(path), SharedClipboardOp.MOVE)
                         itemForMenu = null
                         Toast.makeText(context, "Ready to move — open destination folder", Toast.LENGTH_SHORT).show()
                     }
@@ -910,15 +1055,14 @@ fun FilesScreen() {
                         itemForMenu = null
                         coroutineScope.launch {
                             val ok = withContext(Dispatchers.IO) {
-                                if (isZip) extractZipArchive(target.file, currentDir)
-                                else compressFilesToZip(listOf(target.file), File(currentDir, "${target.file.nameWithoutExtension}.zip"))
+                                if (isZip) FileManagerOps.extractZipArchive(context, target.file, currentDir)
+                                else FileManagerOps.compressFilesToZip(listOf(target.file), File(currentDir, "${target.file.nameWithoutExtension}.zip"))
                             }
                             Toast.makeText(
                                 context,
                                 if (ok) (if (isZip) "Extracted archive" else "Created .zip archive") else "Archive operation failed",
                                 Toast.LENGTH_SHORT
                             ).show()
-                            StorageScanCache.invalidate()
                             forceFilesRescan = true
                             refreshTrigger++
                         }
@@ -927,9 +1071,8 @@ fun FilesScreen() {
                         SimpleSheetAction(Icons.Default.Lock, "Vault", AuraPurple) {
                             itemForMenu = null
                             coroutineScope.launch {
-                                val ok = withContext(Dispatchers.IO) { encryptLocalFileToVault(context, target.file) }
+                                val ok = withContext(Dispatchers.IO) { FileManagerOps.encryptFileToVault(context, target.file) }
                                 Toast.makeText(context, if (ok) "Locked in Vault" else "Vault failed", Toast.LENGTH_SHORT).show()
-                                StorageScanCache.invalidate()
                                 forceFilesRescan = true
                                 refreshTrigger++
                             }
@@ -971,44 +1114,97 @@ fun FilesScreen() {
         )
     }
 
+    // Built-in Image Lightbox, Text Viewer/Editor, Zip Inspector & APK Inspector
+    BuiltInFilePreviewHost(
+        preview = activeFilePreview,
+        onDismiss = { activeFilePreview = null },
+        onExtractZip = { zipFile ->
+            coroutineScope.launch {
+                val ok = withContext(Dispatchers.IO) {
+                    FileManagerOps.extractZipArchive(context, zipFile, zipFile.parentFile ?: currentDir)
+                }
+                Toast.makeText(context, if (ok) "Extracted ${zipFile.name}" else "Extract failed", Toast.LENGTH_SHORT).show()
+                forceFilesRescan = true
+                refreshTrigger++
+            }
+        },
+        onShare = { f, _ -> shareFileWithProvider(context, f) },
+        onVault = { f, uri ->
+            coroutineScope.launch {
+                val ok = withContext(Dispatchers.IO) { FileManagerOps.encryptFileToVault(context, f, uri) }
+                Toast.makeText(context, if (ok) "Locked in Vault" else "Vault failed", Toast.LENGTH_SHORT).show()
+                forceFilesRescan = true
+                refreshTrigger++
+            }
+        },
+        onDelete = { f, _ ->
+            selectedPaths = setOf(f.absolutePath)
+            deleteWithShredder = false
+            showDeleteConfirm = true
+        },
+        onShowDetails = { f ->
+            activeFilePreview = null
+            itemForDetails = toBrowserFileItem(f)
+        },
+        onFileSaved = {
+            StorageScanCache.invalidate()
+            forceFilesRescan = true
+            refreshTrigger++
+        }
+    )
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .statusBarsPadding()
             .padding(horizontal = 20.dp)
     ) {
-        Spacer(modifier = Modifier.height(18.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
         // Header
         Row(
-            modifier = Modifier.fillMaxWidth().padding(end = 56.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(38.dp)
+                .padding(end = 46.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = "FILES",
-                    style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 4.sp, fontWeight = FontWeight.Bold),
+                    style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 2.5.sp, fontWeight = FontWeight.Bold),
                     color = AuraCyan
                 )
-                Text(
-                    text = "Storage, Explorer & Vault",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary
-                )
+                if (totalSpace > 0L) {
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(100.dp))
+                            .background(GlassPanel)
+                            .border(1.dp, GlassBorder, RoundedCornerShape(100.dp))
+                            .padding(horizontal = 8.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            text = "${formatBytes(freeSpace)} free",
+                            color = TextSecondary,
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        )
+                    }
+                }
             }
         }
 
-        Spacer(modifier = Modifier.height(14.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
         // Segmented Switcher: OVERVIEW | EXPLORER
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(100.dp))
-                .background(GlassPanel.copy(alpha = 0.7f))
+                .background(GlassPanel.copy(alpha = 0.8f))
                 .border(1.dp, GlassBorder, RoundedCornerShape(100.dp))
-                .padding(4.dp)
+                .padding(3.dp)
         ) {
             val modes = listOf("SMART_HUB" to "OVERVIEW", "FOLDER_BROWSER" to "EXPLORER")
             modes.forEach { (key, label) ->
@@ -1020,22 +1216,23 @@ fun FilesScreen() {
                         .clip(RoundedCornerShape(100.dp))
                         .background(if (selected) AuraCyan.copy(alpha = 0.18f) else Color.Transparent)
                         .clickable { activeSubTab = key }
-                        .padding(vertical = 10.dp),
+                        .padding(vertical = 8.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
                         text = label,
                         color = if (selected) AuraCyan else TextSecondary,
                         style = MaterialTheme.typography.labelSmall.copy(
+                            fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
-                            letterSpacing = 1.5.sp
+                            letterSpacing = 1.2.sp
                         )
                     )
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
         if (activeSubTab == "SMART_HUB") {
             if (isAnalyzing) {
@@ -1213,6 +1410,25 @@ fun FilesScreen() {
                         }
                     }
 
+                    if (recentFiles.isNotEmpty()) {
+                        item {
+                            Text(
+                                "RECENT FILES",
+                                style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 2.sp, fontWeight = FontWeight.Bold),
+                                color = TextTertiary
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                items(recentFiles, key = { it.contentUri.toString() }) { recent ->
+                                    RecentFileChipCard(recent) {
+                                        val f = File(recent.path)
+                                        openFileSmart(f, recent.contentUri)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Open Folder Explorer Card
                     item {
                         GlassCard(
@@ -1244,7 +1460,7 @@ fun FilesScreen() {
                                             fontWeight = FontWeight.Bold
                                         )
                                         Text(
-                                            "Copy, move, rename, zip & manage folders",
+                                            "Copy, move, rename, zip, inspect & edit files",
                                             color = TextSecondary,
                                             style = MaterialTheme.typography.labelSmall
                                         )
@@ -1266,7 +1482,7 @@ fun FilesScreen() {
                     items(categories) { cat ->
                         GlassCard(modifier = Modifier.fillMaxWidth()) {
                             CategoryItemRow(cat, totalSpace) {
-                                if (cat.name in listOf("Images", "Videos", "Audio", "Documents")) {
+                                if (cat.name in listOf("Images", "Videos", "Audio", "Documents", "Downloads", "APKs")) {
                                     val intent = Intent(context, FileCategoryActivity::class.java).apply {
                                         putExtra("CATEGORY_NAME", cat.name)
                                     }
@@ -1299,13 +1515,38 @@ fun FilesScreen() {
                         Spacer(modifier = Modifier.height(10.dp))
                     }
 
-                    // Quick Jump Shortcuts: Internal | Downloads | Camera | Docs | Pictures | Starred
+                    // Quick Jump Shortcuts: Volumes (if >1) | Internal | Downloads | Camera | Docs | Pictures | Starred
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        if (storageVolumes.size > 1) {
+                            storageVolumes.forEach { vol ->
+                                val activeVol = rootDir.absolutePath == vol.rootDir.absolutePath && !showOnlyStarred
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(100.dp))
+                                        .background(if (activeVol) AuraPurple.copy(alpha = 0.2f) else GlassPanel.copy(alpha = 0.6f))
+                                        .border(1.dp, if (activeVol) AuraPurple else GlassBorder, RoundedCornerShape(100.dp))
+                                        .clickable {
+                                            showOnlyStarred = false
+                                            selectedVolumeRootPath = vol.rootDir.absolutePath
+                                            updateCurrentDir(vol.rootDir)
+                                            selectedPaths = emptySet()
+                                        }
+                                        .padding(horizontal = 12.dp, vertical = 7.dp)
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(Icons.Default.SdStorage, contentDescription = null, tint = if (activeVol) AuraPurple else TextSecondary, modifier = Modifier.size(13.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(vol.label, color = if (activeVol) AuraPurple else TextSecondary, style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                                    }
+                                }
+                            }
+                        }
+
                         val shortcuts = remember(rootDir) {
                             listOf(
                                 "Internal" to rootDir,
@@ -1332,172 +1573,250 @@ fun FilesScreen() {
                                     }
                                     .padding(horizontal = 12.dp, vertical = 7.dp)
                             ) {
-                            Text(
-                                text = label,
-                                color = if (active) AuraCyan else TextSecondary,
-                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
-                            )
-                        }
-                    }
-
-                    // Starred Filter Chip
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(100.dp))
-                            .background(if (showOnlyStarred) AuraOrange.copy(alpha = 0.2f) else GlassPanel.copy(alpha = 0.6f))
-                            .border(1.dp, if (showOnlyStarred) AuraOrange else GlassBorder, RoundedCornerShape(100.dp))
-                            .clickable {
-                                showOnlyStarred = !showOnlyStarred
-                                selectedPaths = emptySet()
-                            }
-                            .padding(horizontal = 12.dp, vertical = 7.dp)
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.Star, contentDescription = null, tint = AuraOrange, modifier = Modifier.size(13.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = "Starred (${starredPaths.size})",
-                                color = if (showOnlyStarred) AuraOrange else TextSecondary,
-                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
-                            )
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Search + New Folder + Hidden Toggle
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedTextField(
-                        value = searchQuery,
-                        onValueChange = { searchQuery = it },
-                        modifier = Modifier.weight(1f),
-                        placeholder = { Text("Search files...", color = TextTertiary, style = MaterialTheme.typography.bodySmall) },
-                        leadingIcon = { Icon(Icons.Default.Search, contentDescription = "Search", tint = AuraCyan) },
-                        trailingIcon = {
-                            if (searchQuery.isNotEmpty()) {
-                                IconButton(onClick = { searchQuery = "" }) {
-                                    Icon(Icons.Default.Close, contentDescription = "Clear", tint = TextSecondary)
-                                }
-                            }
-                        },
-                        singleLine = true,
-                        shape = RoundedCornerShape(16.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = AuraCyan,
-                            unfocusedBorderColor = GlassBorder,
-                            focusedContainerColor = GlassPanel.copy(alpha = 0.55f),
-                            unfocusedContainerColor = GlassPanel.copy(alpha = 0.55f),
-                            focusedTextColor = TextPrimary,
-                            unfocusedTextColor = TextPrimary
-                        )
-                    )
-
-                    IconButton(
-                        onClick = { showCreateFolderDialog = true },
-                        modifier = Modifier
-                            .size(46.dp)
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(GlassPanel.copy(alpha = 0.7f))
-                            .border(1.dp, GlassBorder, RoundedCornerShape(14.dp))
-                    ) {
-                        Icon(Icons.Default.CreateNewFolder, contentDescription = "New Folder", tint = AuraCyan, modifier = Modifier.size(20.dp))
-                    }
-
-                    IconButton(
-                        onClick = { showHiddenFiles = !showHiddenFiles },
-                        modifier = Modifier
-                            .size(46.dp)
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(if (showHiddenFiles) AuraPurple.copy(alpha = 0.2f) else GlassPanel.copy(alpha = 0.7f))
-                            .border(1.dp, if (showHiddenFiles) AuraPurple else GlassBorder, RoundedCornerShape(14.dp))
-                    ) {
-                        Icon(
-                            imageVector = if (showHiddenFiles) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                            contentDescription = "Toggle hidden files",
-                            tint = if (showHiddenFiles) AuraPurple else TextSecondary,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                // Breadcrumb Bar + Sort + Select All
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .weight(1f)
-                            .horizontalScroll(rememberScrollState()),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        if (!showOnlyStarred && currentDir.absolutePath != rootDir.absolutePath) {
-                            IconButton(
-                                onClick = {
-                                    currentDir.parentFile?.let { parent ->
-                                        updateCurrentDir(parent)
-                                        selectedPaths = emptySet()
-                                    }
-                                },
-                                modifier = Modifier.size(28.dp)
-                            ) {
-                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Up", tint = AuraCyan, modifier = Modifier.size(16.dp))
-                            }
-                        }
-
-                        if (showOnlyStarred) {
-                            Text(
-                                text = "Starred Items",
-                                color = AuraOrange,
-                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
-                            )
-                        } else {
-                            val segments = remember(currentDir, rootDir) {
-                                buildBreadcrumbs(rootDir, currentDir)
-                            }
-                            segments.forEachIndexed { idx, (label, file) ->
                                 Text(
                                     text = label,
-                                    color = if (idx == segments.lastIndex) AuraCyan else TextSecondary,
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .clickable {
-                                            updateCurrentDir(file)
-                                            selectedPaths = emptySet()
-                                        }
-                                        .padding(horizontal = 5.dp, vertical = 3.dp)
+                                    color = if (active) AuraCyan else TextSecondary,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
                                 )
-                                if (idx < segments.lastIndex) {
-                                    Text("/", color = TextTertiary, style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
+
+                        // Starred Filter Chip
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(100.dp))
+                                .background(if (showOnlyStarred) AuraOrange.copy(alpha = 0.2f) else GlassPanel.copy(alpha = 0.6f))
+                                .border(1.dp, if (showOnlyStarred) AuraOrange else GlassBorder, RoundedCornerShape(100.dp))
+                                .clickable {
+                                    showOnlyStarred = !showOnlyStarred
+                                    selectedPaths = emptySet()
                                 }
+                                .padding(horizontal = 12.dp, vertical = 7.dp)
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Star, contentDescription = null, tint = AuraOrange, modifier = Modifier.size(13.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = "Starred (${starredPaths.size})",
+                                    color = if (showOnlyStarred) AuraOrange else TextSecondary,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                                )
                             }
                         }
                     }
 
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // Sleek Compact Action Toolbar (Breadcrumbs on left, Search Icon + Create + Hidden + Grid on right)
                     Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        listOf("Date", "Size", "Name").forEach { mode ->
-                            val active = sortBy == mode
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .horizontalScroll(rememberScrollState()),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (!showOnlyStarred && currentDir.absolutePath != rootDir.absolutePath) {
+                                IconButton(
+                                    onClick = {
+                                        currentDir.parentFile?.let { parent ->
+                                            updateCurrentDir(parent)
+                                            selectedPaths = emptySet()
+                                        }
+                                    },
+                                    modifier = Modifier.size(28.dp)
+                                ) {
+                                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Up", tint = AuraCyan, modifier = Modifier.size(16.dp))
+                                }
+                            }
+
+                            if (showOnlyStarred) {
+                                Text(
+                                    text = "Starred Items",
+                                    color = AuraOrange,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                                )
+                            } else {
+                                val segments = remember(currentDir, rootDir) {
+                                    buildBreadcrumbs(rootDir, currentDir)
+                                }
+                                segments.forEachIndexed { idx, (label, file) ->
+                                    Text(
+                                        text = label,
+                                        color = if (idx == segments.lastIndex) AuraCyan else TextSecondary,
+                                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .clickable {
+                                                updateCurrentDir(file)
+                                                selectedPaths = emptySet()
+                                            }
+                                            .padding(horizontal = 5.dp, vertical = 3.dp)
+                                    )
+                                    if (idx < segments.lastIndex) {
+                                        Text("/", color = TextTertiary, style = MaterialTheme.typography.labelSmall)
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.width(6.dp))
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                            SearchIconToggleButton(
+                                isExpanded = searchExpanded,
+                                hasQuery = searchQuery.isNotBlank(),
+                                accentColor = AuraCyan,
+                                size = 36.dp,
+                                tag = "explorer_search_toggle"
+                            ) {
+                                if (searchExpanded) {
+                                    searchExpanded = false
+                                    searchQuery = ""
+                                } else {
+                                    searchExpanded = true
+                                }
+                            }
+
+                            Box {
+                                IconButton(
+                                    onClick = { showCreateMenu = true },
+                                    modifier = Modifier
+                                        .size(36.dp)
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(GlassPanel.copy(alpha = 0.7f))
+                                        .border(1.dp, GlassBorder, RoundedCornerShape(12.dp))
+                                ) {
+                                    Icon(Icons.Default.Add, contentDescription = "Create New", tint = AuraCyan, modifier = Modifier.size(18.dp))
+                                }
+                                DropdownMenu(
+                                    expanded = showCreateMenu,
+                                    onDismissRequest = { showCreateMenu = false },
+                                    modifier = Modifier.background(GlassPanel)
+                                ) {
+                                    DropdownMenuItem(
+                                        text = { Text("New Folder", color = TextPrimary) },
+                                        leadingIcon = { Icon(Icons.Default.CreateNewFolder, contentDescription = null, tint = AuraCyan) },
+                                        onClick = {
+                                            showCreateMenu = false
+                                            showCreateFolderDialog = true
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("New Text File", color = TextPrimary) },
+                                        leadingIcon = { Icon(Icons.Default.NoteAdd, contentDescription = null, tint = AuraGreen) },
+                                        onClick = {
+                                            showCreateMenu = false
+                                            showCreateFileDialog = true
+                                        }
+                                    )
+                                }
+                            }
+
+                            IconButton(
+                                onClick = { showHiddenFiles = !showHiddenFiles },
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(if (showHiddenFiles) AuraPurple.copy(alpha = 0.2f) else GlassPanel.copy(alpha = 0.7f))
+                                    .border(1.dp, if (showHiddenFiles) AuraPurple else GlassBorder, RoundedCornerShape(12.dp))
+                            ) {
+                                Icon(
+                                    imageVector = if (showHiddenFiles) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                    contentDescription = "Toggle hidden files",
+                                    tint = if (showHiddenFiles) AuraPurple else TextSecondary,
+                                    modifier = Modifier.size(17.dp)
+                                )
+                            }
+
+                            IconButton(
+                                onClick = { isExplorerGrid = !isExplorerGrid },
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(if (isExplorerGrid) AuraCyan.copy(alpha = 0.18f) else GlassPanel.copy(alpha = 0.7f))
+                                    .border(1.dp, if (isExplorerGrid) AuraCyan else GlassBorder, RoundedCornerShape(12.dp))
+                            ) {
+                                Icon(
+                                    imageVector = if (isExplorerGrid) Icons.AutoMirrored.Filled.ViewList else Icons.Default.GridView,
+                                    contentDescription = "Toggle Grid or List View",
+                                    tint = if (isExplorerGrid) AuraCyan else TextSecondary,
+                                    modifier = Modifier.size(17.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    ExpandableSearchBar(
+                        visible = searchExpanded,
+                        query = searchQuery,
+                        onQueryChange = { searchQuery = it },
+                        placeholder = if (searchRecursive) "Search all subfolders..." else "Filter current folder...",
+                        onClose = {
+                            searchQuery = ""
+                            searchExpanded = false
+                        },
+                        trailingExtra = {
                             Box(
                                 modifier = Modifier
-                                    .clip(RoundedCornerShape(100.dp))
-                                    .background(if (active) AuraCyan.copy(alpha = 0.15f) else Color.Transparent)
-                                    .border(1.dp, if (active) AuraCyan.copy(alpha = 0.4f) else GlassBorder, RoundedCornerShape(100.dp))
-                                    .clickable { sortBy = mode }
-                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(if (searchRecursive) AuraCyan.copy(alpha = 0.2f) else GlassPanel.copy(alpha = 0.7f))
+                                    .border(1.dp, if (searchRecursive) AuraCyan else GlassBorder, RoundedCornerShape(12.dp))
+                                    .clickable { searchRecursive = !searchRecursive }
+                                    .padding(horizontal = 10.dp, vertical = 14.dp)
                             ) {
-                                Text(mode, color = if (active) AuraCyan else TextTertiary, style = MaterialTheme.typography.labelSmall)
+                                Text(
+                                    text = if (searchRecursive) "Deep: ON" else "Deep: OFF",
+                                    color = if (searchRecursive) AuraCyan else TextSecondary,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                                )
+                            }
+                        }
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // Sort Chips + Direction + Select All
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf("Date", "Size", "Name").forEach { mode ->
+                                val active = sortBy == mode
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(100.dp))
+                                        .background(if (active) AuraCyan.copy(alpha = 0.15f) else Color.Transparent)
+                                        .border(1.dp, if (active) AuraCyan.copy(alpha = 0.4f) else GlassBorder, RoundedCornerShape(100.dp))
+                                        .clickable {
+                                            if (active) sortAscending = !sortAscending else {
+                                                sortBy = mode
+                                                sortAscending = (mode == "Name")
+                                            }
+                                        }
+                                        .padding(horizontal = 9.dp, vertical = 4.dp)
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(mode, color = if (active) AuraCyan else TextTertiary, style = MaterialTheme.typography.labelSmall)
+                                        if (active) {
+                                            Spacer(modifier = Modifier.width(3.dp))
+                                            Icon(
+                                                imageVector = if (sortAscending) Icons.Default.ArrowUpward else Icons.Default.ArrowDownward,
+                                                contentDescription = null,
+                                                tint = AuraCyan,
+                                                modifier = Modifier.size(11.dp)
+                                            )
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -1521,199 +1840,229 @@ fun FilesScreen() {
                             }
                         }
                     }
-                }
 
-                Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
 
-                // Clipboard Paste Bar (when Copy or Move is active)
-                if (clipboard != null) {
-                    val clip = clipboard!!
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(AuraGreen.copy(alpha = 0.15f))
-                            .border(1.dp, AuraGreen.copy(alpha = 0.45f), RoundedCornerShape(16.dp))
-                            .padding(horizontal = 14.dp, vertical = 8.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "${clip.paths.size} item(s) ready to ${if (clip.operation == ClipboardOperation.COPY) "copy" else "move"}",
-                            color = TextPrimary,
-                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
-                        )
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Button(
-                                onClick = {
-                                    coroutineScope.launch {
-                                        val count = withContext(Dispatchers.IO) {
-                                            executeClipboardPaste(clip, currentDir)
+                    // Clipboard Paste Bar (when Copy or Move is active)
+                    if (clipboard != null) {
+                        val clip = clipboard!!
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(AuraGreen.copy(alpha = 0.15f))
+                                .border(1.dp, AuraGreen.copy(alpha = 0.45f), RoundedCornerShape(16.dp))
+                                .padding(horizontal = 14.dp, vertical = 8.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "${clip.paths.size} item(s) ready to ${if (clip.operation == SharedClipboardOp.COPY) "copy" else "move"}",
+                                color = TextPrimary,
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Button(
+                                    onClick = {
+                                        coroutineScope.launch {
+                                            val count = withContext(Dispatchers.IO) {
+                                                FileManagerOps.executeClipboardPaste(context, clip, currentDir)
+                                            }
+                                            Toast.makeText(
+                                                context,
+                                                "${if (clip.operation == SharedClipboardOp.COPY) "Copied" else "Moved"} $count item(s)",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                            SharedClipboardHolder.clear()
+                                            selectedPaths = emptySet()
+                                            forceFilesRescan = true
+                                            refreshTrigger++
                                         }
-                                        Toast.makeText(
-                                            context,
-                                            "${if (clip.operation == ClipboardOperation.COPY) "Copied" else "Moved"} $count item(s)",
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                        clipboard = null
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = AuraGreen),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                    modifier = Modifier.height(32.dp)
+                                ) {
+                                    Icon(Icons.Default.ContentPaste, contentDescription = null, tint = Obsidian, modifier = Modifier.size(14.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Paste Here", color = Obsidian, style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                                }
+                                Spacer(modifier = Modifier.width(4.dp))
+                                IconButton(onClick = { SharedClipboardHolder.clear() }, modifier = Modifier.size(28.dp)) {
+                                    Icon(Icons.Default.Close, contentDescription = "Cancel paste", tint = TextSecondary, modifier = Modifier.size(16.dp))
+                                }
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+
+                    // Multi-Select Simple Action Bar
+                    if (selectedPaths.isNotEmpty()) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(18.dp))
+                                .background(GlassPanel.copy(alpha = 0.92f))
+                                .border(1.dp, AuraCyan.copy(alpha = 0.45f), RoundedCornerShape(18.dp))
+                                .padding(horizontal = 10.dp, vertical = 8.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "${selectedPaths.size} selected",
+                                color = AuraCyan,
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                modifier = Modifier.padding(start = 4.dp)
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
+                                if (selectedPaths.size == 1) {
+                                    val singleFile = File(selectedPaths.first())
+                                    MiniBarAction(Icons.Default.Edit, "Rename", AuraCyan) {
+                                        renameInput = singleFile.name
+                                        itemForRename = toBrowserFileItem(singleFile)
+                                    }
+                                }
+                                MiniBarAction(Icons.Default.ContentCopy, "Copy", AuraCyan) {
+                                    SharedClipboardHolder.setClipboard(selectedPaths, SharedClipboardOp.COPY)
+                                    selectedPaths = emptySet()
+                                    Toast.makeText(context, "Copied to clipboard", Toast.LENGTH_SHORT).show()
+                                }
+                                MiniBarAction(Icons.AutoMirrored.Filled.DriveFileMove, "Move", AuraOrange) {
+                                    SharedClipboardHolder.setClipboard(selectedPaths, SharedClipboardOp.MOVE)
+                                    selectedPaths = emptySet()
+                                    Toast.makeText(context, "Open target folder to Move", Toast.LENGTH_SHORT).show()
+                                }
+                                MiniBarAction(Icons.Default.Archive, "Zip", AuraGreen) {
+                                    val targets = selectedPaths.map { File(it) }
+                                    coroutineScope.launch {
+                                        val archiveName = if (targets.size == 1) "${targets.first().nameWithoutExtension}.zip" else "archive_${System.currentTimeMillis() / 1000}.zip"
+                                        val ok = withContext(Dispatchers.IO) {
+                                            FileManagerOps.compressFilesToZip(targets, File(currentDir, archiveName))
+                                        }
+                                        Toast.makeText(context, if (ok) "Saved $archiveName" else "Zip failed", Toast.LENGTH_SHORT).show()
                                         selectedPaths = emptySet()
-                                        StorageScanCache.invalidate()
                                         forceFilesRescan = true
                                         refreshTrigger++
                                     }
-                                },
-                                colors = ButtonDefaults.buttonColors(containerColor = AuraGreen),
-                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                                modifier = Modifier.height(32.dp)
-                            ) {
-                                Icon(Icons.Default.ContentPaste, contentDescription = null, tint = Obsidian, modifier = Modifier.size(14.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Paste Here", color = Obsidian, style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
-                            }
-                            Spacer(modifier = Modifier.width(4.dp))
-                            IconButton(onClick = { clipboard = null }, modifier = Modifier.size(28.dp)) {
-                                Icon(Icons.Default.Close, contentDescription = "Cancel paste", tint = TextSecondary, modifier = Modifier.size(16.dp))
-                            }
-                        }
-                    }
-                    Spacer(modifier = Modifier.height(8.dp))
-                }
-
-                // Multi-Select Simple Action Bar
-                if (selectedPaths.isNotEmpty()) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(18.dp))
-                            .background(GlassPanel.copy(alpha = 0.92f))
-                            .border(1.dp, AuraCyan.copy(alpha = 0.45f), RoundedCornerShape(18.dp))
-                            .padding(horizontal = 10.dp, vertical = 8.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            "${selectedPaths.size} selected",
-                            color = AuraCyan,
-                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                            modifier = Modifier.padding(start = 4.dp)
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
-                            if (selectedPaths.size == 1) {
-                                val singleFile = File(selectedPaths.first())
-                                MiniBarAction(Icons.Default.Edit, "Rename", AuraCyan) {
-                                    renameInput = singleFile.name
-                                    itemForRename = toBrowserFileItem(singleFile)
                                 }
-                            }
-                            MiniBarAction(Icons.Default.ContentCopy, "Copy", AuraCyan) {
-                                clipboard = FileClipboard(selectedPaths, ClipboardOperation.COPY)
-                                selectedPaths = emptySet()
-                                Toast.makeText(context, "Copied to clipboard", Toast.LENGTH_SHORT).show()
-                            }
-                            MiniBarAction(Icons.AutoMirrored.Filled.DriveFileMove, "Move", AuraOrange) {
-                                clipboard = FileClipboard(selectedPaths, ClipboardOperation.MOVE)
-                                selectedPaths = emptySet()
-                                Toast.makeText(context, "Open target folder to Move", Toast.LENGTH_SHORT).show()
-                            }
-                            MiniBarAction(Icons.Default.Archive, "Zip", AuraGreen) {
-                                val targets = selectedPaths.map { File(it) }
-                                coroutineScope.launch {
-                                    val archiveName = if (targets.size == 1) "${targets.first().nameWithoutExtension}.zip" else "archive_${System.currentTimeMillis() / 1000}.zip"
-                                    val ok = withContext(Dispatchers.IO) {
-                                        compressFilesToZip(targets, File(currentDir, archiveName))
-                                    }
-                                    Toast.makeText(context, if (ok) "Saved $archiveName" else "Zip failed", Toast.LENGTH_SHORT).show()
-                                    selectedPaths = emptySet()
-                                    forceFilesRescan = true
-                                    refreshTrigger++
-                                }
-                            }
-                            MiniBarAction(Icons.Default.Lock, "Vault", AuraPurple) {
-                                coroutineScope.launch {
-                                    val lockedCount = withContext(Dispatchers.IO) {
-                                        selectedPaths.count { p ->
-                                            val f = File(p)
-                                            f.isFile && encryptLocalFileToVault(context, f)
+                                MiniBarAction(Icons.Default.Lock, "Vault", AuraPurple) {
+                                    coroutineScope.launch {
+                                        val lockedCount = withContext(Dispatchers.IO) {
+                                            selectedPaths.count { p ->
+                                                val f = File(p)
+                                                f.isFile && FileManagerOps.encryptFileToVault(context, f)
+                                            }
                                         }
+                                        Toast.makeText(context, "Locked $lockedCount file(s) in Vault", Toast.LENGTH_SHORT).show()
+                                        selectedPaths = emptySet()
+                                        forceFilesRescan = true
+                                        refreshTrigger++
                                     }
-                                    Toast.makeText(context, "Locked $lockedCount file(s) in Vault", Toast.LENGTH_SHORT).show()
-                                    selectedPaths = emptySet()
-                                    forceFilesRescan = true
-                                    refreshTrigger++
+                                }
+                                MiniBarAction(Icons.Default.Delete, "Delete", TextSecondary) {
+                                    deleteWithShredder = false
+                                    showDeleteConfirm = true
+                                }
+                                MiniBarAction(Icons.Default.DeleteForever, "Shred", AuraRose) {
+                                    deleteWithShredder = true
+                                    showDeleteConfirm = true
+                                }
+                                IconButton(onClick = { selectedPaths = emptySet() }, modifier = Modifier.size(28.dp)) {
+                                    Icon(Icons.Default.Close, contentDescription = "Clear", tint = TextSecondary, modifier = Modifier.size(16.dp))
                                 }
                             }
-                            MiniBarAction(Icons.Default.Delete, "Delete", TextSecondary) {
-                                deleteWithShredder = false
-                                showDeleteConfirm = true
-                            }
-                            MiniBarAction(Icons.Default.DeleteForever, "Shred", AuraRose) {
-                                deleteWithShredder = true
-                                showDeleteConfirm = true
-                            }
-                            IconButton(onClick = { selectedPaths = emptySet() }, modifier = Modifier.size(28.dp)) {
-                                Icon(Icons.Default.Close, contentDescription = "Clear", tint = TextSecondary, modifier = Modifier.size(16.dp))
-                            }
                         }
+                        Spacer(modifier = Modifier.height(8.dp))
                     }
-                    Spacer(modifier = Modifier.height(8.dp))
-                }
 
-                if (isBrowserLoading) {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator(color = AuraCyan)
-                    }
-                } else if (filteredBrowserItems.isEmpty()) {
-                    Box(modifier = Modifier.fillMaxSize().padding(bottom = 100.dp), contentAlignment = Alignment.Center) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Icon(Icons.Default.FolderOpen, contentDescription = null, tint = TextTertiary, modifier = Modifier.size(44.dp))
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Text(
-                                if (!hasManageStorage && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                                    "Grant 'All Files Access' in Overview to browse folders."
-                                } else {
-                                    "Empty folder"
-                                },
-                                color = TextSecondary,
-                                style = MaterialTheme.typography.bodySmall,
-                                textAlign = TextAlign.Center
-                            )
+                    if (isBrowserLoading || isRecursiveSearching) {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator(color = AuraCyan)
                         }
-                    }
-                } else {
-                    LazyColumn(
-                        modifier = Modifier.fillMaxSize(),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                        contentPadding = PaddingValues(bottom = 112.dp)
-                    ) {
-                        items(filteredBrowserItems, key = { it.file.absolutePath }) { item ->
-                            val path = item.file.absolutePath
-                            val isSelected = path in selectedPaths
-                            val isStarred = path in starredPaths
-                            BrowserItemCard(
-                                item = item,
-                                isSelected = isSelected,
-                                isStarred = isStarred,
-                                onToggleSelect = {
-                                    selectedPaths = if (path in selectedPaths) selectedPaths - path else selectedPaths + path
-                                },
-                                onClick = {
-                                    if (selectedPaths.isNotEmpty()) {
-                                        selectedPaths = if (path in selectedPaths) selectedPaths - path else selectedPaths + path
-                                    } else if (item.isDirectory) {
-                                        showOnlyStarred = false
-                                        updateCurrentDir(item.file)
+                    } else if (filteredBrowserItems.isEmpty()) {
+                        Box(modifier = Modifier.fillMaxSize().padding(bottom = 100.dp), contentAlignment = Alignment.Center) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Icon(Icons.Default.FolderOpen, contentDescription = null, tint = TextTertiary, modifier = Modifier.size(44.dp))
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Text(
+                                    if (!hasManageStorage && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                        "Grant 'All Files Access' in Overview to browse folders."
                                     } else {
-                                        openFileWithProvider(context, item.file)
+                                        "Empty folder"
+                                    },
+                                    color = TextSecondary,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                        }
+                    } else if (isExplorerGrid) {
+                        LazyVerticalGrid(
+                            columns = GridCells.Fixed(3),
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(bottom = 112.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            gridItems(filteredBrowserItems, key = { it.file.absolutePath }) { item ->
+                                val path = item.file.absolutePath
+                                val isSelected = path in selectedPaths
+                                BrowserGridCard(
+                                    item = item,
+                                    isSelected = isSelected,
+                                    isStarred = path in starredPaths,
+                                    onClick = {
+                                        if (selectedPaths.isNotEmpty()) {
+                                            selectedPaths = if (path in selectedPaths) selectedPaths - path else selectedPaths + path
+                                        } else if (item.isDirectory) {
+                                            showOnlyStarred = false
+                                            updateCurrentDir(item.file)
+                                        } else {
+                                            openFileSmart(item.file)
+                                        }
+                                    },
+                                    onLongClick = { itemForMenu = item }
+                                )
+                            }
+                        }
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                            contentPadding = PaddingValues(bottom = 112.dp)
+                        ) {
+                            items(filteredBrowserItems, key = { it.file.absolutePath }) { item ->
+                                val path = item.file.absolutePath
+                                val isSelected = path in selectedPaths
+                                val isStarred = path in starredPaths
+                                BrowserItemCard(
+                                    item = item,
+                                    isSelected = isSelected,
+                                    isStarred = isStarred,
+                                    relativeHint = if (searchRecursive && searchQuery.trim().length >= 2) {
+                                        item.file.parentFile?.relativeToOrNull(currentDir)?.path?.takeIf { it.isNotBlank() }
+                                    } else null,
+                                    onToggleSelect = {
+                                        selectedPaths = if (path in selectedPaths) selectedPaths - path else selectedPaths + path
+                                    },
+                                    onClick = {
+                                        if (selectedPaths.isNotEmpty()) {
+                                            selectedPaths = if (path in selectedPaths) selectedPaths - path else selectedPaths + path
+                                        } else if (item.isDirectory) {
+                                            showOnlyStarred = false
+                                            updateCurrentDir(item.file)
+                                        } else {
+                                            openFileSmart(item.file)
+                                        }
+                                    },
+                                    onMoreClick = {
+                                        itemForMenu = item
                                     }
-                                },
-                                onMoreClick = {
-                                    itemForMenu = item
-                                }
-                            )
+                                )
+                            }
                         }
                     }
                 }
-            }
             }
         }
     }
@@ -1784,9 +2133,9 @@ private fun FileDetailsSheet(
     LaunchedEffect(item.file) {
         withContext(Dispatchers.IO) {
             if (item.isDirectory) {
-                calculatedSize = computeRecursiveSize(item.file)
+                calculatedSize = FileManagerOps.computeRecursiveSize(item.file)
             } else if (item.sizeBytes in 1..(50L * 1024 * 1024)) {
-                sha256Hash = computeSha256Short(item.file)
+                sha256Hash = FileManagerOps.computeSha256Short(item.file)
             }
         }
     }
@@ -1905,26 +2254,161 @@ private fun QuickToolCard(
 }
 
 @Composable
-private fun BrowserItemCard(
-    item: BrowserFileItem,
-    isSelected: Boolean,
-    isStarred: Boolean,
-    onToggleSelect: () -> Unit,
-    onClick: () -> Unit,
-    onMoreClick: () -> Unit
+private fun ExplorerThumbnail(
+    file: File,
+    isDirectory: Boolean,
+    modifier: Modifier = Modifier
 ) {
-    val ext = item.file.extension.lowercase()
+    val context = LocalContext.current
+    val ext = file.extension.lowercase()
+    val supportsThumb = !isDirectory && (
+        ext in FileManagerOps.IMAGE_EXTENSIONS ||
+            ext in setOf("mp4", "mkv", "mov", "avi", "webm") ||
+            ext == "apk"
+        )
+    var bitmap by remember(file.absolutePath) {
+        mutableStateOf(if (supportsThumb) explorerThumbCache.get(file.absolutePath) else null)
+    }
+
+    LaunchedEffect(file.absolutePath, supportsThumb) {
+        if (supportsThumb && bitmap == null) {
+            val bmp = withContext(Dispatchers.IO) {
+                FileManagerOps.loadFileThumbnailBitmap(context, file)
+            }
+            if (bmp != null) {
+                explorerThumbCache.put(file.absolutePath, bmp)
+                bitmap = bmp
+            }
+        }
+    }
+
     val (icon, tint) = when {
-        item.isDirectory -> Icons.Default.Folder to AuraCyan
-        ext in setOf("jpg", "jpeg", "png", "webp", "gif", "heic") -> Icons.Default.Image to AuraCyan
+        isDirectory -> Icons.Default.Folder to AuraCyan
+        ext in FileManagerOps.IMAGE_EXTENSIONS -> Icons.Default.Image to AuraCyan
         ext in setOf("mp4", "mkv", "mov", "avi", "webm") -> Icons.Default.VideoLibrary to AuraOrange
         ext in setOf("mp3", "wav", "flac", "m4a", "ogg") -> Icons.Default.AudioFile to AuraRose
         ext == "apk" -> Icons.Default.Android to AuraGreen
         ext == "zip" -> Icons.Default.FolderZip to AuraGreen
-        ext in setOf("pdf", "doc", "docx", "txt", "xls", "xlsx", "ppt", "pptx") -> Icons.Default.Description to AuraPurple
+        ext in setOf("pdf", "doc", "docx", "txt", "xls", "xlsx", "ppt", "pptx", "json", "md", "xml") -> Icons.Default.Description to AuraPurple
         else -> Icons.AutoMirrored.Filled.InsertDriveFile to TextSecondary
     }
 
+    Box(
+        modifier = modifier.background(tint.copy(alpha = 0.16f)),
+        contentAlignment = Alignment.Center
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap!!.asImageBitmap(),
+                contentDescription = file.name,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
+            Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(20.dp))
+        }
+    }
+}
+
+@Composable
+private fun RecentFileChipCard(
+    recent: RecentMediaFile,
+    onClick: () -> Unit
+) {
+    val f = remember(recent.path) { File(recent.path) }
+    Column(
+        modifier = Modifier
+            .width(126.dp)
+            .clip(RoundedCornerShape(18.dp))
+            .background(GlassPanel.copy(alpha = 0.65f))
+            .border(1.dp, GlassBorder, RoundedCornerShape(18.dp))
+            .clickable { onClick() }
+            .padding(10.dp)
+    ) {
+        ExplorerThumbnail(
+            file = f,
+            isDirectory = false,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(64.dp)
+                .clip(RoundedCornerShape(12.dp))
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = recent.name,
+            color = TextPrimary,
+            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            text = formatBytes(recent.size),
+            color = TextTertiary,
+            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp)
+        )
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun BrowserGridCard(
+    item: BrowserFileItem,
+    isSelected: Boolean,
+    isStarred: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .clip(RoundedCornerShape(16.dp))
+            .background(if (isSelected) AuraCyan.copy(alpha = 0.16f) else GlassPanel.copy(alpha = 0.6f))
+            .border(1.dp, if (isSelected) AuraCyan else GlassBorder, RoundedCornerShape(16.dp))
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+            .padding(8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(74.dp)
+                .clip(RoundedCornerShape(10.dp))
+        ) {
+            ExplorerThumbnail(file = item.file, isDirectory = item.isDirectory, modifier = Modifier.fillMaxSize())
+            if (isStarred) {
+                Icon(
+                    Icons.Default.Star,
+                    contentDescription = "Starred",
+                    tint = AuraOrange,
+                    modifier = Modifier.align(Alignment.TopEnd).padding(4.dp).size(14.dp)
+                )
+            }
+        }
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = item.name,
+            color = TextPrimary,
+            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            text = if (item.isDirectory) "${item.childCount} items" else formatBytes(item.sizeBytes),
+            color = TextTertiary,
+            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp)
+        )
+    }
+}
+
+@Composable
+private fun BrowserItemCard(
+    item: BrowserFileItem,
+    isSelected: Boolean,
+    isStarred: Boolean,
+    relativeHint: String? = null,
+    onToggleSelect: () -> Unit,
+    onClick: () -> Unit,
+    onMoreClick: () -> Unit
+) {
     val dateStr = remember(item.lastModified) {
         SimpleDateFormat("MMM d", Locale.US).format(Date(item.lastModified))
     }
@@ -1939,15 +2423,13 @@ private fun BrowserItemCard(
             .padding(horizontal = 14.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Box(
+        ExplorerThumbnail(
+            file = item.file,
+            isDirectory = item.isDirectory,
             modifier = Modifier
                 .size(40.dp)
                 .clip(CircleShape)
-                .background(tint.copy(alpha = 0.16f)),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(20.dp))
-        }
+        )
         Spacer(modifier = Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1966,12 +2448,13 @@ private fun BrowserItemCard(
                 }
             }
             Spacer(modifier = Modifier.height(2.dp))
-            val metaText = if (item.isDirectory) {
+            val baseMeta = if (item.isDirectory) {
                 "${item.childCount} items • $dateStr"
             } else {
                 "${formatBytes(item.sizeBytes)} • $dateStr"
             }
-            Text(metaText, color = TextTertiary, style = MaterialTheme.typography.labelSmall)
+            val metaText = if (!relativeHint.isNullOrBlank()) "$baseMeta • $relativeHint" else baseMeta
+            Text(metaText, color = TextTertiary, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         IconButton(onClick = onToggleSelect, modifier = Modifier.size(40.dp)) {
             Icon(
@@ -2022,123 +2505,6 @@ private fun loadDirectoryContents(dir: File, showHidden: Boolean): List<BrowserF
         .map { toBrowserFileItem(it) }
 }
 
-private fun executeClipboardPaste(clip: FileClipboard, targetDir: File): Int {
-    var successCount = 0
-    for (srcPath in clip.paths) {
-        val src = File(srcPath)
-        if (!src.exists()) continue
-        var dest = File(targetDir, src.name)
-        if (dest.absolutePath == src.absolutePath) {
-            if (clip.operation == ClipboardOperation.MOVE) continue
-            dest = File(targetDir, "${src.nameWithoutExtension}_copy.${src.extension}".trimEnd('.'))
-        } else if (dest.exists()) {
-            dest = File(targetDir, "${src.nameWithoutExtension}_${System.currentTimeMillis() % 1000}.${src.extension}".trimEnd('.'))
-        }
-        try {
-            if (clip.operation == ClipboardOperation.COPY) {
-                src.copyRecursively(dest, overwrite = true)
-                successCount++
-            } else {
-                if (src.renameTo(dest)) {
-                    successCount++
-                } else {
-                    src.copyRecursively(dest, overwrite = true)
-                    if (src.isDirectory) src.deleteRecursively() else src.delete()
-                    successCount++
-                }
-            }
-        } catch (_: Exception) {
-        }
-    }
-    return successCount
-}
-
-private fun compressFilesToZip(sources: List<File>, destZip: File): Boolean {
-    return try {
-        ZipOutputStream(BufferedOutputStream(FileOutputStream(destZip))).use { zos ->
-            for (src in sources) {
-                addFileToZip(zos, src, src.name)
-            }
-        }
-        true
-    } catch (_: Exception) {
-        false
-    }
-}
-
-private fun addFileToZip(zos: ZipOutputStream, file: File, entryName: String) {
-    if (file.isDirectory) {
-        val children = file.listFiles() ?: return
-        for (child in children) {
-            addFileToZip(zos, child, "$entryName/${child.name}")
-        }
-    } else {
-        FileInputStream(file).use { fis ->
-            BufferedInputStream(fis).use { origin ->
-                val entry = ZipEntry(entryName)
-                zos.putNextEntry(entry)
-                origin.copyTo(zos)
-                zos.closeEntry()
-            }
-        }
-    }
-}
-
-private fun extractZipArchive(zipFile: File, targetParentDir: File): Boolean {
-    return try {
-        val outDir = File(targetParentDir, zipFile.nameWithoutExtension)
-        if (!outDir.exists()) outDir.mkdirs()
-        val canonicalOutDir = outDir.canonicalPath
-        ZipInputStream(BufferedInputStream(FileInputStream(zipFile))).use { zis ->
-            var entry: ZipEntry? = zis.nextEntry
-            while (entry != null) {
-                val outFile = File(outDir, entry.name)
-                if (!outFile.canonicalPath.startsWith(canonicalOutDir)) {
-                    break // Zip-slip protection
-                }
-                if (entry.isDirectory) {
-                    outFile.mkdirs()
-                } else {
-                    outFile.parentFile?.mkdirs()
-                    FileOutputStream(outFile).use { fos ->
-                        zis.copyTo(fos)
-                    }
-                }
-                zis.closeEntry()
-                entry = zis.nextEntry
-            }
-        }
-        true
-    } catch (_: Exception) {
-        false
-    }
-}
-
-private fun computeRecursiveSize(file: File): Long {
-    return try {
-        if (file.isFile) file.length()
-        else file.walkTopDown().filter { it.isFile }.sumOf { it.length() }
-    } catch (_: Exception) {
-        0L
-    }
-}
-
-private fun computeSha256Short(file: File): String? {
-    return try {
-        val md = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
-            val buf = ByteArray(8192)
-            var read: Int
-            while (input.read(buf).also { read = it } != -1) {
-                md.update(buf, 0, read)
-            }
-        }
-        md.digest().take(8).joinToString("") { "%02x".format(it) } + "..."
-    } catch (_: Exception) {
-        null
-    }
-}
-
 private fun buildBreadcrumbs(root: File, current: File): List<Pair<String, File>> {
     val result = mutableListOf<Pair<String, File>>()
     var ptr: File? = current
@@ -2149,46 +2515,6 @@ private fun buildBreadcrumbs(root: File, current: File): List<Pair<String, File>
         ptr = ptr.parentFile
     }
     return result
-}
-
-private fun encryptLocalFileToVault(context: Context, sourceFile: File): Boolean {
-    return try {
-        val uuid = UUID.randomUUID().toString()
-        val vaultDir = VaultManager.getVaultDir(context)
-        val destFile = File(vaultDir, "$uuid.enc")
-        val encryptedFile = EncryptedFile.Builder(
-            context,
-            destFile,
-            VaultManager.getMasterKey(context),
-            EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB
-        ).build()
-
-        sourceFile.inputStream().use { input ->
-            encryptedFile.openFileOutput().use { output ->
-                input.copyTo(output)
-            }
-        }
-        VaultManager.getRegistry(context).edit().putString(uuid, sourceFile.name).apply()
-        sourceFile.delete()
-        true
-    } catch (_: Exception) {
-        false
-    }
-}
-
-private fun openFileWithProvider(context: Context, file: File) {
-    try {
-        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-        val ext = file.extension.lowercase()
-        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, mime)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        context.startActivity(Intent.createChooser(intent, "Open with"))
-    } catch (_: Exception) {
-        Toast.makeText(context, "No app found to open this file", Toast.LENGTH_SHORT).show()
-    }
 }
 
 private fun shareFileWithProvider(context: Context, file: File) {
@@ -2342,7 +2668,7 @@ fun StorageDonutChart(total: Long, used: Long, free: Long, categories: List<Stor
 
 @Composable
 fun CategoryItemRow(cat: StorageCategory, totalSpace: Long, onClick: () -> Unit = {}) {
-    val isInteractive = cat.name in listOf("Images", "Videos", "Audio", "Documents", "Apps & Data")
+    val isInteractive = cat.name in listOf("Images", "Videos", "Audio", "Documents", "Downloads", "APKs", "Apps & Data")
     val safeTotal = max(1L, totalSpace)
     val modifier = if (isInteractive) {
         Modifier.clickable { onClick() }

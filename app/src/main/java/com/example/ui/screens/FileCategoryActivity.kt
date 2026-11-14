@@ -45,25 +45,37 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.DriveFileMove
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.automirrored.filled.Sort
+import androidx.compose.material.icons.automirrored.filled.ViewList
+import androidx.compose.material.icons.filled.Android
 import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayCircleOutline
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
-import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.VideoLibrary
-import androidx.compose.material.icons.automirrored.filled.ViewList
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -75,6 +87,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
@@ -83,8 +97,8 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.foundation.border
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -100,28 +114,42 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.GlassCard
+import com.example.InfoRow
 import com.example.formatBytes
+import com.example.service.FileManagerOps
 import com.example.service.FileShredder
+import com.example.service.PendingExplorerNavigation
 import com.example.service.PermissionUtils
+import com.example.service.SharedClipboardHolder
+import com.example.service.SharedClipboardOp
 import com.example.service.ShredJobCoordinator
 import com.example.service.ShredStandard
 import com.example.service.ShredTarget
 import com.example.service.StorageScanCache
+import com.example.ui.components.ActiveFilePreview
+import com.example.ui.components.BuiltInFilePreviewHost
+import com.example.ui.components.ExpandableSearchBar
+import com.example.ui.components.SearchIconToggleButton
+import com.example.ui.components.openExternalWithProvider
+import com.example.ui.components.resolveInAppViewerType
 import com.example.ui.theme.AppTheme
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
 import com.example.ui.theme.AuraOrange
+import com.example.ui.theme.AuraPurple
 import com.example.ui.theme.AuraRose
 import com.example.ui.theme.GlassBorder
 import com.example.ui.theme.GlassPanel
@@ -162,7 +190,7 @@ class FileCategoryActivity : ComponentActivity() {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class, ExperimentalLayoutApi::class)
 @Composable
 fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
     val context = LocalContext.current
@@ -170,7 +198,9 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
     val scope = rememberCoroutineScope()
     var files by remember { mutableStateOf<List<FileItem>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
+    var searchExpanded by rememberSaveable { mutableStateOf(false) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
+    var selectedAlbum by rememberSaveable { mutableStateOf("ALL") }
     var sortOption by rememberSaveable { mutableStateOf("Size (High to Low)") }
     var showSortMenu by remember { mutableStateOf(false) }
 
@@ -180,6 +210,12 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
 
     var selectedItems by remember { mutableStateOf<Set<FileItem>>(emptySet()) }
     val isSelectionMode = selectedItems.isNotEmpty()
+
+    var itemForMenu by remember { mutableStateOf<FileItem?>(null) }
+    var itemForDetails by remember { mutableStateOf<FileItem?>(null) }
+    var itemForRename by remember { mutableStateOf<FileItem?>(null) }
+    var renameInput by remember { mutableStateOf("") }
+    var activeFilePreview by remember { mutableStateOf<ActiveFilePreview?>(null) }
 
     var showNormalDeleteDialog by remember { mutableStateOf(false) }
     var showShredDialog by remember { mutableStateOf(false) }
@@ -298,12 +334,26 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
         isLoading = false
     }
 
-    val sortedFiles = remember(files, sortOption, searchQuery) {
-        val filtered = if (searchQuery.isBlank()) {
+    val albums = remember(files) {
+        files.mapNotNull { item ->
+            val p = item.path
+            if (p.isNotBlank()) File(p).parentFile?.name?.takeIf { it.isNotBlank() } else null
+        }.groupingBy { it }.eachCount().entries.sortedByDescending { it.value }
+    }
+
+    val sortedFiles = remember(files, selectedAlbum, sortOption, searchQuery) {
+        val albumFiltered = if (selectedAlbum == "ALL") {
             files
         } else {
+            files.filter { item ->
+                item.path.isNotBlank() && File(item.path).parentFile?.name == selectedAlbum
+            }
+        }
+        val filtered = if (searchQuery.isBlank()) {
+            albumFiltered
+        } else {
             val q = searchQuery.trim().lowercase()
-            files.filter { it.name.lowercase().contains(q) }
+            albumFiltered.filter { it.name.lowercase().contains(q) }
         }
         when (sortOption) {
             "Size (High to Low)" -> filtered.sortedByDescending { it.size }
@@ -324,19 +374,24 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
     }
 
     fun openFile(item: FileItem) {
-        try {
-            val uri: Uri = if (item.path.isNotBlank() && File(item.path).exists()) {
-                FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", File(item.path))
-            } else {
-                item.contentUri
+        val f = if (item.path.isNotBlank()) File(item.path) else null
+        if (f != null && f.exists()) {
+            val vType = resolveInAppViewerType(f)
+            if (vType != null) {
+                activeFilePreview = ActiveFilePreview(f, item.contentUri, vType)
+                return
             }
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, item.mimeType)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            context.startActivity(Intent.createChooser(intent, "Open with"))
-        } catch (_: Exception) {
-            Toast.makeText(context, "No application available to open this file", Toast.LENGTH_SHORT).show()
+        }
+        openExternalWithProvider(context, f, item.contentUri, item.mimeType)
+    }
+
+    fun jumpToParentFolder(item: FileItem) {
+        val parent = if (item.path.isNotBlank()) File(item.path).parentFile else null
+        if (parent != null && parent.exists()) {
+            PendingExplorerNavigation.openFolder(parent.absolutePath)
+            onBack()
+        } else {
+            Toast.makeText(context, "Folder path unavailable", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -648,6 +703,213 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
         )
     }
 
+    // Built-in Viewers Host
+    BuiltInFilePreviewHost(
+        preview = activeFilePreview,
+        onDismiss = { activeFilePreview = null },
+        onExtractZip = { zipFile ->
+            scope.launch {
+                val ok = withContext(Dispatchers.IO) {
+                    FileManagerOps.extractZipArchive(context, zipFile, zipFile.parentFile ?: context.filesDir)
+                }
+                Toast.makeText(context, if (ok) "Extracted ${zipFile.name}" else "Extract failed", Toast.LENGTH_SHORT).show()
+                refreshTrigger++
+            }
+        },
+        onShare = { f, uri ->
+            val match = files.firstOrNull { it.path == f.absolutePath || it.contentUri == uri }
+            if (match != null) {
+                selectedItems = setOf(match)
+                shareSelectedFiles()
+                selectedItems = emptySet()
+            }
+        },
+        onVault = { f, uri ->
+            scope.launch {
+                val ok = withContext(Dispatchers.IO) { FileManagerOps.encryptFileToVault(context, f, uri) }
+                if (ok) {
+                    files = files.filterNot { it.path == f.absolutePath || it.contentUri == uri }
+                    refreshTrigger++
+                }
+                Toast.makeText(context, if (ok) "Locked in Vault" else "Vault failed", Toast.LENGTH_SHORT).show()
+            }
+        },
+        onDelete = { f, uri ->
+            val match = files.firstOrNull { it.path == f.absolutePath || it.contentUri == uri }
+            if (match != null) {
+                selectedItems = setOf(match)
+                showNormalDeleteDialog = true
+            }
+        },
+        onShowDetails = { f ->
+            activeFilePreview = null
+            itemForDetails = files.firstOrNull { it.path == f.absolutePath }
+        },
+        onFileSaved = { refreshTrigger++ }
+    )
+
+    // Rename Dialog
+    if (itemForRename != null) {
+        val target = itemForRename!!
+        AlertDialog(
+            onDismissRequest = { itemForRename = null },
+            containerColor = GlassPanel,
+            title = { Text("Rename File", color = TextPrimary, fontWeight = FontWeight.Bold) },
+            text = {
+                OutlinedTextField(
+                    value = renameInput,
+                    onValueChange = { renameInput = it },
+                    label = { Text("New name", color = TextSecondary) },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = AuraCyan,
+                        unfocusedBorderColor = GlassBorder,
+                        focusedTextColor = TextPrimary,
+                        unfocusedTextColor = TextPrimary
+                    )
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val newName = renameInput.trim()
+                    if (newName.isNotEmpty() && newName != target.name && target.path.isNotBlank()) {
+                        scope.launch {
+                            val ok = withContext(Dispatchers.IO) {
+                                FileManagerOps.renameFileSafely(context, File(target.path), newName)
+                            }
+                            Toast.makeText(
+                                context,
+                                if (ok) "Renamed to $newName" else "Grant All Files Access to rename",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            if (ok) refreshTrigger++
+                        }
+                    }
+                    itemForRename = null
+                }) {
+                    Text("SAVE", color = AuraCyan, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { itemForRename = null }) {
+                    Text("CANCEL", color = TextSecondary)
+                }
+            }
+        )
+    }
+
+    // Item Details Sheet
+    if (itemForDetails != null) {
+        val target = itemForDetails!!
+        CategoryFileDetailsSheet(
+            item = target,
+            onShowInFolder = {
+                itemForDetails = null
+                jumpToParentFolder(target)
+            },
+            onClose = { itemForDetails = null }
+        )
+    }
+
+    // Item Context Action Sheet
+    if (itemForMenu != null) {
+        val target = itemForMenu!!
+        ModalBottomSheet(
+            onDismissRequest = { itemForMenu = null },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            containerColor = GlassPanel,
+            contentColor = TextPrimary
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 24.dp, vertical = 12.dp)
+            ) {
+                Text(
+                    text = target.name,
+                    color = TextPrimary,
+                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = "${formatBytes(target.size)} • ${File(target.path).parentFile?.name ?: categoryName}",
+                    color = TextTertiary,
+                    style = MaterialTheme.typography.labelSmall
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    maxItemsInEachRow = 4
+                ) {
+                    CategorySheetAction(Icons.Default.FolderOpen, "In Folder", AuraCyan) {
+                        itemForMenu = null
+                        jumpToParentFolder(target)
+                    }
+                    CategorySheetAction(Icons.Default.Edit, "Rename", AuraCyan) {
+                        itemForMenu = null
+                        renameInput = target.name
+                        itemForRename = target
+                    }
+                    CategorySheetAction(Icons.Default.ContentCopy, "Copy", AuraCyan) {
+                        itemForMenu = null
+                        if (target.path.isNotBlank()) {
+                            SharedClipboardHolder.setClipboard(setOf(target.path), SharedClipboardOp.COPY)
+                            Toast.makeText(context, "Copied — open Explorer folder to paste", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                    CategorySheetAction(Icons.AutoMirrored.Filled.DriveFileMove, "Move", AuraOrange) {
+                        itemForMenu = null
+                        if (target.path.isNotBlank()) {
+                            SharedClipboardHolder.setClipboard(setOf(target.path), SharedClipboardOp.MOVE)
+                            Toast.makeText(context, "Ready to move — open destination in Explorer", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                    CategorySheetAction(Icons.Default.Lock, "Vault", AuraPurple) {
+                        itemForMenu = null
+                        if (target.path.isNotBlank()) {
+                            scope.launch {
+                                val ok = withContext(Dispatchers.IO) {
+                                    FileManagerOps.encryptFileToVault(context, File(target.path), target.contentUri)
+                                }
+                                if (ok) {
+                                    files = files.filterNot { it == target }
+                                    selectedItems = selectedItems - target
+                                    refreshTrigger++
+                                }
+                                Toast.makeText(context, if (ok) "Locked in Vault" else "Vault failed", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                    CategorySheetAction(Icons.Default.Share, "Share", AuraCyan) {
+                        itemForMenu = null
+                        selectedItems = setOf(target)
+                        shareSelectedFiles()
+                        selectedItems = emptySet()
+                    }
+                    CategorySheetAction(Icons.Default.Info, "Details", TextSecondary) {
+                        itemForMenu = null
+                        itemForDetails = target
+                    }
+                    CategorySheetAction(Icons.Default.Delete, "Delete", TextSecondary) {
+                        itemForMenu = null
+                        selectedItems = setOf(target)
+                        showNormalDeleteDialog = true
+                    }
+                    CategorySheetAction(Icons.Default.DeleteForever, "Shred", AuraRose) {
+                        itemForMenu = null
+                        selectedItems = setOf(target)
+                        showShredDialog = true
+                    }
+                }
+                Spacer(modifier = Modifier.height(24.dp))
+            }
+        }
+    }
+
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
@@ -672,10 +934,32 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                 },
                 actions = {
                     if (isSelectionMode) {
+                        if (selectedItems.size == 1) {
+                            IconButton(onClick = { itemForMenu = selectedItems.first() }) {
+                                Icon(Icons.Default.MoreVert, contentDescription = "More Actions", tint = AuraCyan)
+                            }
+                        }
                         IconButton(onClick = {
                             selectedItems = if (selectedItems.size == sortedFiles.size) emptySet() else sortedFiles.toSet()
                         }) {
                             Icon(Icons.Default.SelectAll, contentDescription = "Select All", tint = TextPrimary)
+                        }
+                        IconButton(onClick = {
+                            val paths = selectedItems.mapNotNull { it.path.takeIf { p -> p.isNotBlank() } }.toSet()
+                            if (paths.isNotEmpty()) {
+                                scope.launch {
+                                    val count = withContext(Dispatchers.IO) {
+                                        selectedItems.count { item ->
+                                            item.path.isNotBlank() && FileManagerOps.encryptFileToVault(context, File(item.path), item.contentUri)
+                                        }
+                                    }
+                                    selectedItems = emptySet()
+                                    refreshTrigger++
+                                    Toast.makeText(context, "Locked $count file(s) in Vault", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        }) {
+                            Icon(Icons.Default.Lock, contentDescription = "Lock in Vault", tint = AuraPurple)
                         }
                         IconButton(onClick = { shareSelectedFiles() }) {
                             Icon(Icons.Default.Share, contentDescription = "Share Selected", tint = AuraCyan)
@@ -687,6 +971,21 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                             Icon(Icons.Default.DeleteForever, contentDescription = "Secure Shred", tint = AuraRose)
                         }
                     } else {
+                        SearchIconToggleButton(
+                            isExpanded = searchExpanded,
+                            hasQuery = searchQuery.isNotBlank(),
+                            accentColor = AuraCyan,
+                            size = 36.dp,
+                            tag = "category_search_toggle"
+                        ) {
+                            if (searchExpanded) {
+                                searchExpanded = false
+                                searchQuery = ""
+                            } else {
+                                searchExpanded = true
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(4.dp))
                         IconButton(onClick = { isGridView = !isGridView }) {
                             Icon(
                                 if (isGridView) Icons.AutoMirrored.Filled.ViewList else Icons.Default.GridView,
@@ -736,31 +1035,60 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                 .fillMaxSize()
                 .padding(padding)
         ) {
-            if (!isLoading && files.isNotEmpty()) {
-                OutlinedTextField(
-                    value = searchQuery,
-                    onValueChange = { searchQuery = it },
-                    placeholder = { Text("Search $categoryName...", color = TextTertiary) },
-                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = AuraCyan) },
-                    trailingIcon = {
-                        if (searchQuery.isNotEmpty()) {
-                            IconButton(onClick = { searchQuery = "" }) {
-                                Icon(Icons.Default.Close, contentDescription = "Clear", tint = TextSecondary)
-                            }
-                        }
-                    },
-                    singleLine = true,
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = AuraCyan,
-                        unfocusedBorderColor = GlassBorder,
-                        focusedTextColor = TextPrimary,
-                        unfocusedTextColor = TextPrimary
-                    ),
-                    shape = RoundedCornerShape(14.dp),
+            ExpandableSearchBar(
+                visible = searchExpanded,
+                query = searchQuery,
+                onQueryChange = { searchQuery = it },
+                placeholder = "Search $categoryName...",
+                onClose = {
+                    searchQuery = ""
+                    searchExpanded = false
+                },
+                modifier = Modifier.padding(horizontal = 24.dp)
+            )
+
+            // Album / Folder Filter Chips
+            if (!isLoading && albums.size > 1) {
+                Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 24.dp, vertical = 8.dp)
-                )
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 24.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    val allChipSelected = selectedAlbum == "ALL"
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(100.dp))
+                            .background(if (allChipSelected) AuraCyan.copy(alpha = 0.18f) else GlassPanel.copy(alpha = 0.65f))
+                            .border(1.dp, if (allChipSelected) AuraCyan else GlassBorder, RoundedCornerShape(100.dp))
+                            .clickable { selectedAlbum = "ALL" }
+                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        Text(
+                            text = "All (${files.size})",
+                            color = if (allChipSelected) AuraCyan else TextSecondary,
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                        )
+                    }
+                    albums.forEach { (albumName, count) ->
+                        val active = selectedAlbum == albumName
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(100.dp))
+                                .background(if (active) AuraCyan.copy(alpha = 0.18f) else GlassPanel.copy(alpha = 0.65f))
+                                .border(1.dp, if (active) AuraCyan else GlassBorder, RoundedCornerShape(100.dp))
+                                .clickable { selectedAlbum = albumName }
+                                .padding(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Text(
+                                text = "$albumName ($count)",
+                                color = if (active) AuraCyan else TextSecondary,
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold)
+                            )
+                        }
+                    }
+                }
             }
 
             if (!hasMediaPerm && !hasManageStorage) {
@@ -876,12 +1204,111 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                                 onClick = {
                                     if (isSelectionMode) toggleSelection(file) else openFile(file)
                                 },
-                                onLongClick = { toggleSelection(file) }
+                                onLongClick = { toggleSelection(file) },
+                                onMoreClick = { itemForMenu = file }
                             )
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun CategorySheetAction(
+    icon: ImageVector,
+    label: String,
+    tint: Color,
+    onClick: () -> Unit
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier
+            .width(74.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .clickable { onClick() }
+            .padding(vertical = 10.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(44.dp)
+                .clip(CircleShape)
+                .background(tint.copy(alpha = 0.15f)),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(icon, contentDescription = label, tint = tint, modifier = Modifier.size(22.dp))
+        }
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = label,
+            color = TextPrimary,
+            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+            maxLines = 1
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CategoryFileDetailsSheet(
+    item: FileItem,
+    onShowInFolder: () -> Unit,
+    onClose: () -> Unit
+) {
+    var sha256Hash by remember(item.path) { mutableStateOf<String?>(null) }
+    LaunchedEffect(item.path) {
+        if (item.path.isNotBlank() && item.size in 1..(50L * 1024 * 1024)) {
+            sha256Hash = withContext(Dispatchers.IO) {
+                FileManagerOps.computeSha256Short(File(item.path))
+            }
+        }
+    }
+    val dateStr = remember(item.dateModified) {
+        SimpleDateFormat("MMM d, yyyy • hh:mm a", Locale.US).format(Date(item.dateModified * 1000))
+    }
+
+    ModalBottomSheet(
+        onDismissRequest = onClose,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        containerColor = GlassPanel,
+        contentColor = TextPrimary
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp, vertical = 12.dp)
+        ) {
+            Text(
+                text = "FILE DETAILS",
+                color = AuraCyan,
+                style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 2.sp, fontWeight = FontWeight.Bold)
+            )
+            Spacer(modifier = Modifier.height(14.dp))
+            InfoRow("NAME", item.name)
+            InfoRow("ALBUM / FOLDER", File(item.path).parentFile?.name ?: "Shared Storage")
+            InfoRow("MIME TYPE", item.mimeType)
+            InfoRow("SIZE", formatBytes(item.size))
+            InfoRow("MODIFIED", dateStr)
+            if (sha256Hash != null) {
+                InfoRow("SHA-256", sha256Hash!!)
+            }
+            if (item.path.isNotBlank()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text("PATH", style = MaterialTheme.typography.labelSmall, color = TextTertiary)
+                Text(item.path, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                Spacer(modifier = Modifier.height(14.dp))
+                Button(
+                    onClick = onShowInFolder,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = AuraCyan)
+                ) {
+                    Icon(Icons.Default.FolderOpen, contentDescription = null, tint = Obsidian, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("OPEN FOLDER IN EXPLORER", color = Obsidian, fontWeight = FontWeight.Bold)
+                }
+            }
+            Spacer(modifier = Modifier.height(20.dp))
         }
     }
 }
@@ -897,8 +1324,8 @@ fun MediaThumbnail(
     val context = LocalContext.current
     var bitmap by remember(file.contentUri) { mutableStateOf(mediaThumbnailCache.get(file.contentUri)) }
 
-    LaunchedEffect(file.contentUri) {
-        if ((category == "Images" || category == "Videos") && bitmap == null) {
+    LaunchedEffect(file.contentUri, category) {
+        if ((category == "Images" || category == "Videos" || category == "APKs" || file.name.endsWith(".apk", true)) && bitmap == null) {
             val signal = CancellationSignal()
             val reg = coroutineContext[kotlinx.coroutines.Job]?.invokeOnCompletion {
                 signal.cancel()
@@ -906,7 +1333,9 @@ fun MediaThumbnail(
             try {
                 val loaded = withContext(Dispatchers.IO) {
                     try {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        if (category == "APKs" || file.name.endsWith(".apk", true)) {
+                            if (file.path.isNotBlank()) FileManagerOps.loadFileThumbnailBitmap(context, File(file.path)) else null
+                        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                             context.contentResolver.loadThumbnail(file.contentUri, Size(256, 256), signal)
                         } else null
                     } catch (_: Exception) {
@@ -928,6 +1357,8 @@ fun MediaThumbnail(
         "Videos" -> Pair(Icons.Default.VideoLibrary, AuraOrange)
         "Audio" -> Pair(Icons.Default.AudioFile, AuraRose)
         "Documents" -> Pair(Icons.Default.Description, AuraGreen)
+        "Downloads" -> Pair(Icons.Default.Download, AuraCyan)
+        "APKs" -> Pair(Icons.Default.Android, AuraGreen)
         else -> Pair(Icons.AutoMirrored.Filled.InsertDriveFile, Color.Gray)
     }
 
@@ -1018,9 +1449,13 @@ fun FileListItem(
     isSelected: Boolean,
     isSelectionMode: Boolean,
     onClick: () -> Unit,
-    onLongClick: () -> Unit
+    onLongClick: () -> Unit,
+    onMoreClick: () -> Unit = {}
 ) {
     val dateFormat = remember { SimpleDateFormat("MMM dd, yyyy", Locale.getDefault()) }
+    val folderName = remember(file.path) {
+        if (file.path.isNotBlank()) File(file.path).parentFile?.name else null
+    }
 
     GlassCard(
         modifier = Modifier
@@ -1049,25 +1484,60 @@ fun FileListItem(
                     overflow = TextOverflow.Ellipsis
                 )
                 Spacer(modifier = Modifier.height(4.dp))
+                val folderPart = if (!folderName.isNullOrBlank()) "  •  $folderName" else ""
                 Text(
-                    text = "${formatBytes(file.size)}  •  ${dateFormat.format(Date(file.dateModified * 1000))}",
+                    text = "${formatBytes(file.size)}  •  ${dateFormat.format(Date(file.dateModified * 1000))}$folderPart",
                     style = MaterialTheme.typography.labelSmall,
-                    color = TextTertiary
+                    color = TextTertiary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
             if (isSelectionMode) {
-                Spacer(modifier = Modifier.width(12.dp))
+                Spacer(modifier = Modifier.width(8.dp))
                 Icon(
                     imageVector = if (isSelected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
                     contentDescription = null,
                     tint = if (isSelected) AuraCyan else TextTertiary
                 )
+            } else {
+                IconButton(onClick = onMoreClick, modifier = Modifier.size(36.dp)) {
+                    Icon(
+                        imageVector = Icons.Default.MoreVert,
+                        contentDescription = "File Actions",
+                        tint = TextSecondary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
             }
         }
     }
 }
 
 private fun fetchFilesForCategory(context: Context, category: String): List<FileItem> {
+    if (category == "Downloads" && PermissionUtils.hasAllFilesPermission()) {
+        val dlDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+        if (dlDir != null && dlDir.exists()) {
+            val rawFiles = dlDir.walkTopDown().filter { it.isFile && it.length() > 0L }.toList()
+            if (rawFiles.isNotEmpty()) {
+                return rawFiles.mapIndexed { idx, f ->
+                    val uri = FileShredder.findMediaContentUriForFile(context, f) ?: Uri.fromFile(f)
+                    val ext = f.extension.lowercase()
+                    val mime = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
+                    FileItem(
+                        id = idx.toLong() + 1L,
+                        name = f.name,
+                        size = f.length(),
+                        dateModified = f.lastModified() / 1000L,
+                        path = f.absolutePath,
+                        contentUri = uri,
+                        mimeType = mime
+                    )
+                }
+            }
+        }
+    }
+
     val list = mutableListOf<FileItem>()
     val baseUri: Uri = when (category) {
         "Images" -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
@@ -1080,6 +1550,7 @@ private fun fetchFilesForCategory(context: Context, category: String): List<File
         "Images" -> "image/*"
         "Videos" -> "video/*"
         "Audio" -> "audio/*"
+        "APKs" -> "application/vnd.android.package-archive"
         else -> "*/*"
     }
 
@@ -1129,9 +1600,15 @@ private fun fetchFilesForCategory(context: Context, category: String): List<File
 
                 if (size <= 0) continue
 
-                if (category == "Documents") {
-                    val ext = File(path.ifBlank { name }).extension.lowercase()
-                    if (ext !in docExtensions) continue
+                val ext = File(path.ifBlank { name }).extension.lowercase()
+                when (category) {
+                    "Documents" -> if (ext !in docExtensions) continue
+                    "APKs" -> if (ext != "apk") continue
+                    "Downloads" -> {
+                        if (!path.contains("/Download/", ignoreCase = true) && !path.contains("/Downloads/", ignoreCase = true)) {
+                            continue
+                        }
+                    }
                 }
 
                 val itemUri = ContentUris.withAppendedId(baseUri, id)

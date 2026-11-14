@@ -49,6 +49,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Warning
@@ -59,6 +60,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -88,6 +90,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -95,6 +98,8 @@ import androidx.compose.ui.unit.sp
 import com.example.GlassCard
 import com.example.formatBytes
 import com.example.service.StorageScanCache
+import com.example.ui.components.ExpandableSearchBar
+import com.example.ui.components.SearchIconToggleButton
 import com.example.ui.theme.AppTheme
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
@@ -217,6 +222,12 @@ fun AppListScreen(onBack: () -> Unit) {
         }
         when (sortOption) {
             "Size" -> filtered.sortedByDescending { it.totalSize }
+            "InstallNew" -> filtered.sortedWith(
+                compareByDescending<AppItem> { it.installTime }.thenBy { it.name.lowercase() }
+            )
+            "InstallOld" -> filtered.sortedWith(
+                compareBy<AppItem> { if (it.installTime > 0L) it.installTime else Long.MAX_VALUE }.thenBy { it.name.lowercase() }
+            )
             "Risk" -> filtered.sortedWith(compareBy<AppItem> { it.riskLevel.ordinal }.thenByDescending { it.dangerousPermissions.size })
             "Usage" -> filtered.sortedWith(
                 compareBy<AppItem> { if (it.lastTimeUsed == 0L) 0 else 1 }
@@ -335,6 +346,8 @@ fun AppListScreen(onBack: () -> Unit) {
         )
     }
 
+    var isSearchVisible by remember { mutableStateOf(false) }
+
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
@@ -346,6 +359,15 @@ fun AppListScreen(onBack: () -> Unit) {
                     }
                 },
                 actions = {
+                    SearchIconToggleButton(
+                        isExpanded = isSearchVisible,
+                        hasQuery = searchQuery.isNotEmpty(),
+                        modifier = Modifier.padding(end = 4.dp),
+                        onClick = {
+                            isSearchVisible = !isSearchVisible
+                            if (!isSearchVisible) searchQuery = ""
+                        }
+                    )
                     Box {
                         IconButton(onClick = { showSortMenu = true }) {
                             Icon(Icons.AutoMirrored.Filled.Sort, contentDescription = "Sort", tint = AuraCyan)
@@ -357,6 +379,8 @@ fun AppListScreen(onBack: () -> Unit) {
                         ) {
                             listOf(
                                 "Size" to "Sort by Size",
+                                "InstallNew" to "Sort by Install Time (New to Old)",
+                                "InstallOld" to "Sort by Install Time (Old to New)",
                                 "Risk" to "Sort by Privacy Risk",
                                 "Usage" to "Sort by Least Used",
                                 "Name" to "Sort by Name (A-Z)"
@@ -374,29 +398,35 @@ fun AppListScreen(onBack: () -> Unit) {
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)
             )
+        },
+        floatingActionButton = {
+            ExtendedFloatingActionButton(
+                onClick = {
+                    if (!isLoading) {
+                        StorageScanCache.invalidate()
+                        refreshTrigger++
+                    }
+                },
+                containerColor = GlassPanel,
+                contentColor = AuraCyan,
+                modifier = Modifier.testTag("app_list_bottom_refresh_button")
+            ) {
+                Icon(Icons.Default.Refresh, contentDescription = "Refresh Apps", tint = AuraCyan, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Refresh", color = AuraCyan, style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold))
+            }
         }
     ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-            OutlinedTextField(
-                value = searchQuery,
-                onValueChange = { searchQuery = it },
-                placeholder = { Text("Search apps...", color = TextTertiary) },
-                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = AuraCyan) },
-                trailingIcon = {
-                    if (searchQuery.isNotEmpty()) {
-                        IconButton(onClick = { searchQuery = "" }) {
-                            Icon(Icons.Default.Close, contentDescription = "Clear", tint = TextSecondary)
-                        }
-                    }
+            ExpandableSearchBar(
+                visible = isSearchVisible || searchQuery.isNotEmpty(),
+                query = searchQuery,
+                onQueryChange = { searchQuery = it },
+                onClose = {
+                    searchQuery = ""
+                    isSearchVisible = false
                 },
-                singleLine = true,
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = AuraCyan,
-                    unfocusedBorderColor = GlassBorder,
-                    focusedTextColor = TextPrimary,
-                    unfocusedTextColor = TextPrimary
-                ),
-                shape = RoundedCornerShape(14.dp),
+                placeholder = "Search apps...",
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 24.dp, vertical = 4.dp)
@@ -537,17 +567,23 @@ fun AppItemCard(app: AppItem, onClick: () -> Unit) {
 
                 Spacer(modifier = Modifier.height(4.dp))
 
+                val installLabel = if (app.installTime > 0L) {
+                    "Installed ${dateFormat.format(Date(app.installTime))}"
+                } else {
+                    "Installed"
+                }
                 val usageString = if (app.lastTimeUsed > 0L) {
                     val daysAgo = ((System.currentTimeMillis() - app.lastTimeUsed) / (1000 * 60 * 60 * 24)).toInt()
-                    if (daysAgo == 0) "Used today" else if (daysAgo > 30) "Unused ($daysAgo days)" else "Used ${daysAgo}d ago"
+                    val usedPart = if (daysAgo == 0) "Used today" else if (daysAgo > 30) "Unused ($daysAgo days)" else "Used ${daysAgo}d ago"
+                    "$installLabel • $usedPart"
                 } else {
-                    "Installed ${dateFormat.format(Date(app.installTime))}"
+                    installLabel
                 }
 
                 Text(
                     text = "${formatBytes(app.totalSize)}  •  $usageString",
                     style = MaterialTheme.typography.labelSmall,
-                    color = if (usageString.startsWith("Unused")) AuraOrange else TextTertiary
+                    color = if (usageString.contains("Unused")) AuraOrange else TextTertiary
                 )
             }
         }

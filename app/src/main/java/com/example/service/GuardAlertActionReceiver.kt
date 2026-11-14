@@ -114,11 +114,13 @@ class GuardAlertActionReceiver : BroadcastReceiver() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val builder = NotificationCompat.Builder(context, "thermal_tracker_channel")
+        NotificationChannels.ensureCreated(context)
+        val builder = NotificationCompat.Builder(context, NotificationChannels.GUARD_ALERT_CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_info_details)
             .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setSilent(true)
             .setAutoCancel(true)
             .setTimeoutAfter(9000L)
             .setContentIntent(openPi)

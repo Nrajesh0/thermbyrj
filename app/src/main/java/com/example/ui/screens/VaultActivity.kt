@@ -5,6 +5,8 @@ import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -15,15 +17,21 @@ import android.util.Base64
 import android.webkit.MimeTypeMap
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -41,12 +49,20 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Backspace
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AudioFile
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Fingerprint
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
+import androidx.compose.material.icons.filled.RadioButtonUnchecked
+import androidx.compose.material.icons.filled.SelectAll
+import androidx.compose.material.icons.filled.VideoFile
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -65,6 +81,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -74,6 +91,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -86,9 +105,16 @@ import androidx.security.crypto.MasterKey
 import com.example.GlassCard
 import com.example.formatBytes
 import com.example.service.StorageScanCache
+import com.example.ui.components.ActiveFilePreview
+import com.example.ui.components.BuiltInFilePreviewHost
+import com.example.ui.components.ExpandableSearchBar
+import com.example.ui.components.SearchIconToggleButton
+import com.example.ui.components.resolveInAppViewerType
 import com.example.ui.theme.AppTheme
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
+import com.example.ui.theme.AuraOrange
+import com.example.ui.theme.AuraPurple
 import com.example.ui.theme.AuraRose
 import com.example.ui.theme.GlassBorder
 import com.example.ui.theme.GlassPanel
@@ -193,7 +219,7 @@ private fun verifyVaultPin(context: Context, candidatePin: String): Boolean {
     return hashPinWithSalt(candidatePin, salt) == expectedHash
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun VaultScreen(onBack: () -> Unit) {
     val context = LocalContext.current
@@ -207,11 +233,22 @@ fun VaultScreen(onBack: () -> Unit) {
     var showChangePinDialog by remember { mutableStateOf(false) }
     var newPinValue by remember { mutableStateOf("") }
 
+    var isSearchVisible by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
+    var selectedIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var activePreview by remember { mutableStateOf<ActiveFilePreview?>(null) }
+
     val vaultDir = remember { VaultManager.getVaultDir(context) }
     val registry = remember { VaultManager.getRegistry(context) }
     val masterKey = remember { VaultManager.getMasterKey(context) }
     val previewCacheDir = remember {
         File(context.cacheDir, "vault_preview").apply { if (!exists()) mkdirs() }
+    }
+
+    val isSelectionMode = selectedIds.isNotEmpty()
+
+    if (isSelectionMode) {
+        BackHandler { selectedIds = emptySet() }
     }
 
     DisposableEffect(Unit) {
@@ -229,6 +266,51 @@ fun VaultScreen(onBack: () -> Unit) {
             val id = f.nameWithoutExtension
             val origName = registry.getString(id, null) ?: f.name
             VaultEntry(id = id, originalName = origName, encryptedFile = f)
+        }
+    }
+
+    val filteredEntries = remember(vaultEntries, searchQuery) {
+        if (searchQuery.isBlank()) vaultEntries
+        else vaultEntries.filter { it.originalName.contains(searchQuery.trim(), ignoreCase = true) }
+    }
+
+    fun decryptEntryToDownloads(entry: VaultEntry): Boolean {
+        return try {
+            val encryptedFile = EncryptedFile.Builder(
+                context,
+                entry.encryptedFile,
+                masterKey,
+                EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB
+            ).build()
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = android.content.ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, "Decrypted_${entry.originalName}")
+                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                }
+                val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                if (uri != null) {
+                    encryptedFile.openFileInput().use { input ->
+                        context.contentResolver.openOutputStream(uri)?.use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                    true
+                } else false
+            } else {
+                val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                if (!downloads.exists()) downloads.mkdirs()
+                val outFile = File(downloads, "Decrypted_${entry.originalName}")
+                if (outFile.exists()) outFile.delete()
+                encryptedFile.openFileInput().use { input ->
+                    FileOutputStream(outFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                true
+            }
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -250,17 +332,22 @@ fun VaultScreen(onBack: () -> Unit) {
                     }
                 }
                 withContext(Dispatchers.Main) {
-                    try {
-                        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", tempOut)
-                        val ext = tempOut.extension.lowercase()
-                        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
-                        val intent = Intent(Intent.ACTION_VIEW).apply {
-                            setDataAndType(uri, mime)
-                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    val viewerType = resolveInAppViewerType(tempOut)
+                    if (viewerType != null) {
+                        activePreview = ActiveFilePreview(file = tempOut, type = viewerType)
+                    } else {
+                        try {
+                            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", tempOut)
+                            val ext = tempOut.extension.lowercase()
+                            val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
+                            val intent = Intent(Intent.ACTION_VIEW).apply {
+                                setDataAndType(uri, mime)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            context.startActivity(Intent.createChooser(intent, "Preview Secured File"))
+                        } catch (_: Exception) {
+                            Toast.makeText(context, "No app installed to preview this file type", Toast.LENGTH_SHORT).show()
                         }
-                        context.startActivity(Intent.createChooser(intent, "Preview Secured File"))
-                    } catch (_: Exception) {
-                        Toast.makeText(context, "No app installed to preview this file type", Toast.LENGTH_SHORT).show()
                     }
                 }
             } catch (e: Exception) {
@@ -270,6 +357,15 @@ fun VaultScreen(onBack: () -> Unit) {
             }
         }
     }
+
+    // Built-in viewer host for encrypted previews
+    BuiltInFilePreviewHost(
+        preview = activePreview,
+        onDismiss = {
+            activePreview?.file?.delete()
+            activePreview = null
+        }
+    )
 
     val deviceCredentialLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -348,25 +444,92 @@ fun VaultScreen(onBack: () -> Unit) {
         containerColor = Color.Transparent,
         topBar = {
             TopAppBar(
-                title = { Text("Secure Vault (AES-256)", color = TextPrimary, fontWeight = FontWeight.Bold) },
+                title = {
+                    if (isSelectionMode) {
+                        Text("${selectedIds.size} Selected", color = AuraCyan, fontWeight = FontWeight.Bold)
+                    } else {
+                        Text("Secure Vault (AES-256)", color = TextPrimary, fontWeight = FontWeight.Bold)
+                    }
+                },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = TextPrimary)
+                    if (isSelectionMode) {
+                        IconButton(onClick = { selectedIds = emptySet() }) {
+                            Icon(Icons.Default.Close, contentDescription = "Cancel Selection", tint = TextPrimary)
+                        }
+                    } else {
+                        IconButton(onClick = onBack) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = TextPrimary)
+                        }
                     }
                 },
                 actions = {
                     if (isUnlocked) {
-                        IconButton(onClick = {
-                            newPinValue = ""
-                            showChangePinDialog = true
-                        }) {
-                            Icon(Icons.Default.Key, contentDescription = "Change Vault PIN", tint = AuraCyan)
-                        }
-                        IconButton(onClick = {
-                            isUnlocked = false
-                            pinInput = ""
-                        }) {
-                            Icon(Icons.Default.Lock, contentDescription = "Lock Vault", tint = AuraRose)
+                        if (isSelectionMode) {
+                            IconButton(
+                                onClick = {
+                                    selectedIds = if (selectedIds.size == filteredEntries.size) emptySet()
+                                    else filteredEntries.map { it.id }.toSet()
+                                }
+                            ) {
+                                Icon(Icons.Default.SelectAll, contentDescription = "Select All", tint = AuraCyan)
+                            }
+                            IconButton(
+                                onClick = {
+                                    val targets = vaultEntries.filter { it.id in selectedIds }
+                                    scope.launch(Dispatchers.IO) {
+                                        var count = 0
+                                        targets.forEach { entry ->
+                                            if (decryptEntryToDownloads(entry)) count++
+                                        }
+                                        withContext(Dispatchers.Main) {
+                                            Toast.makeText(context, "Decrypted $count files to Downloads", Toast.LENGTH_LONG).show()
+                                            selectedIds = emptySet()
+                                        }
+                                    }
+                                }
+                            ) {
+                                Icon(Icons.Default.Download, contentDescription = "Decrypt Selected", tint = AuraGreen)
+                            }
+                            IconButton(
+                                onClick = {
+                                    val targets = vaultEntries.filter { it.id in selectedIds }
+                                    val editor = registry.edit()
+                                    targets.forEach { entry ->
+                                        entry.encryptedFile.delete()
+                                        editor.remove(entry.id)
+                                    }
+                                    editor.apply()
+                                    StorageScanCache.invalidate()
+                                    selectedIds = emptySet()
+                                    refreshVault()
+                                    Toast.makeText(context, "Deleted ${targets.size} files from Vault", Toast.LENGTH_SHORT).show()
+                                }
+                            ) {
+                                Icon(Icons.Default.Delete, contentDescription = "Delete Selected", tint = AuraRose)
+                            }
+                        } else {
+                            SearchIconToggleButton(
+                                isExpanded = isSearchVisible,
+                                hasQuery = searchQuery.isNotEmpty(),
+                                modifier = Modifier.padding(end = 4.dp),
+                                onClick = {
+                                    isSearchVisible = !isSearchVisible
+                                    if (!isSearchVisible) searchQuery = ""
+                                }
+                            )
+                            IconButton(onClick = {
+                                newPinValue = ""
+                                showChangePinDialog = true
+                            }) {
+                                Icon(Icons.Default.Key, contentDescription = "Change Vault PIN", tint = AuraCyan)
+                            }
+                            IconButton(onClick = {
+                                isUnlocked = false
+                                pinInput = ""
+                                selectedIds = emptySet()
+                            }) {
+                                Icon(Icons.Default.Lock, contentDescription = "Lock Vault", tint = AuraRose)
+                            }
                         }
                     }
                 },
@@ -374,7 +537,7 @@ fun VaultScreen(onBack: () -> Unit) {
             )
         },
         floatingActionButton = {
-            if (isUnlocked) {
+            if (isUnlocked && !isSelectionMode) {
                 FloatingActionButton(
                     onClick = { filePickerLauncher.launch(arrayOf("*/*")) },
                     containerColor = AuraCyan,
@@ -508,91 +671,122 @@ fun VaultScreen(onBack: () -> Unit) {
                 }
             }
         } else {
-            if (vaultEntries.isEmpty()) {
-                Box(modifier = Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(Icons.Default.LockOpen, contentDescription = "Vault Unlocked", tint = AuraGreen, modifier = Modifier.size(64.dp))
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Text("Vault is Empty", color = TextPrimary, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                        Text("Tap + to encrypt and hide sensitive files.", color = TextSecondary)
-                    }
-                }
-            } else {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(padding)
-                        .padding(horizontal = 24.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    items(vaultEntries, key = { it.id }) { entry ->
-                        GlassCard(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { previewEncryptedEntry(entry) }
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(Icons.AutoMirrored.Filled.InsertDriveFile, contentDescription = null, tint = AuraCyan)
-                                Spacer(modifier = Modifier.width(16.dp))
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(entry.originalName, color = TextPrimary, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    Text("${formatBytes(entry.encryptedFile.length())} · Encrypted · Tap to preview", color = AuraGreen, style = MaterialTheme.typography.labelSmall)
-                                }
-                                IconButton(onClick = { previewEncryptedEntry(entry) }) {
-                                    Icon(Icons.Default.Visibility, contentDescription = "Preview File", tint = AuraCyan)
-                                }
-                                IconButton(onClick = {
-                                    scope.launch(Dispatchers.IO) {
-                                        try {
-                                            val encryptedFile = EncryptedFile.Builder(
-                                                context,
-                                                entry.encryptedFile,
-                                                masterKey,
-                                                EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB
-                                            ).build()
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+            ) {
+                ExpandableSearchBar(
+                    visible = isSearchVisible,
+                    query = searchQuery,
+                    onQueryChange = { searchQuery = it },
+                    onClose = {
+                        searchQuery = ""
+                        isSearchVisible = false
+                    },
+                    placeholder = "Search encrypted files...",
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp)
+                )
 
-                                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                                                val values = android.content.ContentValues().apply {
-                                                    put(MediaStore.Downloads.DISPLAY_NAME, "Decrypted_${entry.originalName}")
-                                                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-                                                }
-                                                val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                                                if (uri != null) {
-                                                    encryptedFile.openFileInput().use { input ->
-                                                        context.contentResolver.openOutputStream(uri)?.use { output ->
-                                                            input.copyTo(output)
-                                                        }
-                                                    }
-                                                }
+                if (filteredEntries.isEmpty()) {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(Icons.Default.LockOpen, contentDescription = "Vault Unlocked", tint = AuraGreen, modifier = Modifier.size(64.dp))
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(
+                                if (searchQuery.isNotEmpty()) "No matching encrypted files" else "Vault is Empty",
+                                color = TextPrimary,
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text("Tap + or lock files from Explorer to encrypt them.", color = TextSecondary)
+                        }
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(horizontal = 24.dp),
+                        contentPadding = PaddingValues(top = 8.dp, bottom = 96.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        items(filteredEntries, key = { it.id }) { entry ->
+                            val isSelected = selectedIds.contains(entry.id)
+                            GlassCard(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .border(
+                                        width = if (isSelected) 1.5.dp else 0.dp,
+                                        color = if (isSelected) AuraCyan else Color.Transparent,
+                                        shape = RoundedCornerShape(24.dp)
+                                    )
+                                    .combinedClickable(
+                                        onClick = {
+                                            if (isSelectionMode) {
+                                                selectedIds = if (isSelected) selectedIds - entry.id else selectedIds + entry.id
                                             } else {
-                                                val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                                                val outFile = File(downloads, "Decrypted_${entry.originalName}")
-                                                if (outFile.exists()) outFile.delete()
-                                                encryptedFile.openFileInput().use { input ->
-                                                    FileOutputStream(outFile).use { output ->
-                                                        input.copyTo(output)
+                                                previewEncryptedEntry(entry)
+                                            }
+                                        },
+                                        onLongClick = {
+                                            selectedIds = if (isSelected) selectedIds - entry.id else selectedIds + entry.id
+                                        }
+                                    )
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    VaultEntryThumbnail(
+                                        entry = entry,
+                                        masterKey = masterKey,
+                                        modifier = Modifier.size(48.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(14.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            entry.originalName,
+                                            color = TextPrimary,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            "${formatBytes(entry.encryptedFile.length())} · Encrypted · Tap to preview",
+                                            color = AuraGreen,
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+                                    }
+                                    if (isSelectionMode) {
+                                        Icon(
+                                            imageVector = if (isSelected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
+                                            contentDescription = "Select",
+                                            tint = if (isSelected) AuraCyan else TextTertiary
+                                        )
+                                    } else {
+                                        IconButton(onClick = { previewEncryptedEntry(entry) }) {
+                                            Icon(Icons.Default.Visibility, contentDescription = "Preview File", tint = AuraCyan)
+                                        }
+                                        IconButton(onClick = {
+                                            scope.launch(Dispatchers.IO) {
+                                                val ok = decryptEntryToDownloads(entry)
+                                                withContext(Dispatchers.Main) {
+                                                    if (ok) {
+                                                        Toast.makeText(context, "Decrypted to Downloads/Decrypted_${entry.originalName}", Toast.LENGTH_LONG).show()
+                                                    } else {
+                                                        Toast.makeText(context, "Decryption failed", Toast.LENGTH_SHORT).show()
                                                     }
                                                 }
                                             }
-                                            withContext(Dispatchers.Main) {
-                                                Toast.makeText(context, "Decrypted to Downloads/Decrypted_${entry.originalName}", Toast.LENGTH_LONG).show()
-                                            }
-                                        } catch (e: Exception) {
-                                            withContext(Dispatchers.Main) {
-                                                Toast.makeText(context, "Decryption failed: ${e.message}", Toast.LENGTH_SHORT).show()
-                                            }
+                                        }) {
+                                            Icon(Icons.Default.Download, contentDescription = "Decrypt and Export", tint = AuraGreen)
+                                        }
+                                        IconButton(onClick = {
+                                            entry.encryptedFile.delete()
+                                            registry.edit().remove(entry.id).apply()
+                                            StorageScanCache.invalidate()
+                                            refreshVault()
+                                        }) {
+                                            Icon(Icons.Default.Delete, contentDescription = "Delete Permanently", tint = AuraRose)
                                         }
                                     }
-                                }) {
-                                    Icon(Icons.Default.Download, contentDescription = "Decrypt and Export", tint = AuraGreen)
-                                }
-                                IconButton(onClick = {
-                                    entry.encryptedFile.delete()
-                                    registry.edit().remove(entry.id).apply()
-                                    StorageScanCache.invalidate()
-                                    refreshVault()
-                                }) {
-                                    Icon(Icons.Default.Delete, contentDescription = "Delete Permanently", tint = AuraRose)
                                 }
                             }
                         }
@@ -647,5 +841,70 @@ fun VaultScreen(onBack: () -> Unit) {
                 }
             }
         )
+    }
+}
+
+@Composable
+private fun VaultEntryThumbnail(
+    entry: VaultEntry,
+    masterKey: MasterKey,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val ext = remember(entry.originalName) {
+        entry.originalName.substringAfterLast('.', "").lowercase()
+    }
+    var bitmap by remember(entry.id) { mutableStateOf<Bitmap?>(null) }
+
+    LaunchedEffect(entry.id) {
+        if (ext in setOf("jpg", "jpeg", "png", "webp", "bmp")) {
+            bitmap = withContext(Dispatchers.IO) {
+                try {
+                    val encryptedFile = EncryptedFile.Builder(
+                        context,
+                        entry.encryptedFile,
+                        masterKey,
+                        EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB
+                    ).build()
+                    val bytes = encryptedFile.openFileInput().use { it.readBytes() }
+                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                    var sample = 1
+                    while (bounds.outWidth / sample > 200 && bounds.outHeight / sample > 200) {
+                        sample *= 2
+                    }
+                    val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sample }
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts)
+                } catch (_: Exception) {
+                    null
+                }
+            }
+        }
+    }
+
+    val (icon, tint) = when {
+        ext in setOf("jpg", "jpeg", "png", "webp", "gif", "bmp") -> Icons.Default.Image to AuraCyan
+        ext in setOf("mp4", "mkv", "mov", "avi", "webm") -> Icons.Default.VideoFile to AuraRose
+        ext in setOf("mp3", "wav", "flac", "m4a", "ogg") -> Icons.Default.AudioFile to AuraPurple
+        ext in setOf("pdf", "txt", "doc", "docx", "json", "md", "log") -> Icons.Default.Description to AuraOrange
+        else -> Icons.AutoMirrored.Filled.InsertDriveFile to AuraCyan
+    }
+
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .background(tint.copy(alpha = 0.14f)),
+        contentAlignment = Alignment.Center
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap!!.asImageBitmap(),
+                contentDescription = entry.originalName,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
+            Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(24.dp))
+        }
     }
 }

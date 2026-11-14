@@ -130,6 +130,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.GlassCard
 import com.example.startTrackingServiceSafely
+import com.example.service.AppRefreshCoordinator
 import com.example.service.AuditSeverity
 import com.example.service.GuardEvent
 import com.example.service.LiveCaptureState
@@ -224,6 +225,7 @@ fun LiveGuardScreen() {
     var scanProgress by remember { mutableFloatStateOf(0f) }
     var selectedVector by remember { mutableStateOf<SecurityAuditVector?>(null) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
+    val globalRefreshVersion by AppRefreshCoordinator.refreshVersion.collectAsStateWithLifecycle()
 
     LaunchedEffect(Unit) {
         guardMonitor.startMonitoring()
@@ -260,6 +262,7 @@ fun LiveGuardScreen() {
 
     LaunchedEffect(
         refreshTrigger,
+        globalRefreshVersion,
         ignoredPackages,
         latestSensorEventId,
         captureState.isScreenRecordingOrCasting,
@@ -271,7 +274,11 @@ fun LiveGuardScreen() {
         if (!isScanning) {
             withContext(Dispatchers.IO) {
                 val vectors = guardMonitor.runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = false)
-                val timeline = PrivacyAnalyzer.getPermissionAccessTimeline(context, includeSystemApps = false)
+                val timeline = PrivacyAnalyzer.getPermissionAccessTimeline(
+                    context,
+                    includeSystemApps = false,
+                    forceRefresh = globalRefreshVersion > 0
+                )
                 auditVectors = vectors
                 accessTimeline = timeline
                 if (selectedVector != null) {
@@ -362,82 +369,93 @@ fun LiveGuardScreen() {
 
         // Minimalist Header
         Row(
-            modifier = Modifier.fillMaxWidth().padding(end = 56.dp),
+            modifier = Modifier.fillMaxWidth().padding(end = 46.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
             val activeRuleCount = ignoredPackages.size + activeSnoozes.size
             val modeTint = if (activeSnoozes.isNotEmpty()) AuraOrange else AuraCyan
-            Column(modifier = Modifier.weight(1f)) {
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Text(
                     text = "LIVE GUARD",
-                    style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 3.sp, fontWeight = FontWeight.Bold),
+                    style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 2.5.sp, fontWeight = FontWeight.Bold),
                     color = if (captureState.isScreenRecordingOrCasting) AuraRose else AuraCyan
                 )
-                Text(
-                    text = when {
-                        activeSnoozes.isNotEmpty() -> "${rulesConfig.alertMode.title} • ${activeSnoozes.size} snoozed"
-                        else -> "${rulesConfig.alertMode.title} • Sensors & Timeline"
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-
-            Box(
-                modifier = Modifier
-                    .heightIn(min = 36.dp)
-                    .testTag("guard_rules_button")
-                    .clip(RoundedCornerShape(100.dp))
-                    .background(if (activeRuleCount > 0) modeTint.copy(alpha = 0.14f) else GlassPanel)
-                    .border(1.dp, if (activeRuleCount > 0) modeTint.copy(alpha = 0.4f) else GlassBorder, RoundedCornerShape(100.dp))
-                    .clickable {
-                        context.startActivity(Intent(context, GuardRulesActivity::class.java))
-                    }
-                    .padding(horizontal = 11.dp, vertical = 6.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        Icons.Default.Tune,
-                        contentDescription = "Guard Rules",
-                        tint = if (activeRuleCount > 0) modeTint else TextSecondary,
-                        modifier = Modifier.size(13.dp)
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(100.dp))
+                        .background(modeTint.copy(alpha = 0.14f))
+                        .padding(horizontal = 8.dp, vertical = 2.dp)
+                ) {
                     Text(
-                        text = if (activeRuleCount > 0) "Rules ($activeRuleCount)" else "Rules",
-                        color = if (activeRuleCount > 0) modeTint else TextSecondary,
-                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                        text = if (activeSnoozes.isNotEmpty()) "${activeSnoozes.size} Snoozed" else rulesConfig.alertMode.title,
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.Bold),
+                        color = modeTint,
+                        maxLines = 1
                     )
                 }
             }
-            Spacer(modifier = Modifier.width(6.dp))
 
-            Box(
-                modifier = Modifier
-                    .heightIn(min = 36.dp)
-                    .testTag("guard_test_alert_button")
-                    .clip(RoundedCornerShape(100.dp))
-                    .background(AuraPurple.copy(alpha = 0.16f))
-                    .border(1.dp, AuraPurple.copy(alpha = 0.4f), RoundedCornerShape(100.dp))
-                    .clickable {
-                        guardMonitor.triggerSimulatedGuardTest()
-                        Toast.makeText(
-                            context,
-                            "Sample Guard alert triggered — check Snooze & Trust actions",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    }
-                    .padding(horizontal = 12.dp, vertical = 6.dp),
-                contentAlignment = Alignment.Center
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.NotificationsActive, contentDescription = "Test Alert", tint = AuraPurple, modifier = Modifier.size(14.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Test Alert", color = AuraPurple, style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                Box(
+                    modifier = Modifier
+                        .height(36.dp)
+                        .testTag("guard_rules_button")
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(if (activeRuleCount > 0) modeTint.copy(alpha = 0.14f) else GlassPanel.copy(alpha = 0.7f))
+                        .border(1.dp, if (activeRuleCount > 0) modeTint.copy(alpha = 0.4f) else GlassBorder, RoundedCornerShape(12.dp))
+                        .clickable {
+                            context.startActivity(Intent(context, GuardRulesActivity::class.java))
+                        }
+                        .padding(horizontal = 10.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Default.Tune,
+                            contentDescription = "Guard Rules",
+                            tint = if (activeRuleCount > 0) modeTint else TextSecondary,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = if (activeRuleCount > 0) "Rules ($activeRuleCount)" else "Rules",
+                            color = if (activeRuleCount > 0) modeTint else TextSecondary,
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        )
+                    }
+                }
+
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .testTag("guard_test_alert_button")
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(AuraPurple.copy(alpha = 0.14f))
+                        .border(1.dp, AuraPurple.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+                        .clickable {
+                            guardMonitor.triggerSimulatedGuardTest()
+                            Toast.makeText(
+                                context,
+                                "Sample Guard alert triggered — check Snooze & Trust actions",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Default.NotificationsActive,
+                        contentDescription = "Test Alert",
+                        tint = AuraPurple,
+                        modifier = Modifier.size(16.dp)
+                    )
                 }
             }
         }
@@ -1252,12 +1270,12 @@ private fun CompactHardwareShieldCard(
             }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
-        // 3 Primary Sensor Pills
+        // Single Compact Row of 5 Hardware Sensor Pills
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             LiveSensorChip(
                 modifier = Modifier.weight(1f),
@@ -1272,7 +1290,7 @@ private fun CompactHardwareShieldCard(
                 modifier = Modifier.weight(1f),
                 icon = Icons.Default.Mic,
                 label = "Mic",
-                status = if (captureState.isMicActive) (captureState.activeMicApps.firstOrNull() ?: "Live") else "Silent",
+                status = if (captureState.isMicActive) "Live" else "Idle",
                 isActive = captureState.isMicActive,
                 activeColor = AuraOrange,
                 onClick = onMicClick
@@ -1280,26 +1298,17 @@ private fun CompactHardwareShieldCard(
             LiveSensorChip(
                 modifier = Modifier.weight(1f),
                 icon = Icons.Default.CameraAlt,
-                label = "Camera",
-                status = if (captureState.isCameraActive) (captureState.activeCameraApps.firstOrNull() ?: "Live") else "Idle",
+                label = "Cam",
+                status = if (captureState.isCameraActive) "Live" else "Idle",
                 isActive = captureState.isCameraActive,
                 activeColor = AuraOrange,
                 onClick = onCameraClick
             )
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        // 2 Background Privacy Sensor Pills (Location & Clipboard)
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
             LiveSensorChip(
                 modifier = Modifier.weight(1f),
                 icon = Icons.Default.MyLocation,
-                label = "Bg Location",
-                status = if (captureState.isBackgroundLocationActive) (captureState.activeLocationApps.firstOrNull() ?: "Active") else "Idle",
+                label = "GPS",
+                status = if (captureState.isBackgroundLocationActive) "Active" else "Idle",
                 isActive = captureState.isBackgroundLocationActive,
                 activeColor = AuraOrange,
                 onClick = onLocationClick
@@ -1307,22 +1316,13 @@ private fun CompactHardwareShieldCard(
             LiveSensorChip(
                 modifier = Modifier.weight(1f),
                 icon = Icons.Default.ContentPaste,
-                label = "Clipboard",
-                status = if (captureState.isClipboardAccessedRecently) (captureState.recentClipboardApps.firstOrNull() ?: "Read") else "Safe",
+                label = "Clip",
+                status = if (captureState.isClipboardAccessedRecently) "Read" else "Safe",
                 isActive = captureState.isClipboardAccessedRecently,
                 activeColor = AuraPurple,
                 onClick = onClipboardClick
             )
         }
-
-        Spacer(modifier = Modifier.height(6.dp))
-        Text(
-            text = "Tap a sensor to filter Timeline • Screen opens Rules",
-            color = TextTertiary,
-            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-            textAlign = TextAlign.Center,
-            modifier = Modifier.fillMaxWidth()
-        )
 
         if (isScanning) {
             Spacer(modifier = Modifier.height(10.dp))
@@ -1351,7 +1351,7 @@ private fun PulsingShieldAvatar(heroAccent: Color) {
     )
     Box(
         modifier = Modifier
-            .size(44.dp)
+            .size(38.dp)
             .graphicsLayer {
                 scaleX = pulseScale
                 scaleY = pulseScale
@@ -1365,7 +1365,7 @@ private fun PulsingShieldAvatar(heroAccent: Color) {
             imageVector = Icons.Default.Warning,
             contentDescription = null,
             tint = heroAccent,
-            modifier = Modifier.size(22.dp)
+            modifier = Modifier.size(20.dp)
         )
     }
 }
@@ -1381,29 +1381,30 @@ private fun LiveSensorChip(
     onClick: () -> Unit
 ) {
     val tint = if (isActive) activeColor else AuraGreen
-    Row(
+    Column(
         modifier = modifier
-            .heightIn(min = 48.dp)
-            .clip(RoundedCornerShape(14.dp))
-            .background(tint.copy(alpha = 0.1f))
-            .border(1.dp, tint.copy(alpha = 0.3f), RoundedCornerShape(14.dp))
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (isActive) tint.copy(alpha = 0.16f) else Obsidian.copy(alpha = 0.4f))
+            .border(1.dp, if (isActive) tint.copy(alpha = 0.5f) else GlassBorder, RoundedCornerShape(12.dp))
             .clickable { onClick() }
-            .padding(vertical = 8.dp, horizontal = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.Center
+            .padding(vertical = 7.dp, horizontal = 4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
     ) {
-        Icon(icon, contentDescription = label, tint = tint, modifier = Modifier.size(16.dp))
-        Spacer(modifier = Modifier.width(6.dp))
-        Column {
-            Text(label, color = TextSecondary, style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp))
-            Text(
-                text = status,
-                color = tint,
-                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-        }
+        Icon(icon, contentDescription = label, tint = tint, modifier = Modifier.size(15.dp))
+        Spacer(modifier = Modifier.height(3.dp))
+        Text(
+            text = label,
+            color = TextPrimary,
+            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.SemiBold),
+            maxLines = 1
+        )
+        Text(
+            text = status,
+            color = if (isActive) tint else TextTertiary,
+            style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.Bold),
+            maxLines = 1
+        )
     }
 }
 

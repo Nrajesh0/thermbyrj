@@ -60,7 +60,9 @@ data class AppPrivacyReport(
     val hasOverlayPermission: Boolean,
     val hasAccessibilityAccess: Boolean,
     val hasNotificationListener: Boolean,
-    val isDeviceAdmin: Boolean
+    val isDeviceAdmin: Boolean,
+    val firstInstallTimeMs: Long = 0L,
+    val lastUpdateTimeMs: Long = 0L
 )
 
 data class DevicePrivacySummary(
@@ -491,6 +493,18 @@ object PrivacyAnalyzer {
         cachedTimelineTimeMs = 0L
     }
 
+    fun invalidateAllCaches() {
+        cachedPrivacyUser = null
+        cachedPrivacySystem = null
+        cachedPrivacyUserTimeMs = 0L
+        cachedPrivacySystemTimeMs = 0L
+        cachedTelemetryUser = null
+        cachedTelemetrySystem = null
+        cachedTelemetryUserTimeMs = 0L
+        cachedTelemetrySystemTimeMs = 0L
+        invalidateTimelineCache()
+    }
+
     fun peekCachedChanges(): List<PrivacyChangeEvent>? = cachedChangeEvents
 
     fun analyzeDevicePrivacy(
@@ -665,7 +679,9 @@ object PrivacyAnalyzer {
                     hasOverlayPermission = hasOverlay,
                     hasAccessibilityAccess = hasAccessibility,
                     hasNotificationListener = hasNotifListener,
-                    isDeviceAdmin = isAdmin
+                    isDeviceAdmin = isAdmin,
+                    firstInstallTimeMs = pkgInfo.firstInstallTime,
+                    lastUpdateTimeMs = pkgInfo.lastUpdateTime
                 )
             )
         }
@@ -1463,7 +1479,11 @@ object PrivacyAnalyzer {
     }
 
     @Synchronized
-    fun getPrivacyChanges(context: Context, currentReports: List<AppPrivacyReport>): List<PrivacyChangeEvent> {
+    fun getPrivacyChanges(
+        context: Context,
+        currentReports: List<AppPrivacyReport>,
+        dispatchNotifications: Boolean = true
+    ): List<PrivacyChangeEvent> {
         val prefs = context.getSharedPreferences(PREFS_PRIVACY_DIFF, Context.MODE_PRIVATE)
         val pm = context.packageManager
         val now = System.currentTimeMillis()
@@ -1480,11 +1500,13 @@ object PrivacyAnalyzer {
             val recentApps = userReports
                 .filter { it.grantedPermissions.isNotEmpty() }
                 .map { report ->
-                    val installTime = try {
-                        pm.getPackageInfo(report.packageName, 0).lastUpdateTime.takeIf { it > 0L } ?: now
-                    } catch (_: Exception) {
-                        now
-                    }
+                    val installTime = report.firstInstallTimeMs.takeIf { it > 0L }
+                        ?: report.lastUpdateTimeMs.takeIf { it > 0L }
+                        ?: try {
+                            pm.getPackageInfo(report.packageName, 0).lastUpdateTime.takeIf { it > 0L } ?: now
+                        } catch (_: Exception) {
+                            now
+                        }
                     report to installTime
                 }
                 .sortedByDescending { it.second }
@@ -1524,6 +1546,7 @@ object PrivacyAnalyzer {
                 .putString(KEY_SNAPSHOT, snapshotStr)
                 .putString(KEY_CHANGE_LOG, encodeChangeLog(combined))
                 .apply()
+            cachedChangeEvents = combined
             return combined
         }
 
@@ -1532,30 +1555,42 @@ object PrivacyAnalyzer {
         var nextId = (existingLog.maxOfOrNull { it.id } ?: now).coerceAtLeast(now) + 1L
 
         val currentMap = userReports.associateBy { it.packageName }
+        val newlyInstalledApps = mutableListOf<AppPrivacyReport>()
+        val newlyGrantedPermsByApp = linkedMapOf<AppPrivacyReport, MutableList<PlainPermissionInfo>>()
 
         // Check for newly installed apps or permission additions/revocations
         for (app in userReports) {
             val prevEntry = oldSnapshot[app.packageName]
             val currentPermSet = app.grantedPermissions.map { it.permissionName }.toSet()
             if (prevEntry == null) {
-                if (app.grantedPermissions.isNotEmpty()) {
-                    newEvents.add(
-                        PrivacyChangeEvent(
-                            id = nextId++,
-                            timestamp = now,
-                            packageName = app.packageName,
-                            appName = app.appName,
-                            changeType = PrivacyChangeType.NEW_APP,
-                            permissionTitle = "${app.grantedPermissions.size} permissions granted",
-                            detail = app.grantedPermissions.take(3).joinToString(", ") { it.shortTag }
-                        )
-                    )
+                newlyInstalledApps.add(app)
+                val permSummaryTitle = if (app.grantedPermissions.isNotEmpty()) {
+                    "${app.grantedPermissions.size} permission(s) granted"
+                } else {
+                    "Installed • No sensitive permissions"
                 }
+                val permDetail = if (app.grantedPermissions.isNotEmpty()) {
+                    app.grantedPermissions.take(4).joinToString(", ") { it.shortTag }
+                } else {
+                    app.installerName
+                }
+                newEvents.add(
+                    PrivacyChangeEvent(
+                        id = nextId++,
+                        timestamp = now,
+                        packageName = app.packageName,
+                        appName = app.appName,
+                        changeType = PrivacyChangeType.NEW_APP,
+                        permissionTitle = permSummaryTitle,
+                        detail = permDetail
+                    )
+                )
             } else {
                 val prevPerms = prevEntry.second
                 // Newly added permissions
                 for (perm in app.grantedPermissions) {
                     if (perm.permissionName !in prevPerms) {
+                        newlyGrantedPermsByApp.getOrPut(app) { mutableListOf() }.add(perm)
                         newEvents.add(
                             PrivacyChangeEvent(
                                 id = nextId++,
@@ -1646,8 +1681,127 @@ object PrivacyAnalyzer {
                 .apply()
         }
 
+        if (dispatchNotifications && (newlyInstalledApps.isNotEmpty() || newlyGrantedPermsByApp.isNotEmpty())) {
+            dispatchInstallAndPermissionNotifications(
+                context = context,
+                newlyInstalledApps = newlyInstalledApps,
+                newlyGrantedPermsByApp = newlyGrantedPermsByApp
+            )
+        }
+
         cachedChangeEvents = updatedLog
         return updatedLog
+    }
+
+    private fun dispatchInstallAndPermissionNotifications(
+        context: Context,
+        newlyInstalledApps: List<AppPrivacyReport>,
+        newlyGrantedPermsByApp: Map<AppPrivacyReport, List<PlainPermissionInfo>>
+    ) {
+        val guardMonitor = LiveGuardMonitor.peekInstance()
+        for (app in newlyInstalledApps) {
+            val permsAddedText = if (app.grantedPermissions.isNotEmpty()) {
+                "Added permissions: ${app.grantedPermissions.joinToString(", ") { it.friendlyTitle }}"
+            } else {
+                "No sensitive permissions granted (${app.installerName})"
+            }
+            val title = "New App Installed: ${app.appName}"
+            val message = "${app.appName} installed • $permsAddedText"
+            guardMonitor?.recordEvent(
+                type = "INSTALL",
+                title = title,
+                description = message,
+                severity = if (app.grantedPermissions.isNotEmpty()) AuditSeverity.WARNING else AuditSeverity.SAFE,
+                packageName = app.packageName
+            )
+            sendPrivacyChangeNotification(
+                context = context,
+                notificationId = 4100 + (app.packageName.hashCode() and 0x7FFF),
+                title = title,
+                message = message,
+                packageName = app.packageName
+            )
+        }
+
+        for ((app, addedPerms) in newlyGrantedPermsByApp) {
+            if (addedPerms.isEmpty()) continue
+            val permNames = addedPerms.joinToString(", ") { it.friendlyTitle }
+            val title = "New Permission Added: ${app.appName}"
+            val message = "${app.appName} was granted: $permNames"
+            guardMonitor?.recordEvent(
+                type = "PERMISSION",
+                title = title,
+                description = message,
+                severity = if (addedPerms.any { it.riskLevel == PermissionRiskLevel.CRITICAL || it.riskLevel == PermissionRiskLevel.HIGH }) {
+                    AuditSeverity.WARNING
+                } else {
+                    AuditSeverity.SAFE
+                },
+                packageName = app.packageName
+            )
+            sendPrivacyChangeNotification(
+                context = context,
+                notificationId = 4500 + (app.packageName.hashCode() and 0x7FFF),
+                title = title,
+                message = message,
+                packageName = app.packageName
+            )
+        }
+    }
+
+    fun sendPrivacyChangeNotification(
+        context: Context,
+        notificationId: Int,
+        title: String,
+        message: String,
+        packageName: String? = null
+    ) {
+        val prefs = context.getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
+        if (!prefs.getBoolean("live_guard_alerts", true)) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        try {
+            NotificationChannels.ensureCreated(context)
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager ?: return
+            val targetIntent = if (!packageName.isNullOrBlank()) {
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.fromParts("package", packageName, null)
+                ).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                }
+            } else {
+                Intent(context, com.example.MainActivity::class.java).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                }
+            }
+            val contentPi = android.app.PendingIntent.getActivity(
+                context,
+                notificationId,
+                targetIntent,
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+            )
+            val notification = androidx.core.app.NotificationCompat.Builder(
+                context,
+                NotificationChannels.GUARD_ALERT_CHANNEL_ID
+            )
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle(title)
+                .setContentText(message)
+                .setStyle(androidx.core.app.NotificationCompat.BigTextStyle().bigText(message))
+                .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+                .setAutoCancel(true)
+                .setContentIntent(contentPi)
+                .build()
+            nm.notify(notificationId, notification)
+        } catch (_: Exception) {
+        }
     }
 
     @Synchronized

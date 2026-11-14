@@ -30,7 +30,7 @@ class FileShredService : Service() {
     private var collectorJob: Job? = null
 
     companion object {
-        private const val SHRED_CHANNEL_ID = "file_shred_channel"
+        private const val SHRED_CHANNEL_ID = NotificationChannels.SHRED_CHANNEL_ID
         private const val SHRED_NOTIF_ID = 2001
         private const val SHRED_DONE_NOTIF_ID = 2002
     }
@@ -137,17 +137,7 @@ class FileShredService : Service() {
         .build()
 
     private fun createChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            val channel = NotificationChannel(
-                SHRED_CHANNEL_ID,
-                "Secure File Shredder",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Shows progress while securely overwriting and deleting sensitive files"
-            }
-            nm.createNotificationChannel(channel)
-        }
+        NotificationChannels.ensureCreated(this)
     }
 
     override fun onDestroy() {

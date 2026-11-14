@@ -375,4 +375,190 @@ class ExampleRobolectricTest {
         assertTrue(context.packageManager.resolveService(shredServiceIntent, 0) != null)
         assertEquals(null, com.example.service.FileShredder.peekInterruptedShredPath(context))
     }
+
+    @Test
+    fun `notification channels separate background monitor, thermal alerts, live guard, and shredder`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        com.example.service.NotificationChannels.ensureCreated(context)
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+
+        val tracker = nm.getNotificationChannel(com.example.service.NotificationChannels.TRACKER_CHANNEL_ID)
+        val thermalAlert = nm.getNotificationChannel(com.example.service.NotificationChannels.ALERT_CHANNEL_ID)
+        val guardAlert = nm.getNotificationChannel(com.example.service.NotificationChannels.GUARD_ALERT_CHANNEL_ID)
+        val shredder = nm.getNotificationChannel(com.example.service.NotificationChannels.SHRED_CHANNEL_ID)
+
+        assertTrue(tracker != null && tracker.name == "Background Monitor Status")
+        assertTrue(thermalAlert != null && thermalAlert.name == "Thermal Overheat Alerts")
+        assertTrue(guardAlert != null && guardAlert.name == "Live Guard Privacy Alerts")
+        assertTrue(shredder != null && shredder.name == "Secure File Shredder")
+
+        val thermalPrefs = context.getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
+        thermalPrefs.edit().putBoolean("thermal_alerts_enabled", false).commit()
+        val json = com.example.service.PreferencesBackupManager.exportToJson(context)
+        assertTrue(json.contains("\"thermal_alerts_enabled\": false"))
+        thermalPrefs.edit().clear().commit()
+        assertTrue(com.example.service.PreferencesBackupManager.importFromJson(context, json))
+        assertFalse(thermalPrefs.getBoolean("thermal_alerts_enabled", true))
+    }
+
+    @Test
+    fun `file manager operations support recursive search, zip archive, clipboard paste, and built in viewers`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val rootDir = java.io.File(context.cacheDir, "fm_ops_test_${System.currentTimeMillis()}").apply { mkdirs() }
+        try {
+            val subDir = java.io.File(rootDir, "SubFolder").apply { mkdirs() }
+            val textFile = java.io.File(subDir, "notes.txt").apply { writeText("Hello File Manager") }
+            val imgFile = java.io.File(rootDir, "sample.png").apply { writeBytes(byteArrayOf(1, 2, 3, 4)) }
+
+            // Recursive search finds nested file
+            val deepResults = com.example.service.FileManagerOps.searchFilesRecursively(
+                rootDir = rootDir,
+                query = "notes",
+                showHidden = false
+            )
+            assertEquals(1, deepResults.size)
+            assertEquals("notes.txt", deepResults.first().name)
+
+            // Rename safely
+            assertTrue(com.example.service.FileManagerOps.renameFileSafely(context, textFile, "renamed_notes.txt"))
+            val renamedFile = java.io.File(subDir, "renamed_notes.txt")
+            assertTrue(renamedFile.exists())
+
+            // Zip and Unzip
+            val zipOut = java.io.File(rootDir, "bundle.zip")
+            assertTrue(com.example.service.FileManagerOps.compressFilesToZip(listOf(renamedFile), zipOut))
+            assertTrue(zipOut.exists() && zipOut.length() > 0L)
+
+            val extractDest = java.io.File(rootDir, "extracted").apply { mkdirs() }
+            assertTrue(com.example.service.FileManagerOps.extractZipArchive(context, zipOut, extractDest))
+            assertTrue(java.io.File(java.io.File(extractDest, "bundle"), "renamed_notes.txt").exists())
+
+            // Clipboard copy & paste
+            com.example.service.SharedClipboardHolder.setClipboard(
+                setOf(renamedFile.absolutePath),
+                com.example.service.SharedClipboardOp.COPY
+            )
+            val pasteDir = java.io.File(rootDir, "pasted").apply { mkdirs() }
+            val clip = com.example.service.SharedClipboardHolder.clipboard.value!!
+            val pastedCount = com.example.service.FileManagerOps.executeClipboardPaste(
+                context = context,
+                clip = clip,
+                targetDir = pasteDir
+            )
+            assertEquals(1, pastedCount)
+            assertTrue(java.io.File(pasteDir, "renamed_notes.txt").exists())
+            com.example.service.SharedClipboardHolder.clear()
+
+            // PendingExplorerNavigation
+            com.example.service.PendingExplorerNavigation.openFolder(subDir.absolutePath)
+            assertEquals(subDir.absolutePath, com.example.service.PendingExplorerNavigation.targetFolderPath.value)
+            assertEquals(subDir.absolutePath, com.example.service.PendingExplorerNavigation.consume())
+            assertEquals(null, com.example.service.PendingExplorerNavigation.targetFolderPath.value)
+
+            // Built-in viewer type resolution
+            assertEquals(
+                com.example.ui.components.InAppViewerType.TEXT,
+                com.example.ui.components.resolveInAppViewerType(renamedFile)
+            )
+            assertEquals(
+                com.example.ui.components.InAppViewerType.IMAGE,
+                com.example.ui.components.resolveInAppViewerType(imgFile)
+            )
+            assertEquals(
+                com.example.ui.components.InAppViewerType.ZIP,
+                com.example.ui.components.resolveInAppViewerType(zipOut)
+            )
+        } finally {
+            rootDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `new app installs and newly added permissions trigger notifications and support new to old install time sorting`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val diffPrefs = context.getSharedPreferences("privacy_baseline_prefs", Context.MODE_PRIVATE)
+        diffPrefs.edit().clear().commit()
+
+        val icon = context.applicationInfo.loadIcon(context.packageManager)
+        val dict = com.example.service.PrivacyAnalyzer.getPlainDictionary().associateBy { it.permissionName }
+        val camPerm = dict[android.Manifest.permission.CAMERA]!!
+        val micPerm = dict[android.Manifest.permission.RECORD_AUDIO]!!
+
+        val olderApp = com.example.service.AppPrivacyReport(
+            appName = "Alpha Older",
+            packageName = "com.test.older",
+            icon = icon,
+            isSystem = false,
+            grantedPermissions = listOf(camPerm),
+            riskScore = 20,
+            riskBadge = "MODERATE",
+            lastTimeUsedMs = 1_000L,
+            isSideloaded = false,
+            installerName = "Play Store",
+            hasInternetAccess = true,
+            canUploadSensitiveData = true,
+            hasOverlayPermission = false,
+            hasAccessibilityAccess = false,
+            hasNotificationListener = false,
+            isDeviceAdmin = false,
+            firstInstallTimeMs = 1_000_000L,
+            lastUpdateTimeMs = 1_000_000L
+        )
+
+        // 1. Seed baseline with olderApp
+        com.example.service.PrivacyAnalyzer.getPrivacyChanges(
+            context = context,
+            currentReports = listOf(olderApp),
+            dispatchNotifications = false
+        )
+
+        // 2. Simulate a newly installed app AND a newly added permission on olderApp
+        val updatedOlderApp = olderApp.copy(
+            grantedPermissions = listOf(camPerm, micPerm)
+        )
+        val newlyInstalledApp = com.example.service.AppPrivacyReport(
+            appName = "Zeta Newest",
+            packageName = "com.test.newest",
+            icon = icon,
+            isSystem = false,
+            grantedPermissions = listOf(camPerm),
+            riskScore = 20,
+            riskBadge = "MODERATE",
+            lastTimeUsedMs = 2_000L,
+            isSideloaded = false,
+            installerName = "Play Store",
+            hasInternetAccess = true,
+            canUploadSensitiveData = true,
+            hasOverlayPermission = false,
+            hasAccessibilityAccess = false,
+            hasNotificationListener = false,
+            isDeviceAdmin = false,
+            firstInstallTimeMs = 9_000_000L,
+            lastUpdateTimeMs = 9_000_000L
+        )
+
+        val changes = com.example.service.PrivacyAnalyzer.getPrivacyChanges(
+            context = context,
+            currentReports = listOf(updatedOlderApp, newlyInstalledApp),
+            dispatchNotifications = true
+        )
+
+        // Verify NEW_APP and PERM_ADDED events were recorded
+        assertTrue(changes.any { it.packageName == "com.test.newest" && it.changeType == com.example.service.PrivacyChangeType.NEW_APP })
+        assertTrue(changes.any { it.packageName == "com.test.older" && it.changeType == com.example.service.PrivacyChangeType.PERM_ADDED && it.permissionTitle == micPerm.friendlyTitle })
+
+        // Verify New-to-Old install time sorting places newlyInstalledApp first
+        val sortedNewToOld = listOf(updatedOlderApp, newlyInstalledApp).sortedByDescending { it.firstInstallTimeMs }
+        assertEquals("com.test.newest", sortedNewToOld.first().packageName)
+        assertEquals("com.test.older", sortedNewToOld.last().packageName)
+
+        // Verify AppRefreshCoordinator increments refreshVersion
+        val beforeVersion = com.example.service.AppRefreshCoordinator.refreshVersion.value
+        kotlinx.coroutines.runBlocking {
+            com.example.service.AppRefreshCoordinator.triggerRefreshAll(context)
+        }
+        assertTrue(com.example.service.AppRefreshCoordinator.refreshVersion.value > beforeVersion)
+    }
 }
+
+

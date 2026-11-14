@@ -316,6 +316,40 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         }
     }
 
+    private var packageReceiverRegistered = false
+    @Volatile
+    private var lastPermissionDiffCheckMs: Long = 0L
+
+    private val packageChangeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            val action = intent?.action ?: return
+            if (action == Intent.ACTION_PACKAGE_ADDED ||
+                action == Intent.ACTION_PACKAGE_REPLACED ||
+                action == Intent.ACTION_PACKAGE_REMOVED
+            ) {
+                bgExecutor.execute {
+                    try {
+                        PrivacyAnalyzer.invalidateAllCaches()
+                        cachedAuditVectors = null
+                        cachedAuditVectorsTimeMs = 0L
+                        val summary = PrivacyAnalyzer.analyzeDevicePrivacy(
+                            context,
+                            includeSystemApps = false,
+                            forceRefresh = true
+                        )
+                        PrivacyAnalyzer.getPrivacyChanges(
+                            context = context,
+                            currentReports = summary.appReports,
+                            dispatchNotifications = true
+                        )
+                        lastPermissionDiffCheckMs = System.currentTimeMillis()
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        }
+    }
+
     private val periodicMonitorRunnable = object : Runnable {
         override fun run() {
             if (!isMonitoring) return
@@ -335,8 +369,28 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     preloadedPkgOpsList = pkgOps,
                     preloadedUsageSnapshot = usageSnapshot
                 )
+                val now = System.currentTimeMillis()
+                if (now - lastPermissionDiffCheckMs >= 30_000L) {
+                    lastPermissionDiffCheckMs = now
+                    try {
+                        val summary = PrivacyAnalyzer.analyzeDevicePrivacy(
+                            context,
+                            includeSystemApps = false,
+                            forceRefresh = true
+                        )
+                        PrivacyAnalyzer.getPrivacyChanges(
+                            context = context,
+                            currentReports = summary.appReports,
+                            dispatchNotifications = true
+                        )
+                    } catch (_: Exception) {
+                    }
+                }
             }
-            mainHandler.postDelayed(this, 7500L)
+            // Adaptive cadence: 10s when app UI is open in foreground, 30s in background
+            // (Mic, Camera, Screen, and Clipboard already have 0ms OS event callbacks)
+            val nextDelayMs = if (com.example.MainActivity.isUiForeground) 10_000L else 30_000L
+            mainHandler.postDelayed(this, nextDelayMs)
         }
     }
 
@@ -635,6 +689,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         } catch (_: Exception) {
         }
         cachedAuditVectors = null
+        cachedAuditVectorsTimeMs = 0L
         PrivacyAnalyzer.invalidateTimelineCache()
         bgExecutor.execute { refreshAllStates() }
     }
@@ -717,6 +772,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
 
     private fun persistSnoozes(list: List<SnoozeRule>) {
         _activeSnoozes.value = list
+        cachedAuditVectorsTimeMs = 0L
         try {
             val arr = JSONArray()
             list.forEach { s ->
@@ -850,6 +906,24 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             } catch (_: Exception) {
             }
         }
+        if (!packageReceiverRegistered) {
+            try {
+                val pkgFilter = IntentFilter().apply {
+                    addAction(Intent.ACTION_PACKAGE_ADDED)
+                    addAction(Intent.ACTION_PACKAGE_REPLACED)
+                    addAction(Intent.ACTION_PACKAGE_REMOVED)
+                    addDataScheme("package")
+                }
+                ContextCompat.registerReceiver(
+                    context,
+                    packageChangeReceiver,
+                    pkgFilter,
+                    ContextCompat.RECEIVER_NOT_EXPORTED
+                )
+                packageReceiverRegistered = true
+            } catch (_: Exception) {
+            }
+        }
         if (!displayListenerRegistered) {
             try {
                 displayManager.registerDisplayListener(displayListener, mainHandler)
@@ -903,7 +977,8 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             }
         }
         mainHandler.removeCallbacks(periodicMonitorRunnable)
-        mainHandler.postDelayed(periodicMonitorRunnable, 7500L)
+        val initialDelayMs = if (com.example.MainActivity.isUiForeground) 10_000L else 30_000L
+        mainHandler.postDelayed(periodicMonitorRunnable, initialDelayMs)
         bgExecutor.execute { refreshAllStates() }
     }
 
@@ -928,6 +1003,13 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             } catch (_: Exception) {
             }
             screenReceiverRegistered = false
+        }
+        if (packageReceiverRegistered) {
+            try {
+                context.unregisterReceiver(packageChangeReceiver)
+            } catch (_: Exception) {
+            }
+            packageReceiverRegistered = false
         }
         if (displayListenerRegistered) {
             try {
@@ -1135,10 +1217,25 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         }
     }
 
-    private fun fetchAllPackageOps(): List<*>? {
+    @Volatile
+    private var cachedPkgOpsList: List<*>? = null
+    @Volatile
+    private var cachedPkgOpsTimeMs: Long = 0L
+
+    private fun fetchAllPackageOps(forceFresh: Boolean = false): List<*>? {
+        val now = System.currentTimeMillis()
+        if (!forceFresh) {
+            val cached = cachedPkgOpsList
+            if (cached != null && (now - cachedPkgOpsTimeMs) in 0L..3_500L) {
+                return cached
+            }
+        }
         return try {
             val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
-            appOpsGetPackagesForOpsMethod?.invoke(appOps, null) as? List<*>
+            (appOpsGetPackagesForOpsMethod?.invoke(appOps, null) as? List<*>)?.also {
+                cachedPkgOpsList = it
+                cachedPkgOpsTimeMs = now
+            }
         } catch (_: Exception) {
             null
         }
@@ -1906,13 +2003,28 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         onHighPriorityAlert?.invoke(title, desc)
     }
 
+    @Volatile
+    private var cachedAuditVectorsTimeMs: Long = 0L
+    @Volatile
+    private var cachedAuditIncludeSystem: Boolean = false
+
     fun runDeepSecurityAudit(
         includeSystemApps: Boolean = false,
         logAuditEvent: Boolean = false
     ): List<SecurityAuditVector> {
-        val pkgOps = fetchAllPackageOps()
         val nowMs = System.currentTimeMillis()
-        if (logAuditEvent || (nowMs - _captureState.value.lastUpdatedMs) > 2_000L) {
+        if (!logAuditEvent) {
+            val existing = cachedAuditVectors
+            if (existing != null &&
+                cachedAuditIncludeSystem == includeSystemApps &&
+                (nowMs - cachedAuditVectorsTimeMs) in 0L..15_000L &&
+                (nowMs - _captureState.value.lastUpdatedMs) in 0L..10_000L
+            ) {
+                return existing
+            }
+        }
+        val pkgOps = fetchAllPackageOps(forceFresh = logAuditEvent)
+        if (logAuditEvent || (nowMs - _captureState.value.lastUpdatedMs) > 5_000L) {
             val usageSnap = queryCombinedUsageState()
             refreshDisplayCaptureState(
                 triggerAlertIfNew = false,
@@ -2170,6 +2282,8 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         )
 
         cachedAuditVectors = allVectors
+        cachedAuditVectorsTimeMs = System.currentTimeMillis()
+        cachedAuditIncludeSystem = includeSystemApps
 
         if (logAuditEvent) {
             recordEvent(

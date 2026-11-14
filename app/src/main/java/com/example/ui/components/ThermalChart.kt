@@ -172,24 +172,31 @@ fun ThermalChart(
                 }
             }
 
-            // Draw grid lines and Y-axis labels
-            val gridLines = 3
-            val labelStyle = TextStyle(color = Color.White.copy(alpha = 0.5f), fontSize = 10.sp)
+            // Draw 3 horizontal guide lines (top, mid, bottom) and non-overlapping Max/Min Y-axis labels
+            val gridLines = 2
+            val labelStyle = TextStyle(color = Color.White.copy(alpha = 0.65f), fontSize = 10.sp)
             for (i in 0..gridLines) {
                 val y = topPadding + chartHeight * (i.toFloat() / gridLines)
                 drawLine(
-                    color = Color.White.copy(alpha = 0.06f),
+                    color = Color.White.copy(alpha = if (i == 1) 0.05f else 0.09f),
                     start = Offset(0f, y),
                     end = Offset(size.width, y),
                     strokeWidth = 1.dp.toPx()
                 )
-                val tempLabel = maxTemp - (tempRange * (i.toFloat() / gridLines))
-                val measured = textMeasurer.measure(String.format(Locale.US, "%.1f°", tempLabel), labelStyle)
-                val labelY = (y - measured.size.height - 2.dp.toPx()).coerceAtLeast(0f)
-                drawText(
-                    textLayoutResult = measured,
-                    topLeft = Offset(4.dp.toPx(), labelY)
-                )
+                // Only draw text labels at top (Max) and bottom (Min) to prevent vertical overlap
+                if (i == 0 || i == gridLines) {
+                    val tempLabel = if (i == 0) maxTemp else minTemp
+                    val measured = textMeasurer.measure(String.format(Locale.US, "%.1f°C", tempLabel), labelStyle)
+                    val labelY = if (i == 0) {
+                        topPadding + 2.dp.toPx()
+                    } else {
+                        (chartBottom - measured.size.height - 2.dp.toPx()).coerceAtLeast(topPadding + 16.dp.toPx())
+                    }
+                    drawText(
+                        textLayoutResult = measured,
+                        topLeft = Offset(6.dp.toPx(), labelY)
+                    )
+                }
             }
 
             // Draw X-axis labels

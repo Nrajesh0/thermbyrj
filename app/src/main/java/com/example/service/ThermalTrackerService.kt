@@ -37,8 +37,9 @@ class ThermalTrackerService : Service() {
     private lateinit var liveGuardMonitor: LiveGuardMonitor
     private lateinit var repository: ThermalRepository
 
-    private val TRACKER_CHANNEL_ID = "thermal_tracker_channel"
-    private val ALERT_CHANNEL_ID = "thermal_alert_channel"
+    private val TRACKER_CHANNEL_ID = NotificationChannels.TRACKER_CHANNEL_ID
+    private val ALERT_CHANNEL_ID = NotificationChannels.ALERT_CHANNEL_ID
+    private val GUARD_ALERT_CHANNEL_ID = NotificationChannels.GUARD_ALERT_CHANNEL_ID
     private val NOTIFICATION_ID = 1001
     private val ALERT_NOTIFICATION_ID = 1002
     private val GUARD_ALERT_NOTIFICATION_ID = 1003
@@ -125,11 +126,16 @@ class ThermalTrackerService : Service() {
 
         // Record on first reading, every 3 minutes, or when temperature shifts >= 0.5°C after 30s
         if (lastRecordedTime == 0L || timeDiff >= 180_000L || (tempDiff >= 0.5f && timeDiff >= 30_000L)) {
+            val latestCpuTemp = if (!com.example.MainActivity.isUiForeground) {
+                thermalMonitor.refreshCpuTempOnly().takeIf { it > 0f } ?: live.cpuTemp
+            } else {
+                live.cpuTemp
+            }
             repository.insertRecord(
                 ThermalRecord(
                     timestamp = now,
                     batteryTemp = live.batteryTemp,
-                    cpuTemp = live.cpuTemp,
+                    cpuTemp = latestCpuTemp,
                     batteryLevel = live.batteryLevel
                 )
             )
@@ -169,16 +175,19 @@ class ThermalTrackerService : Service() {
         }
 
         if (currentState != lastAlertState) {
-            if (currentState == 2) {
-                sendAlertNotification(
-                    "Critical Temperature",
-                    "Device temperature has exceeded ${String.format(Locale.US, "%.0f", criticalTemp)}°C (${String.format(Locale.US, "%.1f", temp)}°C). Please let it cool down."
-                )
-            } else if (currentState == 1 && lastAlertState < 1) {
-                sendAlertNotification(
-                    "Elevated Temperature",
-                    "Device temperature has reached ${String.format(Locale.US, "%.1f", temp)}°C."
-                )
+            val alertsEnabled = prefs.getBoolean("thermal_alerts_enabled", true)
+            if (alertsEnabled) {
+                if (currentState == 2) {
+                    sendAlertNotification(
+                        "Critical Temperature",
+                        "Device temperature has exceeded ${String.format(Locale.US, "%.0f", criticalTemp)}°C (${String.format(Locale.US, "%.1f", temp)}°C). Please let it cool down."
+                    )
+                } else if (currentState == 1 && lastAlertState < 1) {
+                    sendAlertNotification(
+                        "Elevated Temperature",
+                        "Device temperature has reached ${String.format(Locale.US, "%.1f", temp)}°C."
+                    )
+                }
             }
             lastAlertState = currentState
         }
@@ -232,7 +241,7 @@ class ThermalTrackerService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val builder = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, GUARD_ALERT_CHANNEL_ID)
             .setContentTitle(payload.title)
             .setContentText(payload.message)
             .setStyle(NotificationCompat.BigTextStyle().bigText(payload.message))
@@ -271,21 +280,7 @@ class ThermalTrackerService : Service() {
     }
 
     private fun createNotificationChannels() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val trackerChannel = NotificationChannel(
-                TRACKER_CHANNEL_ID,
-                "Thermal Tracking",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val alertChannel = NotificationChannel(
-                ALERT_CHANNEL_ID,
-                "Thermal Alerts",
-                NotificationManager.IMPORTANCE_HIGH
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(trackerChannel)
-            manager.createNotificationChannel(alertChannel)
-        }
+        NotificationChannels.ensureCreated(this)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

@@ -58,6 +58,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Tune
@@ -65,6 +66,7 @@ import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Tune
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -113,6 +115,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.service.AppRefreshCoordinator
 import com.example.service.LiveGuardMonitor
 import com.example.service.PermissionUtils
 import com.example.service.ThermalTrackerService
@@ -162,21 +165,31 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         PreferencesBackupManager.autoRestoreIfCleared(this)
+        com.example.service.NotificationChannels.ensureCreated(this)
         val prefs = getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
         ThemeState.loadFromPrefs(this)
         if (prefs.getBoolean("background_monitoring", true)) {
             startTrackingServiceSafely(this)
         }
 
-        // Pre-warm Privacy & Guard caches after initial frames settle to avoid startup CPU contention
+        // Staggered, low-impact background pre-warm after initial UI and storage scan settle
         lifecycleScope.launch(Dispatchers.IO) {
-            delay(800L)
+            delay(1_200L)
             try {
-                val summary = PrivacyAnalyzer.analyzeDevicePrivacy(applicationContext, includeSystemApps = false)
-                PrivacyAnalyzer.getPrivacyChanges(applicationContext, summary.appReports)
-                PrivacyAnalyzer.analyzeAppTelemetryAndTrackers(applicationContext, includeSystemApps = false)
-                LiveGuardMonitor.getInstance(applicationContext).runDeepSecurityAudit(includeSystemApps = false)
-                PrivacyAnalyzer.getPermissionAccessTimeline(applicationContext, includeSystemApps = false)
+                if (PrivacyAnalyzer.peekCachedPrivacySummary(false) == null) {
+                    val summary = PrivacyAnalyzer.analyzeDevicePrivacy(applicationContext, includeSystemApps = false)
+                    delay(250L)
+                    PrivacyAnalyzer.getPrivacyChanges(applicationContext, summary.appReports)
+                }
+                delay(300L)
+                val guard = LiveGuardMonitor.getInstance(applicationContext)
+                if (guard.peekCachedAuditVectors() == null) {
+                    guard.runDeepSecurityAudit(includeSystemApps = false)
+                }
+                delay(300L)
+                if (PrivacyAnalyzer.peekCachedTimeline(false) == null) {
+                    PrivacyAnalyzer.getPermissionAccessTimeline(applicationContext, includeSystemApps = false)
+                }
             } catch (_: Exception) {
             }
         }
@@ -238,6 +251,7 @@ fun MainScreen(viewModel: ThermalViewModel) {
     var hapticEnabled by remember { mutableStateOf(prefs.getBoolean("haptic_feedback", true)) }
     var bgMonitoringEnabled by remember { mutableStateOf(prefs.getBoolean("background_monitoring", true)) }
     var liveGuardAlertsEnabled by remember { mutableStateOf(prefs.getBoolean("live_guard_alerts", true)) }
+    var thermalAlertsEnabled by remember { mutableStateOf(prefs.getBoolean("thermal_alerts_enabled", true)) }
     val syncScope = rememberCoroutineScope()
 
     DisposableEffect(prefs) {
@@ -255,6 +269,7 @@ fun MainScreen(viewModel: ThermalViewModel) {
                 "haptic_feedback" -> hapticEnabled = sp.getBoolean("haptic_feedback", true)
                 "background_monitoring" -> bgMonitoringEnabled = sp.getBoolean("background_monitoring", true)
                 "live_guard_alerts" -> liveGuardAlertsEnabled = sp.getBoolean("live_guard_alerts", true)
+                "thermal_alerts_enabled" -> thermalAlertsEnabled = sp.getBoolean("thermal_alerts_enabled", true)
                 "theme_accent", "theme_surface", "ultra_minimal_cards", "ambient_glow" -> {
                     ThemeState.loadFromPrefs(context)
                     widgetJob?.cancel()
@@ -294,8 +309,16 @@ fun MainScreen(viewModel: ThermalViewModel) {
 
     val pagerState = rememberPagerState(pageCount = { 4 })
     val coroutineScope = rememberCoroutineScope()
+    val pendingExplorerPath by com.example.service.PendingExplorerNavigation.targetFolderPath.collectAsStateWithLifecycle()
     val liveData by viewModel.thermalMonitor.liveData.collectAsStateWithLifecycle()
     val captureState by LiveGuardMonitor.getInstance(context).captureState.collectAsStateWithLifecycle()
+    val isRefreshingAll by AppRefreshCoordinator.isRefreshing.collectAsStateWithLifecycle()
+
+    LaunchedEffect(pendingExplorerPath) {
+        if (pendingExplorerPath != null && pagerState.currentPage != 0) {
+            pagerState.animateScrollToPage(0)
+        }
+    }
 
     val tabs = remember {
         listOf(
@@ -366,6 +389,40 @@ fun MainScreen(viewModel: ThermalViewModel) {
                             )
                         )
                     }
+                    Spacer(Modifier.weight(1f))
+                    NavigationRailItem(
+                        selected = isRefreshingAll,
+                        onClick = {
+                            if (!isRefreshingAll) {
+                                if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                coroutineScope.launch {
+                                    AppRefreshCoordinator.triggerRefreshAll(context)
+                                    Toast.makeText(context, "Refreshed", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        },
+                        icon = {
+                            if (isRefreshingAll) {
+                                CircularProgressIndicator(
+                                    color = AuraCyan,
+                                    strokeWidth = 2.dp,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            } else {
+                                Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
+                            }
+                        },
+                        label = { Text("Refresh") },
+                        modifier = Modifier.testTag("bottom_refresh_button"),
+                        colors = NavigationRailItemDefaults.colors(
+                            selectedIconColor = AuraCyan,
+                            selectedTextColor = AuraCyan,
+                            indicatorColor = AuraCyan.copy(alpha = 0.16f),
+                            unselectedIconColor = AuraCyan,
+                            unselectedTextColor = TextSecondary
+                        )
+                    )
+                    Spacer(Modifier.height(16.dp))
                 }
 
                 HorizontalPager(
@@ -390,6 +447,46 @@ fun MainScreen(viewModel: ThermalViewModel) {
                     1 -> PrivacyShieldScreen()
                     2 -> LiveGuardScreen()
                     3 -> VitalsScreen(viewModel, warningTemp)
+                }
+            }
+
+            // Floating Refresh Button positioned above the footbar
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .navigationBarsPadding()
+                    .padding(end = 20.dp, bottom = 76.dp)
+                    .size(48.dp)
+                    .testTag("bottom_refresh_button")
+                    .clip(CircleShape)
+                    .background(GlassPanel.copy(alpha = 0.92f))
+                    .border(
+                        1.dp,
+                        if (isRefreshingAll) AuraCyan else GlassBorder,
+                        CircleShape
+                    )
+                    .clickable(enabled = !isRefreshingAll) {
+                        if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        coroutineScope.launch {
+                            AppRefreshCoordinator.triggerRefreshAll(context)
+                            Toast.makeText(context, "Refreshed", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                if (isRefreshingAll) {
+                    CircularProgressIndicator(
+                        color = AuraCyan,
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(18.dp)
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Filled.Refresh,
+                        contentDescription = "Refresh",
+                        tint = AuraCyan,
+                        modifier = Modifier.size(20.dp)
+                    )
                 }
             }
 
@@ -457,6 +554,7 @@ fun MainScreen(viewModel: ThermalViewModel) {
             hapticEnabled = hapticEnabled,
             bgMonitoringEnabled = bgMonitoringEnabled,
             liveGuardAlertsEnabled = liveGuardAlertsEnabled,
+            thermalAlertsEnabled = thermalAlertsEnabled,
             warningTemp = warningTemp
         )
     }
@@ -464,8 +562,8 @@ fun MainScreen(viewModel: ThermalViewModel) {
 
 @Composable
 fun GlassCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
-    val corner = if (ThemeState.ultraMinimalCards) 16.dp else 24.dp
-    val pad = if (ThemeState.ultraMinimalCards) 14.dp else 20.dp
+    val corner = if (ThemeState.ultraMinimalCards) 14.dp else 18.dp
+    val pad = if (ThemeState.ultraMinimalCards) 12.dp else 15.dp
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(corner))
@@ -536,6 +634,7 @@ fun MorphingSettingsOrb(
     hapticEnabled: Boolean,
     bgMonitoringEnabled: Boolean,
     liveGuardAlertsEnabled: Boolean,
+    thermalAlertsEnabled: Boolean,
     warningTemp: Float
 ) {
     val context = LocalContext.current
@@ -648,13 +747,15 @@ fun MorphingSettingsOrb(
                 .align(Alignment.TopEnd)
                 .statusBarsPadding()
                 .padding(top = 10.dp, end = 16.dp)
-                .size(44.dp)
+                .size(38.dp)
                 .testTag("settings_orb_button")
                 .semantics {
                     contentDescription = "Open system preferences"
                     role = Role.Button
                 }
-                .clip(RoundedCornerShape(22.dp))
+                .clip(RoundedCornerShape(12.dp))
+                .background(GlassPanel.copy(alpha = 0.7f))
+                .border(1.dp, GlassBorder, RoundedCornerShape(12.dp))
                 .clickable {
                     if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                     isExpanded = !isExpanded
@@ -662,25 +763,25 @@ fun MorphingSettingsOrb(
             contentAlignment = Alignment.Center
         ) {
             Canvas(
-                modifier = Modifier.size(28.dp).graphicsLayer {
+                modifier = Modifier.size(20.dp).graphicsLayer {
                     rotationZ = rotation
                 }
             ) {
                 drawArc(
-                    color = AuraCyan.copy(alpha = 0.75f),
+                    color = AuraCyan.copy(alpha = 0.85f),
                     startAngle = 0f,
                     sweepAngle = 270f,
                     useCenter = false,
-                    style = Stroke(width = 3.5.dp.toPx(), cap = StrokeCap.Round)
+                    style = Stroke(width = 2.5.dp.toPx(), cap = StrokeCap.Round)
                 )
                 drawArc(
                     color = AuraRose.copy(alpha = 0.85f),
                     startAngle = 90f,
                     sweepAngle = 180f,
                     useCenter = false,
-                    topLeft = Offset(4.dp.toPx(), 4.dp.toPx()),
-                    size = Size(size.width - 8.dp.toPx(), size.height - 8.dp.toPx()),
-                    style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
+                    topLeft = Offset(3.5.dp.toPx(), 3.5.dp.toPx()),
+                    size = Size(size.width - 7.dp.toPx(), size.height - 7.dp.toPx()),
+                    style = Stroke(width = 1.8.dp.toPx(), cap = StrokeCap.Round)
                 )
             }
         }
@@ -863,7 +964,7 @@ fun MorphingSettingsOrb(
 
                     SettingsToggleRow(
                         title = "Live Screen & Mic Guard Alerts",
-                        subtitle = "Warn immediately if an app records screen or audio",
+                        subtitle = "Warn immediately if an app records screen, mic or camera",
                         checked = liveGuardAlertsEnabled,
                         onCheckedChange = { enabled ->
                             if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -872,8 +973,18 @@ fun MorphingSettingsOrb(
                     )
 
                     SettingsToggleRow(
+                        title = "Thermal Overheat Alerts",
+                        subtitle = "Warn when battery reaches your Warning or Critical temp limit",
+                        checked = thermalAlertsEnabled,
+                        onCheckedChange = { enabled ->
+                            if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            prefs.edit().putBoolean("thermal_alerts_enabled", enabled).apply()
+                        }
+                    )
+
+                    SettingsToggleRow(
                         title = "Background Guard & Thermal Service",
-                        subtitle = "Keep guard & thermal monitor active in background",
+                        subtitle = "Keep background status monitor active in the notification shade",
                         checked = bgMonitoringEnabled,
                         onCheckedChange = { enabled ->
                             if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -943,7 +1054,7 @@ fun MorphingSettingsOrb(
 
                     SettingsPermissionRow(
                         title = "Notifications",
-                        subtitle = "Guard alerts, thermal warnings & shredder progress",
+                        subtitle = "System categories: Background Monitor, Live Guard, Thermal Alerts & Shredder",
                         granted = hasNotifPerm,
                         tag = "perm_row_notifications",
                         onAction = {

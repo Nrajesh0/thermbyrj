@@ -43,6 +43,7 @@ object PreferencesBackupManager {
             put("haptic_feedback", thermal.getBoolean("haptic_feedback", true))
             put("background_monitoring", thermal.getBoolean("background_monitoring", true))
             put("live_guard_alerts", thermal.getBoolean("live_guard_alerts", true))
+            put("thermal_alerts_enabled", thermal.getBoolean("thermal_alerts_enabled", true))
             put(KEY_AUTO_DOC_BACKUP, thermal.getBoolean(KEY_AUTO_DOC_BACKUP, true))
         }
         root.put("thermal_prefs", thermalObj)
@@ -87,6 +88,7 @@ object PreferencesBackupManager {
                 if (thermalObj.has("haptic_feedback")) tEdit.putBoolean("haptic_feedback", thermalObj.optBoolean("haptic_feedback", true))
                 if (thermalObj.has("background_monitoring")) tEdit.putBoolean("background_monitoring", thermalObj.optBoolean("background_monitoring", true))
                 if (thermalObj.has("live_guard_alerts")) tEdit.putBoolean("live_guard_alerts", thermalObj.optBoolean("live_guard_alerts", true))
+                if (thermalObj.has("thermal_alerts_enabled")) tEdit.putBoolean("thermal_alerts_enabled", thermalObj.optBoolean("thermal_alerts_enabled", true))
                 if (thermalObj.has(KEY_AUTO_DOC_BACKUP)) tEdit.putBoolean(KEY_AUTO_DOC_BACKUP, thermalObj.optBoolean(KEY_AUTO_DOC_BACKUP, true))
                 tEdit.putBoolean(KEY_INITIALIZED, true)
                 tEdit.commit()

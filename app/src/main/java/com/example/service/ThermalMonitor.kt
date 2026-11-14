@@ -240,7 +240,12 @@ class ThermalMonitor private constructor(private val context: Context) {
     private var tickerJob: Job? = null
 
     fun startMonitoring() {
-        if (monitoringJob?.isActive == true) return
+        if (monitoringJob?.isActive == true) {
+            if (com.example.MainActivity.isUiForeground) {
+                monitorScope.launch { refreshSystemSpecs() }
+            }
+            return
+        }
 
         // Pull initial state once
         forceUpdate()
@@ -267,14 +272,28 @@ class ThermalMonitor private constructor(private val context: Context) {
             updateDataFromIntent(intent)
         }.launchIn(monitorScope)
 
-        // Low-frequency 15s refresh for RAM & current mA (down from 2s to save battery)
+        // Low-frequency 15s refresh for RAM & current mA only while UI is visible in foreground
         tickerJob?.cancel()
         tickerJob = monitorScope.launch {
             while (isActive) {
-                delay(15_000L)
-                refreshSystemSpecs()
+                if (com.example.MainActivity.isUiForeground) {
+                    delay(15_000L)
+                    if (com.example.MainActivity.isUiForeground) {
+                        refreshSystemSpecs()
+                    }
+                } else {
+                    delay(30_000L)
+                }
             }
         }
+    }
+
+    fun refreshCpuTempOnly(): Float {
+        val cpu = getCpuTemperature()
+        if (cpu > 0f) {
+            _liveData.value = _liveData.value.copy(cpuTemp = cpu)
+        }
+        return cpu
     }
 
     fun stopMonitoring() {

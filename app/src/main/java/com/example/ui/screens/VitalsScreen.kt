@@ -103,6 +103,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import com.example.ui.components.ExpandableSearchBar
+import com.example.ui.components.SearchIconToggleButton
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -187,7 +189,7 @@ fun VitalsScreen(viewModel: ThermalViewModel, warningTemp: Float = 35f) {
 
     var selectedCategory by remember { mutableStateOf(HiddenSettingCategory.ALL) }
     var searchQuery by remember { mutableStateOf("") }
-    var showChartInTempCard by remember { mutableStateOf(true) }
+    var showChartInTempCard by remember { mutableStateOf(false) }
     var statusRefreshTick by remember { mutableIntStateOf(0) }
 
     DisposableEffect(lifecycleOwner) {
@@ -239,71 +241,75 @@ fun VitalsScreen(viewModel: ThermalViewModel, warningTemp: Float = 35f) {
     ) {
         Spacer(modifier = Modifier.height(14.dp))
 
+        var isSearchVisible by remember { mutableStateOf(false) }
+
         // Ultra-clean Header
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(end = 52.dp),
+                .padding(end = 46.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = "TOOLS & THERMALS",
-                style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 3.sp, fontWeight = FontWeight.Bold),
-                color = tempColor
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(100.dp))
-                    .background(GlassPanel)
-                    .border(1.dp, GlassBorder, RoundedCornerShape(100.dp))
-                    .padding(horizontal = 8.dp, vertical = 2.dp)
-            ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = "${allHiddenSettings.size}",
-                    color = TextSecondary,
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    text = "TOOLS & THERMALS",
+                    style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 2.5.sp, fontWeight = FontWeight.Bold),
+                    color = tempColor
                 )
+                Spacer(modifier = Modifier.width(8.dp))
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(100.dp))
+                        .background(GlassPanel)
+                        .border(1.dp, GlassBorder, RoundedCornerShape(100.dp))
+                        .padding(horizontal = 8.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        text = "${allHiddenSettings.size}",
+                        color = TextSecondary,
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    )
+                }
             }
+
+            SearchIconToggleButton(
+                isExpanded = isSearchVisible,
+                hasQuery = searchQuery.isNotEmpty(),
+                onClick = {
+                    isSearchVisible = !isSearchVisible
+                    if (!isSearchVisible) searchQuery = ""
+                }
+            )
         }
+
+        ExpandableSearchBar(
+            visible = isSearchVisible || searchQuery.isNotEmpty(),
+            query = searchQuery,
+            onQueryChange = { searchQuery = it },
+            onClose = {
+                searchQuery = ""
+                isSearchVisible = false
+            },
+            placeholder = "Search settings...",
+            modifier = Modifier.padding(top = 6.dp)
+        )
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Compact Search Bar
-        OutlinedTextField(
-            value = searchQuery,
-            onValueChange = { searchQuery = it },
-            modifier = Modifier.fillMaxWidth(),
-            placeholder = {
-                Text(
-                    "Search settings...",
-                    color = TextTertiary,
-                    style = MaterialTheme.typography.bodySmall
-                )
-            },
-            leadingIcon = {
-                Icon(Icons.Default.Search, contentDescription = "Search", tint = AuraCyan, modifier = Modifier.size(18.dp))
-            },
-            trailingIcon = {
-                if (searchQuery.isNotEmpty()) {
-                    IconButton(onClick = { searchQuery = "" }) {
-                        Icon(Icons.Default.Close, contentDescription = "Clear", tint = TextSecondary, modifier = Modifier.size(16.dp))
-                    }
-                }
-            },
-            singleLine = true,
-            shape = RoundedCornerShape(14.dp),
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = AuraCyan,
-                unfocusedBorderColor = GlassBorder,
-                focusedContainerColor = GlassPanel.copy(alpha = 0.65f),
-                unfocusedContainerColor = GlassPanel.copy(alpha = 0.65f),
-                focusedTextColor = TextPrimary,
-                unfocusedTextColor = TextPrimary
-            )
+        // Compact Top Thermal Status Bar (Collapsed by default; tap 24h or Alert to expand)
+        SingleTempTrackingCard(
+            liveData = liveData,
+            allRecords = allRecords,
+            warningTemp = warningTemp,
+            showChart = showChartInTempCard,
+            onToggleChart = { showChartInTempCard = !showChartInTempCard },
+            onWarningTempChange = { newTemp ->
+                prefs.edit().putFloat("warning_temp", newTemp).apply()
+            }
         )
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
         // Clean Category Filter Chips
         Row(
@@ -334,26 +340,12 @@ fun VitalsScreen(viewModel: ThermalViewModel, warningTemp: Float = 35f) {
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Single Temperature Card + Grouped Native-Style Settings Options
+        // Grouped Native-Style Settings Options
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
             contentPadding = PaddingValues(bottom = 112.dp)
         ) {
-            // 1. SINGLE TEMPERATURE TRACKING CARD
-            item(key = "single_temp_tracking_card") {
-                SingleTempTrackingCard(
-                    liveData = liveData,
-                    allRecords = allRecords,
-                    warningTemp = warningTemp,
-                    showChart = showChartInTempCard,
-                    onToggleChart = { showChartInTempCard = !showChartInTempCard },
-                    onWarningTempChange = { newTemp ->
-                        prefs.edit().putFloat("warning_temp", newTemp).apply()
-                    }
-                )
-            }
-
             if (groupedSettings.isEmpty()) {
                 item(key = "empty_settings") {
                     GlassCard(modifier = Modifier.fillMaxWidth()) {
@@ -535,61 +527,62 @@ private fun SingleTempTrackingCard(
         else -> "CRITICAL" to AuraRose
     }
 
-    GlassCard(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .testTag("unified_temp_tracking_card")
+            .clip(RoundedCornerShape(14.dp))
+            .background(GlassPanel.copy(alpha = 0.72f))
+            .border(1.dp, GlassBorder, RoundedCornerShape(14.dp))
+            .padding(horizontal = 14.dp, vertical = 10.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(
+            Row(
                 modifier = Modifier
                     .weight(1f)
-                    .clickable { onToggleChart() }
+                    .clickable { onToggleChart() },
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(zoneColor)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = if (liveData.batteryTemp > 0f) "$wholeTemp.$fracTemp°C" else "--.-°C",
+                    style = MaterialTheme.typography.titleMedium.copy(
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold
+                    ),
+                    color = TextPrimary
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(zoneColor.copy(alpha = 0.14f))
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                ) {
                     Text(
-                        text = "TEMPERATURE",
-                        color = TextTertiary,
-                        style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 1.5.sp, fontWeight = FontWeight.Bold)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(zoneColor.copy(alpha = 0.14f))
-                            .padding(horizontal = 6.dp, vertical = 2.dp)
-                    ) {
-                        Text(
-                            text = zoneName,
-                            color = zoneColor,
-                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.Bold)
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(2.dp))
-
-                Row(verticalAlignment = Alignment.Bottom) {
-                    Text(
-                        text = if (liveData.batteryTemp > 0f) "$wholeTemp.$fracTemp°C" else "--.-°C",
-                        style = MaterialTheme.typography.headlineMedium.copy(
-                            fontSize = 28.sp,
-                            fontWeight = FontWeight.Bold
-                        ),
-                        color = TextPrimary
-                    )
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Text(
-                        text = "Peak ${String.format(Locale.US, "%.1f°", max24)} • Low ${String.format(Locale.US, "%.1f°", min24)}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TextSecondary,
-                        modifier = Modifier.padding(bottom = 3.dp)
+                        text = zoneName,
+                        color = zoneColor,
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.Bold)
                     )
                 }
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "${String.format(Locale.US, "%.1f°", min24)}–${String.format(Locale.US, "%.1f°", max24)}",
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                    color = TextSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
 
             Row(
@@ -598,7 +591,7 @@ private fun SingleTempTrackingCard(
             ) {
                 Box(
                     modifier = Modifier
-                        .heightIn(min = 34.dp)
+                        .heightIn(min = 30.dp)
                         .testTag("temp_alert_limit_pill")
                         .clip(RoundedCornerShape(100.dp))
                         .background(if (showThresholdSlider) AuraOrange.copy(alpha = 0.18f) else GlassPanel)
@@ -608,7 +601,7 @@ private fun SingleTempTrackingCard(
                             RoundedCornerShape(100.dp)
                         )
                         .clickable { showThresholdSlider = !showThresholdSlider }
-                        .padding(horizontal = 9.dp, vertical = 5.dp),
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
@@ -620,17 +613,17 @@ private fun SingleTempTrackingCard(
 
                 Box(
                     modifier = Modifier
-                        .heightIn(min = 34.dp)
+                        .heightIn(min = 30.dp)
                         .clip(RoundedCornerShape(100.dp))
-                        .background(AuraCyan.copy(alpha = 0.14f))
-                        .border(1.dp, AuraCyan.copy(alpha = 0.35f), RoundedCornerShape(100.dp))
+                        .background(if (showChart) AuraCyan.copy(alpha = 0.18f) else GlassPanel)
+                        .border(1.dp, if (showChart) AuraCyan else GlassBorder, RoundedCornerShape(100.dp))
                         .clickable { onToggleChart() }
-                        .padding(horizontal = 10.dp, vertical = 5.dp),
+                        .padding(horizontal = 9.dp, vertical = 4.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = if (showChart) "Hide 24h" else "24h Curve",
-                        color = AuraCyan,
+                        text = if (showChart) "Hide 24h" else "24h Graph",
+                        color = if (showChart) AuraCyan else TextSecondary,
                         style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
                     )
                 }
@@ -675,10 +668,12 @@ private fun SingleTempTrackingCard(
         AnimatedVisibility(visible = showChart) {
             Column {
                 Spacer(modifier = Modifier.height(8.dp))
+                HorizontalDivider(color = GlassBorder.copy(alpha = 0.5f))
+                Spacer(modifier = Modifier.height(6.dp))
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(82.dp)
+                        .height(104.dp)
                 ) {
                     if (last24h.size < 2) {
                         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

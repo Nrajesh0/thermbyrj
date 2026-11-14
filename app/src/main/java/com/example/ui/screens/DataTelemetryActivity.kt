@@ -86,6 +86,8 @@ import com.example.formatBytes
 import com.example.service.AppTelemetryReport
 import com.example.service.DeviceTelemetrySummary
 import com.example.service.PrivacyAnalyzer
+import com.example.ui.components.ExpandableSearchBar
+import com.example.ui.components.SearchIconToggleButton
 import com.example.ui.theme.AppTheme
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
@@ -222,6 +224,8 @@ fun DataTelemetryScreen(onBack: () -> Unit) {
         }
     }
 
+    var isSearchVisible by remember { mutableStateOf(false) }
+
     Scaffold(
         containerColor = Obsidian,
         topBar = {
@@ -243,6 +247,32 @@ fun DataTelemetryScreen(onBack: () -> Unit) {
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = TextPrimary)
+                    }
+                },
+                actions = {
+                    SearchIconToggleButton(
+                        isExpanded = isSearchVisible,
+                        hasQuery = searchQuery.isNotEmpty(),
+                        modifier = Modifier.padding(end = 6.dp),
+                        onClick = {
+                            isSearchVisible = !isSearchVisible
+                            if (!isSearchVisible) searchQuery = ""
+                        }
+                    )
+                    Box(
+                        modifier = Modifier
+                            .padding(end = 12.dp)
+                            .clip(RoundedCornerShape(100.dp))
+                            .background(if (includeSystemApps) AuraPurple.copy(alpha = 0.2f) else GlassPanel.copy(alpha = 0.6f))
+                            .border(1.dp, if (includeSystemApps) AuraPurple else GlassBorder, RoundedCornerShape(100.dp))
+                            .clickable { includeSystemApps = !includeSystemApps }
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Text(
+                            text = if (includeSystemApps) "All Apps" else "User Only",
+                            color = if (includeSystemApps) AuraPurple else TextSecondary,
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        )
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)
@@ -344,52 +374,19 @@ fun DataTelemetryScreen(onBack: () -> Unit) {
                     }
                 }
 
-                // Search + User/System Toggle
-                item {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        OutlinedTextField(
-                            value = searchQuery,
-                            onValueChange = { searchQuery = it },
-                            modifier = Modifier.weight(1f),
-                            placeholder = { Text("Search apps...", color = TextTertiary, style = MaterialTheme.typography.bodySmall) },
-                            leadingIcon = { Icon(Icons.Default.Search, contentDescription = "Search", tint = AuraCyan) },
-                            trailingIcon = {
-                                if (searchQuery.isNotEmpty()) {
-                                    IconButton(onClick = { searchQuery = "" }) {
-                                        Icon(Icons.Default.Close, contentDescription = "Clear", tint = TextSecondary)
-                                    }
-                                }
+                // Expandable Search Bar
+                if (isSearchVisible || searchQuery.isNotEmpty()) {
+                    item {
+                        ExpandableSearchBar(
+                            visible = true,
+                            query = searchQuery,
+                            onQueryChange = { searchQuery = it },
+                            onClose = {
+                                searchQuery = ""
+                                isSearchVisible = false
                             },
-                            singleLine = true,
-                            shape = RoundedCornerShape(16.dp),
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = AuraCyan,
-                                unfocusedBorderColor = GlassBorder,
-                                focusedContainerColor = GlassPanel.copy(alpha = 0.55f),
-                                unfocusedContainerColor = GlassPanel.copy(alpha = 0.55f),
-                                focusedTextColor = TextPrimary,
-                                unfocusedTextColor = TextPrimary
-                            )
+                            placeholder = "Search apps or tracker SDKs..."
                         )
-
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(16.dp))
-                                .background(if (includeSystemApps) AuraPurple.copy(alpha = 0.2f) else GlassPanel.copy(alpha = 0.6f))
-                                .border(1.dp, if (includeSystemApps) AuraPurple else GlassBorder, RoundedCornerShape(16.dp))
-                                .clickable { includeSystemApps = !includeSystemApps }
-                                .padding(horizontal = 12.dp, vertical = 14.dp)
-                        ) {
-                            Text(
-                                text = if (includeSystemApps) "All" else "User",
-                                color = if (includeSystemApps) AuraPurple else TextSecondary,
-                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
-                            )
-                        }
                     }
                 }
 

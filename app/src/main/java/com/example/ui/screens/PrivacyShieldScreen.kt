@@ -34,6 +34,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.AddCircleOutline
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CheckCircle
@@ -49,6 +50,8 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -81,8 +84,10 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.GlassCard
 import com.example.service.AppPrivacyReport
+import com.example.service.AppRefreshCoordinator
 import com.example.service.AppTelemetryReport
 import com.example.service.DevicePrivacySummary
 import com.example.service.DeviceTelemetrySummary
@@ -92,6 +97,8 @@ import com.example.service.PlainPermissionInfo
 import com.example.service.PrivacyAnalyzer
 import com.example.service.PrivacyChangeEvent
 import com.example.service.PrivacyChangeType
+import com.example.ui.components.ExpandableSearchBar
+import com.example.ui.components.SearchIconToggleButton
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
 import com.example.ui.theme.AuraOrange
@@ -122,8 +129,10 @@ fun PrivacyShieldScreen() {
     var changeEvents by remember { mutableStateOf(PrivacyAnalyzer.peekCachedChanges() ?: emptyList()) }
     var isLoading by remember { mutableStateOf(summary == null) }
 
-    // Sub-tab filter states
+    // Sub-tab filter & sort states
     var activeAppFilter by remember { mutableStateOf("ALL") }
+    var appSortOption by remember { mutableStateOf("RISK") } // "RISK", "NEW_TO_OLD", "OLD_TO_NEW", "NAME"
+    var showSortMenu by remember { mutableStateOf(false) }
     var activeChangeFilter by remember { mutableStateOf("ALL") } // "ALL", "REVOKED", "ADDED", "NEW_APP"
     var activeTrackerFilter by remember { mutableStateOf("ALL") } // "ALL", "HEAVY", "AD_ID", "BOOT"
     var searchQuery by remember { mutableStateOf("") }
@@ -133,6 +142,7 @@ fun PrivacyShieldScreen() {
     var selectedTrackerApp by remember { mutableStateOf<AppTelemetryReport?>(null) }
     var showPermissionGuide by remember { mutableStateOf(false) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
+    val globalRefreshVersion by AppRefreshCoordinator.refreshVersion.collectAsStateWithLifecycle()
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -144,12 +154,25 @@ fun PrivacyShieldScreen() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    LaunchedEffect(refreshTrigger, includeSystemApps) {
+    LaunchedEffect(refreshTrigger, globalRefreshVersion, includeSystemApps) {
         isLoading = summary == null
+        val forceFresh = refreshTrigger > 1 || globalRefreshVersion > 0
         withContext(Dispatchers.IO) {
-            val privResult = PrivacyAnalyzer.analyzeDevicePrivacy(context, includeSystemApps = includeSystemApps)
-            val changes = PrivacyAnalyzer.getPrivacyChanges(context, privResult.appReports)
-            val telemResult = PrivacyAnalyzer.analyzeAppTelemetryAndTrackers(context, includeSystemApps = includeSystemApps)
+            val privResult = PrivacyAnalyzer.analyzeDevicePrivacy(
+                context,
+                includeSystemApps = includeSystemApps,
+                forceRefresh = forceFresh
+            )
+            val changes = PrivacyAnalyzer.getPrivacyChanges(
+                context = context,
+                currentReports = privResult.appReports,
+                dispatchNotifications = true
+            )
+            val telemResult = PrivacyAnalyzer.analyzeAppTelemetryAndTrackers(
+                context,
+                includeSystemApps = includeSystemApps,
+                forceRefresh = forceFresh
+            )
             summary = privResult
             changeEvents = changes
             telemetrySummary = telemResult
@@ -166,8 +189,8 @@ fun PrivacyShieldScreen() {
     val currentSummary = summary
     val currentTelemetry = telemetrySummary
 
-    // Filtered Apps for APPS tab
-    val filteredApps = remember(currentSummary, activeAppFilter, searchQuery) {
+    // Filtered & Sorted Apps for APPS tab
+    val filteredApps = remember(currentSummary, activeAppFilter, appSortOption, searchQuery) {
         val list = currentSummary?.appReports ?: emptyList()
         val byFilter = when (activeAppFilter) {
             "ALL" -> list
@@ -178,7 +201,7 @@ fun PrivacyShieldScreen() {
                 if (cat != null) list.filter { app -> app.grantedPermissions.any { it.category == cat } } else list
             }
         }
-        if (searchQuery.isBlank()) {
+        val bySearch = if (searchQuery.isBlank()) {
             byFilter
         } else {
             val q = searchQuery.trim()
@@ -187,6 +210,23 @@ fun PrivacyShieldScreen() {
                     it.packageName.contains(q, ignoreCase = true) ||
                     it.grantedPermissions.any { p -> p.shortTag.contains(q, ignoreCase = true) || p.friendlyTitle.contains(q, ignoreCase = true) }
             }
+        }
+        when (appSortOption) {
+            "NEW_TO_OLD" -> bySearch.sortedWith(
+                compareByDescending<AppPrivacyReport> { it.firstInstallTimeMs.takeIf { ts -> ts > 0L } ?: it.lastUpdateTimeMs }
+                    .thenByDescending { it.riskScore }
+                    .thenBy { it.appName.lowercase() }
+            )
+            "OLD_TO_NEW" -> bySearch.sortedWith(
+                compareBy<AppPrivacyReport> {
+                    val ts = it.firstInstallTimeMs.takeIf { t -> t > 0L } ?: it.lastUpdateTimeMs
+                    if (ts > 0L) ts else Long.MAX_VALUE
+                }
+                    .thenByDescending { it.riskScore }
+                    .thenBy { it.appName.lowercase() }
+            )
+            "NAME" -> bySearch.sortedBy { it.appName.lowercase() }
+            else -> bySearch
         }
     }
 
@@ -315,20 +355,22 @@ fun PrivacyShieldScreen() {
     ) {
         Spacer(modifier = Modifier.height(14.dp))
 
-        // Header with inline Privacy Score & System Toggle
+        var isSearchVisible by remember { mutableStateOf(false) }
+
+        // Header with inline Privacy Score & Compact Actions
         Row(
-            modifier = Modifier.fillMaxWidth().padding(end = 52.dp),
+            modifier = Modifier.fillMaxWidth().padding(end = 46.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = "PRIVACY",
-                    style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 3.sp, fontWeight = FontWeight.Bold),
+                    style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 2.5.sp, fontWeight = FontWeight.Bold),
                     color = AuraGreen
                 )
                 if (currentSummary != null) {
-                    Spacer(modifier = Modifier.width(10.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
                     val scoreColor = when {
                         currentSummary.privacyScore >= 80 -> AuraGreen
                         currentSummary.privacyScore >= 60 -> AuraCyan
@@ -340,63 +382,93 @@ fun PrivacyShieldScreen() {
                             .clip(RoundedCornerShape(100.dp))
                             .background(scoreColor.copy(alpha = 0.14f))
                             .border(1.dp, scoreColor.copy(alpha = 0.35f), RoundedCornerShape(100.dp))
-                            .padding(horizontal = 9.dp, vertical = 3.dp)
+                            .padding(horizontal = 8.dp, vertical = 2.dp)
                     ) {
                         Text(
                             text = "${currentSummary.privacyScore}/100",
                             color = scoreColor,
-                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
                         )
                     }
                 }
             }
 
-            // Compact Guide + System Apps Toggles
+            // Compact Search + Sort + Guide Icon Buttons
             Row(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Box(
-                    modifier = Modifier
-                        .heightIn(min = 36.dp)
-                        .testTag("privacy_guide_button")
-                        .clip(RoundedCornerShape(100.dp))
-                        .background(AuraGreen.copy(alpha = 0.14f))
-                        .border(1.dp, AuraGreen.copy(alpha = 0.35f), RoundedCornerShape(100.dp))
-                        .clickable { showPermissionGuide = true }
-                        .padding(horizontal = 10.dp, vertical = 6.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                SearchIconToggleButton(
+                    isExpanded = isSearchVisible,
+                    hasQuery = searchQuery.isNotEmpty(),
+                    onClick = {
+                        isSearchVisible = !isSearchVisible
+                        if (!isSearchVisible) searchQuery = ""
+                    }
+                )
+
+                Box {
+                    val isCustomSort = appSortOption != "RISK"
+                    Box(
+                        modifier = Modifier
+                            .size(38.dp)
+                            .testTag("privacy_sort_button")
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(if (isCustomSort) AuraCyan.copy(alpha = 0.16f) else GlassPanel.copy(alpha = 0.7f))
+                            .border(1.dp, if (isCustomSort) AuraCyan else GlassBorder, RoundedCornerShape(12.dp))
+                            .clickable { showSortMenu = true },
+                        contentAlignment = Alignment.Center
+                    ) {
                         Icon(
-                            Icons.Default.Info,
-                            contentDescription = "Permission Guide",
-                            tint = AuraGreen,
-                            modifier = Modifier.size(13.dp)
+                            Icons.AutoMirrored.Filled.Sort,
+                            contentDescription = "Sort Apps",
+                            tint = if (isCustomSort) AuraCyan else TextSecondary,
+                            modifier = Modifier.size(18.dp)
                         )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "Guide",
-                            color = AuraGreen,
-                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                        )
+                    }
+                    DropdownMenu(
+                        expanded = showSortMenu,
+                        onDismissRequest = { showSortMenu = false },
+                        modifier = Modifier.background(GlassPanel)
+                    ) {
+                        listOf(
+                            "RISK" to "Sort by Risk (High to Low)",
+                            "NEW_TO_OLD" to "Sort by Install Time (New to Old)",
+                            "OLD_TO_NEW" to "Sort by Install Time (Old to New)",
+                            "NAME" to "Sort by Name (A-Z)"
+                        ).forEach { (key, label) ->
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        text = label,
+                                        color = if (appSortOption == key) AuraCyan else TextPrimary,
+                                        fontWeight = if (appSortOption == key) FontWeight.Bold else FontWeight.Normal
+                                    )
+                                },
+                                onClick = {
+                                    appSortOption = key
+                                    showSortMenu = false
+                                }
+                            )
+                        }
                     }
                 }
 
                 Box(
                     modifier = Modifier
-                        .heightIn(min = 36.dp)
-                        .clip(RoundedCornerShape(100.dp))
-                        .background(if (includeSystemApps) AuraCyan.copy(alpha = 0.16f) else GlassPanel)
-                        .border(1.dp, if (includeSystemApps) AuraCyan else GlassBorder, RoundedCornerShape(100.dp))
-                        .clickable { includeSystemApps = !includeSystemApps }
-                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                        .size(38.dp)
+                        .testTag("privacy_guide_button")
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(GlassPanel.copy(alpha = 0.7f))
+                        .border(1.dp, GlassBorder, RoundedCornerShape(12.dp))
+                        .clickable { showPermissionGuide = true },
                     contentAlignment = Alignment.Center
                 ) {
-                    Text(
-                        text = if (includeSystemApps) "System: ON" else "System: OFF",
-                        color = if (includeSystemApps) AuraCyan else TextSecondary,
-                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    Icon(
+                        Icons.Default.Info,
+                        contentDescription = "Permission Guide",
+                        tint = AuraGreen,
+                        modifier = Modifier.size(18.dp)
                     )
                 }
             }
@@ -450,41 +522,21 @@ fun PrivacyShieldScreen() {
             }
         }
 
-        Spacer(modifier = Modifier.height(10.dp))
-
-        // Compact Search Bar
-        OutlinedTextField(
-            value = searchQuery,
-            onValueChange = { searchQuery = it },
-            modifier = Modifier.fillMaxWidth(),
-            placeholder = {
-                val hint = when (activeSubTab) {
-                    "CHANGES" -> "Search permission changes..."
-                    "TRACKERS" -> "Search apps or tracker SDKs..."
-                    else -> "Search apps or permissions..."
-                }
-                Text(hint, color = TextTertiary, style = MaterialTheme.typography.bodySmall)
+        val hint = when (activeSubTab) {
+            "CHANGES" -> "Search permission changes..."
+            "TRACKERS" -> "Search apps or tracker SDKs..."
+            else -> "Search apps or permissions..."
+        }
+        ExpandableSearchBar(
+            visible = isSearchVisible || searchQuery.isNotEmpty(),
+            query = searchQuery,
+            onQueryChange = { searchQuery = it },
+            onClose = {
+                searchQuery = ""
+                isSearchVisible = false
             },
-            leadingIcon = {
-                Icon(Icons.Default.Search, contentDescription = "Search", tint = AuraCyan, modifier = Modifier.size(18.dp))
-            },
-            trailingIcon = {
-                if (searchQuery.isNotEmpty()) {
-                    IconButton(onClick = { searchQuery = "" }) {
-                        Icon(Icons.Default.Close, contentDescription = "Clear", tint = TextSecondary, modifier = Modifier.size(16.dp))
-                    }
-                }
-            },
-            singleLine = true,
-            shape = RoundedCornerShape(14.dp),
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = AuraCyan,
-                unfocusedBorderColor = GlassBorder,
-                focusedContainerColor = GlassPanel.copy(alpha = 0.6f),
-                unfocusedContainerColor = GlassPanel.copy(alpha = 0.6f),
-                focusedTextColor = TextPrimary,
-                unfocusedTextColor = TextPrimary
-            )
+            placeholder = hint,
+            modifier = Modifier.padding(top = 8.dp)
         )
 
         Spacer(modifier = Modifier.height(10.dp))
@@ -496,7 +548,7 @@ fun PrivacyShieldScreen() {
         } else {
             when (activeSubTab) {
                 "APPS" -> {
-                    // Single horizontal filter pill strip
+                    // Single horizontal filter pill strip (including System Apps toggle)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -504,6 +556,19 @@ fun PrivacyShieldScreen() {
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         val sideloadCount = currentSummary.appReports.count { it.isSideloaded }
+                        FilterPill(
+                            label = when (appSortOption) {
+                                "NEW_TO_OLD" -> "Sort: Newest"
+                                "OLD_TO_NEW" -> "Sort: Oldest"
+                                "NAME" -> "Sort: Name"
+                                else -> "Sort: Risk"
+                            },
+                            selected = appSortOption != "RISK",
+                            tint = AuraCyan,
+                            onClick = {
+                                appSortOption = if (appSortOption == "NEW_TO_OLD") "RISK" else "NEW_TO_OLD"
+                            }
+                        )
                         val pills = listOf(
                             Triple("ALL", "All (${currentSummary.appReports.size})", AuraGreen),
                             Triple("HIGH_RISK", "High Risk (${currentSummary.highRiskAppCount})", AuraRose),
@@ -522,6 +587,12 @@ fun PrivacyShieldScreen() {
                                 onClick = { activeAppFilter = key }
                             )
                         }
+                        FilterPill(
+                            label = if (includeSystemApps) "System: ON" else "System: OFF",
+                            selected = includeSystemApps,
+                            tint = AuraCyan,
+                            onClick = { includeSystemApps = !includeSystemApps }
+                        )
                     }
 
                     Spacer(modifier = Modifier.height(10.dp))
@@ -853,13 +924,19 @@ private fun AppPermissionChipCard(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
-                val lastUsedStr = if (app.lastTimeUsedMs > 0L) {
-                    "Used ${formatRelativeShortTime(app.lastTimeUsedMs)}"
-                } else {
-                    app.installerName
+                val installTime = app.firstInstallTimeMs.takeIf { it > 0L } ?: app.lastUpdateTimeMs
+                val subtitleText = buildString {
+                    append(app.installerName)
+                    if (installTime > 0L) {
+                        append(" • Installed ")
+                        append(formatRelativeShortTime(installTime))
+                    } else if (app.lastTimeUsedMs > 0L) {
+                        append(" • Used ")
+                        append(formatRelativeShortTime(app.lastTimeUsedMs))
+                    }
                 }
                 Text(
-                    text = "${app.installerName} • $lastUsedStr",
+                    text = subtitleText,
                     color = TextSecondary,
                     style = MaterialTheme.typography.labelSmall,
                     maxLines = 1,
@@ -885,12 +962,15 @@ private fun AppPermissionChipCard(
         }
 
         if (app.grantedPermissions.isNotEmpty()) {
-            Spacer(modifier = Modifier.height(10.dp))
+            Spacer(modifier = Modifier.height(8.dp))
+            val maxVisiblePerms = 4
+            val visiblePerms = app.grantedPermissions.take(maxVisiblePerms)
+            val remainingCount = (app.grantedPermissions.size - maxVisiblePerms).coerceAtLeast(0)
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                app.grantedPermissions.forEach { perm ->
+                visiblePerms.forEach { perm ->
                     val pColor = when (perm.riskLevel) {
                         PermissionRiskLevel.CRITICAL -> AuraRose
                         PermissionRiskLevel.HIGH -> AuraOrange
@@ -903,7 +983,7 @@ private fun AppPermissionChipCard(
                             .background(pColor.copy(alpha = 0.12f))
                             .border(1.dp, pColor.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
                             .clickable { onPermissionChipClick(perm) }
-                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                            .padding(horizontal = 8.dp, vertical = 3.dp)
                     ) {
                         Text(
                             text = perm.shortTag,
@@ -912,29 +992,23 @@ private fun AppPermissionChipCard(
                         )
                     }
                 }
-                if (app.hasInternetAccess) {
+                if (remainingCount > 0) {
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(8.dp))
                             .background(GlassBorder.copy(alpha = 0.35f))
                             .border(1.dp, GlassBorder, RoundedCornerShape(8.dp))
-                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                            .clickable { onCardClick() }
+                            .padding(horizontal = 8.dp, vertical = 3.dp)
                     ) {
                         Text(
-                            text = "+ Internet",
+                            text = "+$remainingCount more",
                             color = TextSecondary,
-                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp)
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
                         )
                     }
                 }
             }
-        } else {
-            Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = "No sensitive permissions granted",
-                color = AuraGreen,
-                style = MaterialTheme.typography.labelSmall
-            )
         }
     }
 }
