@@ -8,7 +8,9 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.CancellationSignal
 import android.provider.MediaStore
+import android.util.LruCache
 import android.util.Size
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -81,13 +83,17 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.foundation.border
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -100,11 +106,18 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.GlassCard
 import com.example.formatBytes
 import com.example.service.FileShredder
+import com.example.service.PermissionUtils
+import com.example.service.ShredJobCoordinator
 import com.example.service.ShredStandard
 import com.example.service.ShredTarget
+import com.example.service.StorageScanCache
 import com.example.ui.theme.AppTheme
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
@@ -153,14 +166,15 @@ class FileCategoryActivity : ComponentActivity() {
 @Composable
 fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     var files by remember { mutableStateOf<List<FileItem>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
-    var searchQuery by remember { mutableStateOf("") }
-    var sortOption by remember { mutableStateOf("Size (High to Low)") }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    var sortOption by rememberSaveable { mutableStateOf("Size (High to Low)") }
     var showSortMenu by remember { mutableStateOf(false) }
 
-    var isGridView by remember {
+    var isGridView by rememberSaveable {
         mutableStateOf(categoryName == "Images" || categoryName == "Videos")
     }
 
@@ -169,18 +183,51 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
 
     var showNormalDeleteDialog by remember { mutableStateOf(false) }
     var showShredDialog by remember { mutableStateOf(false) }
+    var showAllFilesPromptDialog by remember { mutableStateOf(false) }
+    var blockedShredCount by remember { mutableIntStateOf(0) }
     var selectedShredStandard by remember { mutableStateOf(ShredStandard.DOD_5220_22_M) }
-    var isShredding by remember { mutableStateOf(false) }
-    var shredProgress by remember { mutableFloatStateOf(0f) }
-    var shredStatusText by remember { mutableStateOf("") }
+    var pendingDeleteUris by rememberSaveable { mutableStateOf<List<String>>(emptyList()) }
+    var refreshTrigger by remember { mutableIntStateOf(0) }
+    var mediaPermPromptAttempted by rememberSaveable { mutableStateOf(false) }
+
+    var hasMediaPerm by remember { mutableStateOf(PermissionUtils.hasMediaPermissions(context)) }
+    var hasManageStorage by remember { mutableStateOf(PermissionUtils.hasAllFilesPermission()) }
+
+    val shredState by ShredJobCoordinator.state.collectAsStateWithLifecycle()
+    var lastHandledShredCompletionId by rememberSaveable { mutableStateOf(shredState.completionId) }
+
+    val mediaPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        val granted = PermissionUtils.hasMediaPermissions(context)
+        hasMediaPerm = granted
+        if (!granted && mediaPermPromptAttempted) {
+            Toast.makeText(context, "Enable Photos, Videos & Audio in App Permissions", Toast.LENGTH_SHORT).show()
+            PermissionUtils.launchAppDetailsSettings(context)
+        }
+        mediaPermPromptAttempted = true
+        refreshTrigger++
+    }
 
     val deleteLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartIntentSenderForResult()
     ) { result ->
+        val pendingSet = pendingDeleteUris.toSet()
+        pendingDeleteUris = emptyList()
         if (result.resultCode == Activity.RESULT_OK) {
-            files = files.filterNot { it in selectedItems }
-            selectedItems = emptySet()
-            Toast.makeText(context, "Files deleted", Toast.LENGTH_SHORT).show()
+            if (pendingSet.isNotEmpty()) {
+                val removed = files.filter { it.contentUri.toString() in pendingSet }.toSet()
+                removed.forEach { mediaThumbnailCache.remove(it.contentUri) }
+                files = files.filterNot { it in removed }
+                selectedItems = selectedItems - removed
+            } else {
+                selectedItems.forEach { mediaThumbnailCache.remove(it.contentUri) }
+                files = files.filterNot { it in selectedItems }
+                selectedItems = emptySet()
+            }
+            StorageScanCache.invalidate()
+            refreshTrigger++
+            Toast.makeText(context, "Deleted successfully", Toast.LENGTH_SHORT).show()
         } else {
             Toast.makeText(context, "Deletion cancelled or denied", Toast.LENGTH_SHORT).show()
         }
@@ -190,12 +237,65 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
         selectedItems = emptySet()
     }
 
-    LaunchedEffect(categoryName) {
-        isLoading = true
-        withContext(Dispatchers.IO) {
-            files = fetchFilesForCategory(context, categoryName)
-            isLoading = false
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                hasMediaPerm = PermissionUtils.hasMediaPermissions(context)
+                hasManageStorage = PermissionUtils.hasAllFilesPermission()
+                refreshTrigger++
+            }
         }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    LaunchedEffect(shredState.completionId) {
+        if (!shredState.isRunning && shredState.completionId != 0L && shredState.completionId != lastHandledShredCompletionId) {
+            lastHandledShredCompletionId = shredState.completionId
+            val result = shredState.lastResult
+            if (result != null) {
+                val blockedUris = result.blockedForOverwrite.mapNotNull { it.contentUri?.toString() }.toSet()
+                val failedUris = result.failedTargets.mapNotNull { it.contentUri?.toString() }.toSet()
+                val deletedItems = selectedItems.filter { item ->
+                    val uriStr = item.contentUri.toString()
+                    uriStr !in blockedUris && uriStr !in failedUris
+                }.toSet()
+                deletedItems.forEach { mediaThumbnailCache.remove(it.contentUri) }
+                files = files.filterNot { it in deletedItems }
+                selectedItems = selectedItems - deletedItems
+                StorageScanCache.invalidate()
+                refreshTrigger++
+
+                if (result.blockedForOverwrite.isNotEmpty() && !PermissionUtils.hasAllFilesPermission()) {
+                    blockedShredCount = result.blockedForOverwrite.size
+                    showShredDialog = false
+                    showAllFilesPromptDialog = true
+                } else {
+                    showShredDialog = false
+                    val msg = if (result.blockedForOverwrite.isNotEmpty()) {
+                        "Shredded ${result.shreddedCount} file(s); ${result.blockedForOverwrite.size} blocked."
+                    } else {
+                        "Shredded ${result.shreddedCount} file(s) (${formatBytes(result.totalBytesWiped)})"
+                    }
+                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                }
+            } else {
+                showShredDialog = false
+            }
+        }
+    }
+
+    LaunchedEffect(categoryName, refreshTrigger, hasMediaPerm, hasManageStorage) {
+        if (files.isEmpty()) isLoading = true
+        val loaded = withContext(Dispatchers.IO) {
+            fetchFilesForCategory(context, categoryName)
+        }
+        files = loaded
+        val liveKeys = loaded.map { it.contentUri }.toSet()
+        if (selectedItems.isNotEmpty()) {
+            selectedItems = selectedItems.filter { it.contentUri in liveKeys }.toSet()
+        }
+        isLoading = false
     }
 
     val sortedFiles = remember(files, sortOption, searchQuery) {
@@ -276,96 +376,90 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
 
     fun deleteSelectedStandard() {
         val itemsToDelete = selectedItems.toList()
+        if (itemsToDelete.isEmpty()) return
         scope.launch(Dispatchers.IO) {
             val failedUris = mutableListOf<Uri>()
             val deletedItems = mutableSetOf<FileItem>()
+            var fallbackSender: android.content.IntentSender? = null
 
             for (item in itemsToDelete) {
-                try {
-                    var deleted = false
-                    if (item.path.isNotBlank()) {
+                var unlinked = false
+                if (item.path.isNotBlank()) {
+                    try {
                         val f = File(item.path)
-                        if (f.exists() && f.delete()) {
-                            deleted = true
+                        if (!f.exists() || f.delete()) {
+                            unlinked = true
                         }
+                    } catch (_: Exception) {
                     }
-                    val rows = context.contentResolver.delete(item.contentUri, null, null)
-                    if (rows > 0 || deleted) {
-                        deletedItems.add(item)
-                    } else {
+                }
+
+                if (unlinked) {
+                    FileShredder.cleanupMediaStoreEntry(context, item.path, item.contentUri)
+                    deletedItems.add(item)
+                } else {
+                    try {
+                        val rows = context.contentResolver.delete(item.contentUri, null, null)
+                        if (rows > 0) {
+                            deletedItems.add(item)
+                        } else {
+                            failedUris.add(item.contentUri)
+                        }
+                    } catch (e: SecurityException) {
+                        failedUris.add(item.contentUri)
+                        if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q &&
+                            e is android.app.RecoverableSecurityException &&
+                            fallbackSender == null
+                        ) {
+                            fallbackSender = e.userAction.actionIntent.intentSender
+                        }
+                    } catch (_: Exception) {
                         failedUris.add(item.contentUri)
                     }
-                } catch (_: SecurityException) {
-                    failedUris.add(item.contentUri)
-                } catch (_: Exception) {
-                    failedUris.add(item.contentUri)
                 }
             }
 
             withContext(Dispatchers.Main) {
                 if (deletedItems.isNotEmpty()) {
+                    deletedItems.forEach { mediaThumbnailCache.remove(it.contentUri) }
                     files = files.filterNot { it in deletedItems }
                     selectedItems = selectedItems - deletedItems
+                    StorageScanCache.invalidate()
+                    refreshTrigger++
                 }
                 if (failedUris.isNotEmpty() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     try {
+                        pendingDeleteUris = failedUris.map { it.toString() }
                         val pendingIntent = MediaStore.createDeleteRequest(context.contentResolver, failedUris)
                         deleteLauncher.launch(IntentSenderRequest.Builder(pendingIntent.intentSender).build())
                     } catch (_: Exception) {
-                        Toast.makeText(context, "Could not delete some protected files", Toast.LENGTH_SHORT).show()
+                        pendingDeleteUris = emptyList()
+                        Toast.makeText(context, "Could not delete protected file(s)", Toast.LENGTH_SHORT).show()
+                    }
+                } else if (fallbackSender != null) {
+                    try {
+                        pendingDeleteUris = failedUris.map { it.toString() }
+                        deleteLauncher.launch(IntentSenderRequest.Builder(fallbackSender).build())
+                    } catch (_: Exception) {
+                        pendingDeleteUris = emptyList()
+                        Toast.makeText(context, "Could not delete protected file(s)", Toast.LENGTH_SHORT).show()
                     }
                 } else if (deletedItems.isNotEmpty()) {
-                    Toast.makeText(context, "Deleted ${deletedItems.size} files", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Deleted ${deletedItems.size} file(s)", Toast.LENGTH_SHORT).show()
                 }
             }
         }
     }
 
     fun shredSelectedFiles() {
-        isShredding = true
-        shredProgress = 0f
-        shredStatusText = "Starting ${selectedShredStandard.title}..."
         val itemsSnapshot = selectedItems.toList()
-        scope.launch {
-            val targets = itemsSnapshot.map { ShredTarget(File(it.path), it.contentUri) }
-            val result = withContext(Dispatchers.IO) {
-                FileShredder.shredTargets(
-                    context = context,
-                    targets = targets,
-                    standard = selectedShredStandard
-                ) { done, total, label ->
-                    shredProgress = done.toFloat() / total.toFloat()
-                    shredStatusText = label
-                }
-            }
-
-            val deletedUris = itemsSnapshot
-                .filter { item ->
-                    result.blockedForOverwrite.none { it.contentUri == item.contentUri } &&
-                        result.failedTargets.none { it.contentUri == item.contentUri }
-                }
-                .toSet()
-
-            files = files.filterNot { it in deletedUris }
-            selectedItems = selectedItems - deletedUris
-            isShredding = false
-            showShredDialog = false
-
-            if (result.blockedForOverwrite.isNotEmpty()) {
-                val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !android.os.Environment.isExternalStorageManager()) {
-                    "Grant All Files Access for byte-level DoD/NIST shredding, or use Normal Delete for ${result.blockedForOverwrite.size} protected file(s)."
-                } else {
-                    "Shredded ${result.shreddedCount} file(s); ${result.blockedForOverwrite.size} blocked from direct overwrite."
-                }
-                Toast.makeText(context, hint, Toast.LENGTH_LONG).show()
-            } else {
-                Toast.makeText(
-                    context,
-                    "Shredded ${result.shreddedCount} file(s) (${formatBytes(result.totalBytesWiped)})",
-                    Toast.LENGTH_SHORT
-                ).show()
-            }
-        }
+        if (itemsSnapshot.isEmpty()) return
+        val targets = itemsSnapshot.map { ShredTarget(File(it.path), it.contentUri) }
+        ShredJobCoordinator.startBackgroundShred(
+            context = context,
+            targets = targets,
+            standard = selectedShredStandard
+        )
     }
 
     if (showNormalDeleteDialog) {
@@ -406,21 +500,67 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
         )
     }
 
+    if (showAllFilesPromptDialog) {
+        AlertDialog(
+            onDismissRequest = { showAllFilesPromptDialog = false },
+            containerColor = GlassPanel,
+            title = { Text("All Files Access Needed for Shredder", color = AuraOrange, fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "Android blocks byte-level DoD/NIST overwriting on shared media for $blockedShredCount file(s) without All Files Access. Grant All Files Access to shred directly, or use Normal Delete instead.",
+                    color = TextSecondary
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showAllFilesPromptDialog = false
+                        PermissionUtils.launchAllFilesAccessSettings(context)
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = AuraOrange)
+                ) {
+                    Text("OPEN SETTINGS", color = Obsidian, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                Row {
+                    if (selectedItems.isNotEmpty()) {
+                        TextButton(onClick = {
+                            showAllFilesPromptDialog = false
+                            deleteSelectedStandard()
+                        }) {
+                            Text("Normal Delete", color = AuraCyan, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    TextButton(onClick = { showAllFilesPromptDialog = false }) {
+                        Text("Cancel", color = TextSecondary)
+                    }
+                }
+            }
+        )
+    }
+
     if (showShredDialog) {
         AlertDialog(
-            onDismissRequest = { if (!isShredding) showShredDialog = false },
+            onDismissRequest = { showShredDialog = false },
             containerColor = GlassPanel,
             title = { Text("Standard File Shredder", color = AuraRose, fontWeight = FontWeight.Bold) },
             text = {
-                if (isShredding) {
+                if (shredState.isRunning) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
-                        Text(shredStatusText.ifBlank { "Overwriting blocks & obfuscating filename..." }, color = TextSecondary)
+                        Text(shredState.statusText.ifBlank { "Overwriting blocks & obfuscating filename..." }, color = TextSecondary)
                         Spacer(modifier = Modifier.height(16.dp))
                         LinearProgressIndicator(
-                            progress = { shredProgress },
+                            progress = { shredState.progress },
                             color = AuraRose,
                             trackColor = GlassBorder,
                             modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Text(
+                            "Shredding runs in a foreground service so it keeps going if you switch apps. Force-closing the app mid-shred leaves completed files wiped, queued files untouched, and only the active file partially overwritten.",
+                            color = TextTertiary,
+                            style = MaterialTheme.typography.labelSmall
                         )
                     }
                 } else {
@@ -463,11 +603,33 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                                 }
                             }
                         }
+                        if (!hasManageStorage && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(AuraOrange.copy(alpha = 0.12f))
+                                    .border(1.dp, AuraOrange.copy(alpha = 0.4f), RoundedCornerShape(10.dp))
+                                    .clickable { PermissionUtils.launchAllFilesAccessSettings(context) }
+                                    .padding(10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "All Files Access needed to overwrite videos/photos directly. Tap to grant.",
+                                    color = AuraOrange,
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            }
+                        }
                     }
                 }
             },
             confirmButton = {
-                if (!isShredding) {
+                if (shredState.isRunning) {
+                    TextButton(onClick = { showShredDialog = false }) {
+                        Text("Run in Background", color = AuraCyan, fontWeight = FontWeight.Bold)
+                    }
+                } else {
                     Button(
                         onClick = { shredSelectedFiles() },
                         colors = ButtonDefaults.buttonColors(containerColor = AuraRose)
@@ -477,7 +639,7 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                 }
             },
             dismissButton = {
-                if (!isShredding) {
+                if (!shredState.isRunning) {
                     TextButton(onClick = { showShredDialog = false }) {
                         Text("Cancel", color = TextSecondary)
                     }
@@ -601,17 +763,75 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                 )
             }
 
+            if (!hasMediaPerm && !hasManageStorage) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp, vertical = 6.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(AuraCyan.copy(alpha = 0.12f))
+                        .border(1.dp, AuraCyan.copy(alpha = 0.4f), RoundedCornerShape(16.dp))
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Media Access Needed", color = AuraCyan, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                        Text("Allow Photos, Videos & Audio to view & manage $categoryName.", color = TextSecondary, style = MaterialTheme.typography.labelSmall)
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = { mediaPermLauncher.launch(PermissionUtils.requiredMediaPermissions()) },
+                        colors = ButtonDefaults.buttonColors(containerColor = AuraCyan)
+                    ) {
+                        Text("Grant", color = Obsidian, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            if (shredState.isRunning && !showShredDialog) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp, vertical = 6.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(AuraRose.copy(alpha = 0.14f))
+                        .border(1.dp, AuraRose.copy(alpha = 0.4f), RoundedCornerShape(14.dp))
+                        .clickable { showShredDialog = true }
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(shredState.statusText.ifBlank { "Shredding in background..." }, color = AuraRose, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        LinearProgressIndicator(
+                            progress = { shredState.progress },
+                            color = AuraRose,
+                            trackColor = GlassBorder,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+            }
+
             if (isLoading) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator(color = AuraCyan)
                 }
             } else if (sortedFiles.isEmpty()) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text(
-                        if (searchQuery.isNotBlank()) "No matching files found"
-                        else "No files found in $categoryName",
-                        color = TextSecondary
-                    )
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            if (searchQuery.isNotBlank()) "No matching files found"
+                            else "No files found in $categoryName",
+                            color = TextSecondary
+                        )
+                        if (searchQuery.isBlank() && !hasMediaPerm && !hasManageStorage) {
+                            Spacer(modifier = Modifier.height(12.dp))
+                            OutlinedButton(onClick = { mediaPermLauncher.launch(PermissionUtils.requiredMediaPermissions()) }) {
+                                Text("Grant Media Permission", color = AuraCyan)
+                            }
+                        }
+                    }
                 }
             } else {
                 if (isGridView) {
@@ -666,6 +886,8 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
     }
 }
 
+private val mediaThumbnailCache = LruCache<Uri, Bitmap>(64)
+
 @Composable
 fun MediaThumbnail(
     file: FileItem,
@@ -673,17 +895,30 @@ fun MediaThumbnail(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    var bitmap by remember(file.contentUri) { mutableStateOf<Bitmap?>(null) }
+    var bitmap by remember(file.contentUri) { mutableStateOf(mediaThumbnailCache.get(file.contentUri)) }
 
     LaunchedEffect(file.contentUri) {
-        if (category == "Images" || category == "Videos") {
-            withContext(Dispatchers.IO) {
-                try {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        bitmap = context.contentResolver.loadThumbnail(file.contentUri, Size(256, 256), null)
+        if ((category == "Images" || category == "Videos") && bitmap == null) {
+            val signal = CancellationSignal()
+            val reg = coroutineContext[kotlinx.coroutines.Job]?.invokeOnCompletion {
+                signal.cancel()
+            }
+            try {
+                val loaded = withContext(Dispatchers.IO) {
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            context.contentResolver.loadThumbnail(file.contentUri, Size(256, 256), signal)
+                        } else null
+                    } catch (_: Exception) {
+                        null
                     }
-                } catch (_: Exception) {
                 }
+                if (loaded != null) {
+                    mediaThumbnailCache.put(file.contentUri, loaded)
+                    bitmap = loaded
+                }
+            } finally {
+                reg?.dispose()
             }
         }
     }
@@ -857,11 +1092,17 @@ private fun fetchFilesForCategory(context: Context, category: String): List<File
         MediaStore.MediaColumns.MIME_TYPE
     )
 
+    val selection = if (category == "Documents") {
+        "${MediaStore.Files.FileColumns.MEDIA_TYPE} NOT IN (${MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE}, ${MediaStore.Files.FileColumns.MEDIA_TYPE_AUDIO}, ${MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO}) AND ${MediaStore.MediaColumns.SIZE} > 0"
+    } else {
+        "${MediaStore.MediaColumns.SIZE} > 0"
+    }
+
     try {
         context.contentResolver.query(
             baseUri,
             projection,
-            null,
+            selection,
             null,
             "${MediaStore.MediaColumns.SIZE} DESC"
         )?.use { cursor ->

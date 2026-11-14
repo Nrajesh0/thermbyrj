@@ -313,4 +313,66 @@ class ExampleRobolectricTest {
             com.example.ui.theme.ThemeState.surfacePreset = originalSurface
         }
     }
+
+    @Test
+    fun `live guard passive audit suppresses event loop and stopMonitoring clears active state`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        LiveGuardMonitor.resetInstanceForTests()
+        val monitor = LiveGuardMonitor.getInstance(context)
+        monitor.clearEvents()
+
+        monitor.startMonitoring()
+        assertTrue(monitor.isMonitoringActive())
+
+        // Passive UI refresh must not append "Security Scan Finished" events
+        monitor.runDeepSecurityAudit(includeSystemApps = false)
+        assertFalse(monitor.events.value.any { it.title == "Security Scan Finished" })
+
+        // Explicit user-triggered scan MUST append "Security Scan Finished"
+        monitor.runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = true)
+        assertTrue(monitor.events.value.any { it.title == "Security Scan Finished" })
+
+        monitor.stopMonitoring()
+        assertFalse(monitor.isMonitoringActive())
+    }
+
+    @Test
+    fun `privacy dashboard uses public privacy settings target and camera events appear in timeline`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val catalog = com.example.ui.screens.buildHiddenSettingsCatalog(context)
+        val dashItem = catalog.first { it.id == "priv_dashboard" }
+        assertTrue(dashItem.targets.any { it.action == android.provider.Settings.ACTION_PRIVACY_SETTINGS })
+        assertFalse(dashItem.targets.any { it.action == "android.intent.action.REVIEW_PERMISSION_USAGE" })
+        assertFalse(dashItem.targets.any { it.action == android.content.Intent.ACTION_VIEW_PERMISSION_USAGE })
+
+        LiveGuardMonitor.resetInstanceForTests()
+        val monitor = LiveGuardMonitor.getInstance(context)
+        monitor.clearEvents()
+        PrivacyAnalyzer.invalidateTimelineCache()
+
+        monitor.recordEvent(
+            type = "CAMERA",
+            title = "Camera Active",
+            description = "Lens 0 in use.",
+            severity = AuditSeverity.WARNING,
+            packageName = null
+        )
+        val timeline = PrivacyAnalyzer.getPermissionAccessTimeline(context, includeSystemApps = false)
+        assertTrue(timeline.any { it.permissionInfo.permissionName == android.Manifest.permission.CAMERA })
+    }
+
+    @Test
+    fun `storage cache invalidation, permission helpers, and shred service registration work cleanly`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val genBefore = com.example.service.StorageScanCache.generation
+        com.example.service.StorageScanCache.invalidate()
+        assertTrue(com.example.service.StorageScanCache.generation > genBefore)
+
+        val mediaPerms = com.example.service.PermissionUtils.requiredMediaPermissions()
+        assertTrue(mediaPerms.contains(android.Manifest.permission.READ_MEDIA_VIDEO))
+
+        val shredServiceIntent = android.content.Intent(context, com.example.service.FileShredService::class.java)
+        assertTrue(context.packageManager.resolveService(shredServiceIntent, 0) != null)
+        assertEquals(null, com.example.service.FileShredder.peekInterruptedShredPath(context))
+    }
 }

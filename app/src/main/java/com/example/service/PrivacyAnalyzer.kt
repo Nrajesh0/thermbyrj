@@ -1160,9 +1160,18 @@ object PrivacyAnalyzer {
 
     fun getPermissionAccessTimeline(
         context: Context,
-        includeSystemApps: Boolean = false
+        includeSystemApps: Boolean = false,
+        forceRefresh: Boolean = false
     ): List<PermissionAccessEvent> {
-        val summary = analyzeDevicePrivacy(context, includeSystemApps = includeSystemApps)
+        val nowCheck = System.currentTimeMillis()
+        if (!forceRefresh) {
+            val cached = if (includeSystemApps) cachedTimelineSystem else cachedTimelineUser
+            if (cached != null && (nowCheck - cachedTimelineTimeMs) < 15_000L) {
+                return cached
+            }
+        }
+        val summary = analyzeDevicePrivacy(context, includeSystemApps = includeSystemApps, forceRefresh = forceRefresh)
+        val reportsByPkg = summary.appReports.associateBy { it.packageName }
         val appOpsTimes = queryAppOpsLastAccessMap(context)
         val pm = context.packageManager
         val guardMonitor = LiveGuardMonitor.getInstance(context)
@@ -1234,25 +1243,33 @@ object PrivacyAnalyzer {
             var resolvedIcon: Drawable = context.applicationInfo.loadIcon(pm)
 
             if (!pkg.isNullOrBlank()) {
-                val appInfo = try {
-                    pm.getApplicationInfo(pkg, 0)
-                } catch (_: Exception) {
-                    null
-                }
-                if (appInfo != null) {
-                    val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0 ||
-                        (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
-                    if (isSystem && !includeSystemApps) continue
+                val cachedReport = reportsByPkg[pkg]
+                if (cachedReport != null) {
+                    if (cachedReport.isSystem && !includeSystemApps) continue
                     resolvedPkg = pkg
-                    resolvedName = try {
-                        pm.getApplicationLabel(appInfo).toString()
+                    resolvedName = cachedReport.appName
+                    resolvedIcon = cachedReport.icon
+                } else {
+                    val appInfo = try {
+                        pm.getApplicationInfo(pkg, 0)
                     } catch (_: Exception) {
-                        pkg
+                        null
                     }
-                    resolvedIcon = try {
-                        pm.getApplicationIcon(appInfo)
-                    } catch (_: Exception) {
-                        context.applicationInfo.loadIcon(pm)
+                    if (appInfo != null) {
+                        val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0 ||
+                            (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+                        if (isSystem && !includeSystemApps) continue
+                        resolvedPkg = pkg
+                        resolvedName = try {
+                            pm.getApplicationLabel(appInfo).toString()
+                        } catch (_: Exception) {
+                            pkg
+                        }
+                        resolvedIcon = try {
+                            pm.getApplicationIcon(appInfo)
+                        } catch (_: Exception) {
+                            context.applicationInfo.loadIcon(pm)
+                        }
                     }
                 }
             }
@@ -1295,31 +1312,54 @@ object PrivacyAnalyzer {
         return sortedTimeline
     }
 
+    @Volatile
+    private var appOpsGetPackagesForOpsMethod: java.lang.reflect.Method? = null
+    @Volatile
+    private var pkgOpsGetPackageNameMethod: java.lang.reflect.Method? = null
+    @Volatile
+    private var pkgOpsGetOpsMethod: java.lang.reflect.Method? = null
+    @Volatile
+    private var opEntryGetOpStrMethod: java.lang.reflect.Method? = null
+    @Volatile
+    private var opEntryGetLastAccessTimeMethod: java.lang.reflect.Method? = null
+
     private fun queryAppOpsLastAccessMap(context: Context): Map<String, Map<String, Long>> {
         val map = mutableMapOf<String, MutableMap<String, Long>>()
         val now = System.currentTimeMillis()
         try {
             val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
-            val getPackagesForOps = appOps.javaClass.getMethod("getPackagesForOps", IntArray::class.java)
+            val getPackagesForOps = appOpsGetPackagesForOpsMethod
+                ?: appOps.javaClass.getMethod("getPackagesForOps", IntArray::class.java).also {
+                    appOpsGetPackagesForOpsMethod = it
+                }
             val pkgOpsList = getPackagesForOps.invoke(appOps, null) as? List<*> ?: return emptyMap()
 
             for (pkgOps in pkgOpsList) {
                 if (pkgOps == null) continue
-                val pkgName = pkgOps.javaClass.getMethod("getPackageName").invoke(pkgOps) as? String ?: continue
-                val ops = pkgOps.javaClass.getMethod("getOps").invoke(pkgOps) as? List<*> ?: continue
+                val pkgNameMethod = pkgOpsGetPackageNameMethod
+                    ?: pkgOps.javaClass.getMethod("getPackageName").also { pkgOpsGetPackageNameMethod = it }
+                val opsMethod = pkgOpsGetOpsMethod
+                    ?: pkgOps.javaClass.getMethod("getOps").also { pkgOpsGetOpsMethod = it }
+                val pkgName = pkgNameMethod.invoke(pkgOps) as? String ?: continue
+                val ops = opsMethod.invoke(pkgOps) as? List<*> ?: continue
                 val permTimes = map.getOrPut(pkgName) { mutableMapOf() }
 
                 for (opEntry in ops) {
                     if (opEntry == null) continue
                     val opStr = try {
-                        opEntry.javaClass.getMethod("getOpStr").invoke(opEntry) as? String
+                        val opStrMethod = opEntryGetOpStrMethod
+                            ?: opEntry.javaClass.getMethod("getOpStr").also { opEntryGetOpStrMethod = it }
+                        opStrMethod.invoke(opEntry) as? String
                     } catch (_: Exception) {
                         null
                     } ?: continue
 
                     // Use getLastAccessTime ONLY (never getTime(), which can reflect op-grant/mode-change time)
                     val lastTime = try {
-                        val m = opEntry.javaClass.getMethod("getLastAccessTime", Int::class.javaPrimitiveType)
+                        val m = opEntryGetLastAccessTimeMethod
+                            ?: opEntry.javaClass.getMethod("getLastAccessTime", Int::class.javaPrimitiveType).also {
+                                opEntryGetLastAccessTimeMethod = it
+                            }
                         (m.invoke(opEntry, 0x1f) as? Long) ?: 0L
                     } catch (_: Exception) {
                         0L
@@ -1380,6 +1420,28 @@ object PrivacyAnalyzer {
     private const val KEY_HAS_BASELINE = "has_baseline_v1"
     private const val KEY_SNAPSHOT = "baseline_snapshot_v1"
     private const val KEY_CHANGE_LOG = "change_log_v1"
+
+    fun openOsPrivacyDashboard(context: Context): Boolean {
+        val actions = listOf(
+            Settings.ACTION_PRIVACY_SETTINGS,
+            Settings.ACTION_SECURITY_SETTINGS,
+            Settings.ACTION_SETTINGS
+        )
+        for (action in actions) {
+            val intent = Intent(action)
+            if (context !is android.app.Activity) {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            try {
+                if (context.packageManager.resolveActivity(intent, 0) != null) {
+                    context.startActivity(intent)
+                    return true
+                }
+            } catch (_: Exception) {
+            }
+        }
+        return false
+    }
 
     fun openAppPermissionScreen(context: Context, packageName: String) {
         val appPermsIntent = Intent("android.intent.action.MANAGE_APP_PERMISSIONS").apply {
@@ -1577,10 +1639,12 @@ object PrivacyAnalyzer {
             existingLog
         }
 
-        prefs.edit()
-            .putString(KEY_SNAPSHOT, encodeSnapshot(userReports))
-            .putString(KEY_CHANGE_LOG, encodeChangeLog(updatedLog))
-            .apply()
+        if (newEvents.isNotEmpty() || oldSnapshot.keys != currentMap.keys) {
+            prefs.edit()
+                .putString(KEY_SNAPSHOT, encodeSnapshot(userReports))
+                .putString(KEY_CHANGE_LOG, encodeChangeLog(updatedLog))
+                .apply()
+        }
 
         cachedChangeEvents = updatedLog
         return updatedLog

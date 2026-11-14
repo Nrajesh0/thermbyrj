@@ -109,8 +109,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.service.LiveGuardMonitor
+import com.example.service.PermissionUtils
 import com.example.service.ThermalTrackerService
 import com.example.service.ThermalWidgetProvider
 import com.example.ui.screens.FilesScreen
@@ -138,6 +142,8 @@ import com.example.ui.theme.TextTertiary
 import com.example.ui.theme.ThemeState
 import com.example.viewmodel.ThermalViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
@@ -145,6 +151,11 @@ import kotlin.math.log10
 import kotlin.math.pow
 
 class MainActivity : ComponentActivity() {
+    companion object {
+        @Volatile
+        var isUiForeground: Boolean = false
+    }
+
     private val viewModel: ThermalViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -157,8 +168,9 @@ class MainActivity : ComponentActivity() {
             startTrackingServiceSafely(this)
         }
 
-        // Pre-warm Privacy & Guard caches on background IO thread so tab switches are 0ms instant
+        // Pre-warm Privacy & Guard caches after initial frames settle to avoid startup CPU contention
         lifecycleScope.launch(Dispatchers.IO) {
+            delay(800L)
             try {
                 val summary = PrivacyAnalyzer.analyzeDevicePrivacy(applicationContext, includeSystemApps = false)
                 PrivacyAnalyzer.getPrivacyChanges(applicationContext, summary.appReports)
@@ -174,6 +186,23 @@ class MainActivity : ComponentActivity() {
             AppTheme {
                 MainScreen(viewModel)
             }
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        isUiForeground = true
+        com.example.service.ThermalMonitor.getInstance(applicationContext).startMonitoring()
+        LiveGuardMonitor.getInstance(applicationContext).startMonitoring()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        isUiForeground = false
+        val prefs = getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
+        if (!prefs.getBoolean("background_monitoring", true)) {
+            com.example.service.ThermalMonitor.getInstance(applicationContext).stopMonitoring()
+            LiveGuardMonitor.getInstance(applicationContext).stopMonitoring()
         }
     }
 }
@@ -212,28 +241,42 @@ fun MainScreen(viewModel: ThermalViewModel) {
     val syncScope = rememberCoroutineScope()
 
     DisposableEffect(prefs) {
+        var backupJob: Job? = null
+        var widgetJob: Job? = null
         val listener = SharedPreferences.OnSharedPreferenceChangeListener { sp, key ->
             when (key) {
                 "warning_temp" -> {
                     warningTemp = sp.getFloat("warning_temp", 35f)
-                    ThermalWidgetProvider.updateAllWidgets(context)
+                    widgetJob?.cancel()
+                    widgetJob = syncScope.launch(Dispatchers.IO) {
+                        ThermalWidgetProvider.updateAllWidgets(context)
+                    }
                 }
                 "haptic_feedback" -> hapticEnabled = sp.getBoolean("haptic_feedback", true)
                 "background_monitoring" -> bgMonitoringEnabled = sp.getBoolean("background_monitoring", true)
                 "live_guard_alerts" -> liveGuardAlertsEnabled = sp.getBoolean("live_guard_alerts", true)
                 "theme_accent", "theme_surface", "ultra_minimal_cards", "ambient_glow" -> {
                     ThemeState.loadFromPrefs(context)
-                    ThermalWidgetProvider.updateAllWidgets(context)
+                    widgetJob?.cancel()
+                    widgetJob = syncScope.launch(Dispatchers.IO) {
+                        ThermalWidgetProvider.updateAllWidgets(context)
+                    }
                 }
             }
             if (key != null && key != "prefs_initialized") {
-                syncScope.launch(Dispatchers.IO) {
+                backupJob?.cancel()
+                backupJob = syncScope.launch(Dispatchers.IO) {
+                    delay(500L)
                     PreferencesBackupManager.saveMirrorSnapshot(context)
                 }
             }
         }
         prefs.registerOnSharedPreferenceChangeListener(listener)
-        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+        onDispose {
+            backupJob?.cancel()
+            widgetJob?.cancel()
+            prefs.unregisterOnSharedPreferenceChangeListener(listener)
+        }
     }
 
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
@@ -496,10 +539,66 @@ fun MorphingSettingsOrb(
     warningTemp: Float
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val haptic = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
     var isExpanded by remember { mutableStateOf(false) }
     var autoDocBackup by remember { mutableStateOf(prefs.getBoolean("auto_backup_documents", true)) }
+
+    var hasNotifPerm by remember { mutableStateOf(PermissionUtils.hasNotificationPermission(context)) }
+    var hasMediaPerm by remember { mutableStateOf(PermissionUtils.hasMediaPermissions(context)) }
+    var hasAllFilesPerm by remember { mutableStateOf(PermissionUtils.hasAllFilesPermission()) }
+    var hasUsagePerm by remember { mutableStateOf(PermissionUtils.hasUsageStatsPermission(context)) }
+    var mediaPermRequestedBefore by remember { mutableStateOf(false) }
+    var notifPermRequestedBefore by remember { mutableStateOf(false) }
+
+    fun refreshPermissionStates() {
+        hasNotifPerm = PermissionUtils.hasNotificationPermission(context)
+        hasMediaPerm = PermissionUtils.hasMediaPermissions(context)
+        hasAllFilesPerm = PermissionUtils.hasAllFilesPermission()
+        hasUsagePerm = PermissionUtils.hasUsageStatsPermission(context)
+    }
+
+    val orbNotifLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasNotifPerm = granted
+        if (!granted && notifPermRequestedBefore) {
+            PermissionUtils.launchNotificationSettings(context)
+        }
+        notifPermRequestedBefore = true
+    }
+
+    val orbMediaLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        val granted = PermissionUtils.hasMediaPermissions(context)
+        hasMediaPerm = granted
+        if (!granted && mediaPermRequestedBefore) {
+            PermissionUtils.launchAppDetailsSettings(context)
+        }
+        mediaPermRequestedBefore = true
+    }
+
+    val orbSettingsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) {
+        refreshPermissionStates()
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val obs = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                refreshPermissionStates()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(obs)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+    }
+
+    LaunchedEffect(isExpanded) {
+        if (isExpanded) refreshPermissionStates()
+    }
 
     val exportBackupLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/json")
@@ -650,7 +749,7 @@ fun MorphingSettingsOrb(
                                     .border(1.5.dp, if (selected) preset.color else GlassBorder, RoundedCornerShape(100.dp))
                                     .clickable {
                                         ThemeState.accentPreset = preset
-                                        prefs.edit().putString("theme_accent", preset.key).commit()
+                                        prefs.edit().putString("theme_accent", preset.key).apply()
                                     }
                                     .padding(horizontal = 12.dp, vertical = 8.dp),
                                 verticalAlignment = Alignment.CenterVertically
@@ -696,7 +795,7 @@ fun MorphingSettingsOrb(
                                     .border(1.5.dp, if (selected) AuraCyan else GlassBorder, RoundedCornerShape(12.dp))
                                     .clickable {
                                         ThemeState.surfacePreset = preset
-                                        prefs.edit().putString("theme_surface", preset.key).commit()
+                                        prefs.edit().putString("theme_surface", preset.key).apply()
                                     }
                                     .padding(horizontal = 12.dp, vertical = 10.dp),
                                 verticalAlignment = Alignment.CenterVertically
@@ -726,7 +825,7 @@ fun MorphingSettingsOrb(
                         checked = ThemeState.ultraMinimalCards,
                         onCheckedChange = { enabled ->
                             ThemeState.ultraMinimalCards = enabled
-                            prefs.edit().putBoolean("ultra_minimal_cards", enabled).commit()
+                            prefs.edit().putBoolean("ultra_minimal_cards", enabled).apply()
                         }
                     )
 
@@ -736,7 +835,7 @@ fun MorphingSettingsOrb(
                         checked = ThemeState.showAmbientGlow,
                         onCheckedChange = { enabled ->
                             ThemeState.showAmbientGlow = enabled
-                            prefs.edit().putBoolean("ambient_glow", enabled).commit()
+                            prefs.edit().putBoolean("ambient_glow", enabled).apply()
                         }
                     )
 
@@ -757,7 +856,7 @@ fun MorphingSettingsOrb(
                         subtitle = "Tactile feedback on navigation and controls",
                         checked = hapticEnabled,
                         onCheckedChange = { enabled ->
-                            prefs.edit().putBoolean("haptic_feedback", enabled).commit()
+                            prefs.edit().putBoolean("haptic_feedback", enabled).apply()
                             if (enabled) haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                         }
                     )
@@ -768,7 +867,7 @@ fun MorphingSettingsOrb(
                         checked = liveGuardAlertsEnabled,
                         onCheckedChange = { enabled ->
                             if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            prefs.edit().putBoolean("live_guard_alerts", enabled).commit()
+                            prefs.edit().putBoolean("live_guard_alerts", enabled).apply()
                         }
                     )
 
@@ -778,7 +877,7 @@ fun MorphingSettingsOrb(
                         checked = bgMonitoringEnabled,
                         onCheckedChange = { enabled ->
                             if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            prefs.edit().putBoolean("background_monitoring", enabled).commit()
+                            prefs.edit().putBoolean("background_monitoring", enabled).apply()
                             if (enabled) {
                                 startTrackingServiceSafely(context)
                             } else {
@@ -826,7 +925,77 @@ fun MorphingSettingsOrb(
                         title = "Warning Temp Limit",
                         value = warningTemp,
                         onValueChange = { newTemp ->
-                            prefs.edit().putFloat("warning_temp", newTemp).commit()
+                            prefs.edit().putFloat("warning_temp", newTemp).apply()
+                        }
+                    )
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    HorizontalDivider(color = GlassBorder)
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Text(
+                        "APP PERMISSIONS",
+                        style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 3.sp, fontWeight = FontWeight.Bold),
+                        color = AuraCyan
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    SettingsPermissionRow(
+                        title = "Notifications",
+                        subtitle = "Guard alerts, thermal warnings & shredder progress",
+                        granted = hasNotifPerm,
+                        tag = "perm_row_notifications",
+                        onAction = {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotifPerm) {
+                                orbNotifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            } else {
+                                PermissionUtils.launchNotificationSettings(context)
+                            }
+                        }
+                    )
+
+                    SettingsPermissionRow(
+                        title = "Media Access (Photos, Videos, Audio)",
+                        subtitle = "Scan & manage photos, videos, audio and documents",
+                        granted = hasMediaPerm || hasAllFilesPerm,
+                        tag = "perm_row_media",
+                        onAction = {
+                            if (!hasMediaPerm) {
+                                orbMediaLauncher.launch(PermissionUtils.requiredMediaPermissions())
+                            } else {
+                                PermissionUtils.launchAppDetailsSettings(context)
+                            }
+                        }
+                    )
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        SettingsPermissionRow(
+                            title = "All Files Access",
+                            subtitle = "Folder Explorer, Deep Clean, Duplicates & direct byte Shredder",
+                            granted = hasAllFilesPerm,
+                            tag = "perm_row_all_files",
+                            onAction = {
+                                try {
+                                    orbSettingsLauncher.launch(PermissionUtils.buildAllFilesAccessIntent(context))
+                                } catch (_: Exception) {
+                                    PermissionUtils.launchAllFilesAccessSettings(context)
+                                }
+                            }
+                        )
+                    }
+
+                    SettingsPermissionRow(
+                        title = "Usage Access",
+                        subtitle = "Identify foreground app for Live Guard, Timeline & App sizes",
+                        granted = hasUsagePerm,
+                        tag = "perm_row_usage_access",
+                        onAction = {
+                            try {
+                                orbSettingsLauncher.launch(Intent(android.provider.Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                            } catch (_: Exception) {
+                                PermissionUtils.launchUsageAccessSettings(context)
+                            }
                         }
                     )
 
@@ -848,7 +1017,7 @@ fun MorphingSettingsOrb(
                         checked = autoDocBackup,
                         onCheckedChange = { enabled ->
                             autoDocBackup = enabled
-                            prefs.edit().putBoolean("auto_backup_documents", enabled).commit()
+                            prefs.edit().putBoolean("auto_backup_documents", enabled).apply()
                         }
                     )
 
@@ -931,6 +1100,8 @@ fun SettingsSliderRow(
     value: Float,
     onValueChange: (Float) -> Unit
 ) {
+    var sliderPos by remember(value) { mutableFloatStateOf(value.coerceIn(30f, 50f)) }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -943,15 +1114,16 @@ fun SettingsSliderRow(
         ) {
             Text(title, color = TextPrimary, style = MaterialTheme.typography.bodyMedium)
             Text(
-                "${value.toInt()}°C (Crit ${(value + 5).toInt()}°C)",
+                "${sliderPos.toInt()}°C (Crit ${(sliderPos + 5).toInt()}°C)",
                 color = AuraCyan,
                 style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold)
             )
         }
         Spacer(modifier = Modifier.height(4.dp))
         Slider(
-            value = value.coerceIn(30f, 50f),
-            onValueChange = onValueChange,
+            value = sliderPos,
+            onValueChange = { sliderPos = it },
+            onValueChangeFinished = { onValueChange(sliderPos) },
             valueRange = 30f..50f,
             steps = 19,
             colors = SliderDefaults.colors(
@@ -994,5 +1166,45 @@ fun SettingsToggleRow(
                 uncheckedBorderColor = TextSecondary.copy(alpha = 0.3f)
             )
         )
+    }
+}
+
+@Composable
+fun SettingsPermissionRow(
+    title: String,
+    subtitle: String,
+    granted: Boolean,
+    tag: String,
+    onAction: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag(tag)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable { onAction() }
+            .padding(vertical = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(title, color = TextPrimary, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(subtitle, color = TextTertiary, style = MaterialTheme.typography.labelSmall)
+        }
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(100.dp))
+                .background(if (granted) AuraGreen.copy(alpha = 0.16f) else AuraOrange.copy(alpha = 0.18f))
+                .border(1.dp, if (granted) AuraGreen.copy(alpha = 0.5f) else AuraOrange.copy(alpha = 0.55f), RoundedCornerShape(100.dp))
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = if (granted) "GRANTED" else "GRANT",
+                color = if (granted) AuraGreen else AuraOrange,
+                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+            )
+        }
     }
 }

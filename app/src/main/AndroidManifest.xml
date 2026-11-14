@@ -36,6 +36,13 @@
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Hardware Temperature Monitoring" />
         </service>
 
+        <service
+            android:name=".service.FileShredService"
+            android:foregroundServiceType="specialUse"
+            android:exported="false">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User-Initiated Secure File Shredding" />
+        </service>
+
         <receiver android:name=".service.ThermalWidgetProvider" android:exported="true">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />

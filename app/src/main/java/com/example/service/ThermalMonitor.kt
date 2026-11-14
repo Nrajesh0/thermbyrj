@@ -190,14 +190,30 @@ class ThermalMonitor private constructor(private val context: Context) {
         }
     }
 
+    @Volatile
+    private var lastStorageQueryMs: Long = 0L
+    @Volatile
+    private var cachedTotalStorage: Long = 0L
+    @Volatile
+    private var cachedAvailStorage: Long = 0L
+
     /**
      * Refreshes system specs (RAM, Storage, CPU thermal sensor, display refresh rate).
      * Offline-only: zero network or socket calls.
      */
-    fun refreshSystemSpecs() {
+    fun refreshSystemSpecs(forceStorageRefresh: Boolean = false) {
         val cpuTempC = getCpuTemperature()
         val (totRam, avRam) = getMemoryInfo()
-        val (totStore, avStore) = getStorageInfo()
+        val now = System.currentTimeMillis()
+        val (totStore, avStore) = if (forceStorageRefresh || cachedTotalStorage <= 0L || (now - lastStorageQueryMs) >= 60_000L) {
+            getStorageInfo().also { (tot, av) ->
+                cachedTotalStorage = tot
+                cachedAvailStorage = av
+                lastStorageQueryMs = now
+            }
+        } else {
+            Pair(cachedTotalStorage, cachedAvailStorage)
+        }
 
         _liveData.value = _liveData.value.copy(
             cpuTemp = cpuTempC,
@@ -217,7 +233,7 @@ class ThermalMonitor private constructor(private val context: Context) {
             null
         }
         updateDataFromIntent(stickyIntent)
-        refreshSystemSpecs()
+        refreshSystemSpecs(forceStorageRefresh = true)
     }
 
     private var monitoringJob: Job? = null

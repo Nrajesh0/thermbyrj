@@ -25,6 +25,14 @@ class ThermalViewModel(application: Application) : AndroidViewModel(application)
             initialValue = emptyList()
         )
 
+    val recentRecords24h: StateFlow<List<ThermalRecord>> =
+        repository.getRecordsSince(System.currentTimeMillis() - (24L * 60L * 60L * 1000L))
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5000),
+                initialValue = emptyList()
+            )
+
     init {
         thermalMonitor.startMonitoring()
         viewModelScope.launch {

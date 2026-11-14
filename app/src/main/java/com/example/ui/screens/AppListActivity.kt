@@ -94,6 +94,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.GlassCard
 import com.example.formatBytes
+import com.example.service.StorageScanCache
 import com.example.ui.theme.AppTheme
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
@@ -187,6 +188,7 @@ fun AppListScreen(onBack: () -> Unit) {
     val uninstallLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) {
+        StorageScanCache.invalidate()
         refreshTrigger++
     }
 

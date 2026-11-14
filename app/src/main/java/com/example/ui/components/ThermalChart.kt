@@ -56,8 +56,24 @@ fun ThermalChart(
     val textMeasurer = rememberTextMeasurer()
 
     val sortedRecords = remember(records) {
-        records.sortedBy { it.timestamp }
+        val sorted = records.sortedBy { it.timestamp }
+        val maxPoints = 240
+        if (sorted.size <= maxPoints) {
+            sorted
+        } else {
+            val step = (sorted.size - 1).toDouble() / (maxPoints - 1)
+            List(maxPoints) { idx ->
+                val srcIdx = if (idx == maxPoints - 1) sorted.lastIndex else (idx * step).toInt()
+                sorted[srcIdx]
+            }
+        }
     }
+
+    val timeRangeLongRemembered = remember(sortedRecords) {
+        if (sortedRecords.size >= 2) max(sortedRecords.last().timestamp - sortedRecords.first().timestamp, 1L) else 1L
+    }
+    val datePattern = if (timeRangeLongRemembered > 24L * 60L * 60L * 1000L) "MM-dd" else "HH:mm"
+    val dateFormatter = remember(datePattern) { SimpleDateFormat(datePattern, Locale.getDefault()) }
 
     Box(
         modifier = modifier
@@ -178,15 +194,13 @@ fun ThermalChart(
 
             // Draw X-axis labels
             val xLabelsCount = 4
-            val pattern = if (timeRangeLong > 24L * 60L * 60L * 1000L) "MM-dd" else "HH:mm"
-            val df = SimpleDateFormat(pattern, Locale.getDefault())
 
             for (i in 0..xLabelsCount) {
                 val xPos = (size.width / xLabelsCount) * i
                 val unscaledX = (xPos - clampedOffsetX) / scale
                 val t = timeStart + ((unscaledX / size.width) * timeRange).toLong()
                 if (t in timeStart..timeEnd) {
-                    val timeString = df.format(Date(t))
+                    val timeString = dateFormatter.format(Date(t))
                     val measured = textMeasurer.measure(timeString, labelStyle)
                     val labelX = (xPos - measured.size.width / 2f)
                         .coerceIn(0f, max(0f, size.width - measured.size.width.toFloat()))

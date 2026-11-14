@@ -243,7 +243,6 @@ fun LiveGuardScreen() {
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                guardMonitor.refreshAllStates()
                 hasUsageAccess = PrivacyAnalyzer.hasUsageStatsPermission(context)
                 hasNotificationPermission = hasPostNotificationsPermission(context)
                 bgMonitoringEnabled = prefs.getBoolean("background_monitoring", true)
@@ -255,10 +254,14 @@ fun LiveGuardScreen() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    val latestSensorEventId = remember(events) {
+        events.firstOrNull { it.type != "AUDIT" }?.id ?: 0L
+    }
+
     LaunchedEffect(
         refreshTrigger,
         ignoredPackages,
-        events.firstOrNull()?.id,
+        latestSensorEventId,
         captureState.isScreenRecordingOrCasting,
         captureState.isMicActive,
         captureState.isCameraActive,
@@ -267,7 +270,7 @@ fun LiveGuardScreen() {
     ) {
         if (!isScanning) {
             withContext(Dispatchers.IO) {
-                val vectors = guardMonitor.runDeepSecurityAudit(includeSystemApps = false)
+                val vectors = guardMonitor.runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = false)
                 val timeline = PrivacyAnalyzer.getPermissionAccessTimeline(context, includeSystemApps = false)
                 auditVectors = vectors
                 accessTimeline = timeline
@@ -299,8 +302,8 @@ fun LiveGuardScreen() {
                 delay(180)
             }
             val (results, timeline) = withContext(Dispatchers.IO) {
-                val v = guardMonitor.runDeepSecurityAudit(includeSystemApps = false)
-                val t = PrivacyAnalyzer.getPermissionAccessTimeline(context, includeSystemApps = false)
+                val v = guardMonitor.runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = true)
+                val t = PrivacyAnalyzer.getPermissionAccessTimeline(context, includeSystemApps = false, forceRefresh = true)
                 v to t
             }
             auditVectors = results
@@ -448,7 +451,7 @@ fun LiveGuardScreen() {
                     actionLabel = "Turn On",
                     tint = AuraRose,
                     onAction = {
-                        prefs.edit().putBoolean("background_monitoring", true).commit()
+                        prefs.edit().putBoolean("background_monitoring", true).apply()
                         startTrackingServiceSafely(context)
                     }
                 )
@@ -458,7 +461,7 @@ fun LiveGuardScreen() {
                     actionLabel = "Unmute",
                     tint = AuraOrange,
                     onAction = {
-                        prefs.edit().putBoolean("live_guard_alerts", true).commit()
+                        prefs.edit().putBoolean("live_guard_alerts", true).apply()
                     }
                 )
                 else -> GuardWarningBannerData(
@@ -649,20 +652,8 @@ fun LiveGuardScreen() {
                             .background(AuraOrange.copy(alpha = 0.14f))
                             .border(1.dp, AuraOrange.copy(alpha = 0.35f), RoundedCornerShape(100.dp))
                             .clickable {
-                                val opened = listOf(
-                                    "android.intent.action.REVIEW_PERMISSION_USAGE",
-                                    Intent.ACTION_VIEW_PERMISSION_USAGE,
-                                    Settings.ACTION_PRIVACY_SETTINGS
-                                ).any { action ->
-                                    try {
-                                        context.startActivity(Intent(action))
-                                        true
-                                    } catch (_: Exception) {
-                                        false
-                                    }
-                                }
-                                if (!opened) {
-                                    Toast.makeText(context, "Privacy Dashboard unavailable on this OS", Toast.LENGTH_SHORT).show()
+                                if (!PrivacyAnalyzer.openOsPrivacyDashboard(context)) {
+                                    Toast.makeText(context, "Privacy settings unavailable on this OS", Toast.LENGTH_SHORT).show()
                                 }
                             }
                             .padding(horizontal = 12.dp, vertical = 6.dp),
@@ -774,17 +765,8 @@ fun LiveGuardScreen() {
                                             .background(AuraOrange.copy(alpha = 0.16f))
                                             .border(1.dp, AuraOrange.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
                                             .clickable {
-                                                listOf(
-                                                    "android.intent.action.REVIEW_PERMISSION_USAGE",
-                                                    Intent.ACTION_VIEW_PERMISSION_USAGE,
-                                                    Settings.ACTION_PRIVACY_SETTINGS
-                                                ).any { action ->
-                                                    try {
-                                                        context.startActivity(Intent(action))
-                                                        true
-                                                    } catch (_: Exception) {
-                                                        false
-                                                    }
+                                                if (!PrivacyAnalyzer.openOsPrivacyDashboard(context)) {
+                                                    Toast.makeText(context, "Privacy settings unavailable on this OS", Toast.LENGTH_SHORT).show()
                                                 }
                                             }
                                             .padding(horizontal = 10.dp, vertical = 6.dp)
@@ -1178,42 +1160,29 @@ private fun CompactHardwareShieldCard(
         else -> AuraGreen
     }
 
-    val infiniteTransition = rememberInfiniteTransition(label = "guard_pulse")
-    val pulseScale by infiniteTransition.animateFloat(
-        initialValue = 0.94f,
-        targetValue = 1.08f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1000, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "pulse_scale"
-    )
-
     GlassCard(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Box(
-                modifier = Modifier
-                    .size(44.dp)
-                    .graphicsLayer {
-                        if (anyActiveCapture) {
-                            scaleX = pulseScale
-                            scaleY = pulseScale
-                        }
-                    }
-                    .clip(CircleShape)
-                    .background(heroAccent.copy(alpha = 0.16f))
-                    .border(1.5.dp, heroAccent.copy(alpha = 0.5f), CircleShape),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    imageVector = if (anyActiveCapture) Icons.Default.Warning else Icons.Default.Security,
-                    contentDescription = null,
-                    tint = heroAccent,
-                    modifier = Modifier.size(22.dp)
-                )
+            if (anyActiveCapture) {
+                PulsingShieldAvatar(heroAccent = heroAccent)
+            } else {
+                Box(
+                    modifier = Modifier
+                        .size(44.dp)
+                        .clip(CircleShape)
+                        .background(heroAccent.copy(alpha = 0.16f))
+                        .border(1.5.dp, heroAccent.copy(alpha = 0.5f), CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Security,
+                        contentDescription = null,
+                        tint = heroAccent,
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
             }
             Spacer(modifier = Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
@@ -1365,6 +1334,39 @@ private fun CompactHardwareShieldCard(
                 strokeCap = StrokeCap.Round
             )
         }
+    }
+}
+
+@Composable
+private fun PulsingShieldAvatar(heroAccent: Color) {
+    val infiniteTransition = rememberInfiniteTransition(label = "guard_pulse")
+    val pulseScale by infiniteTransition.animateFloat(
+        initialValue = 0.94f,
+        targetValue = 1.08f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1000, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "pulse_scale"
+    )
+    Box(
+        modifier = Modifier
+            .size(44.dp)
+            .graphicsLayer {
+                scaleX = pulseScale
+                scaleY = pulseScale
+            }
+            .clip(CircleShape)
+            .background(heroAccent.copy(alpha = 0.16f))
+            .border(1.5.dp, heroAccent.copy(alpha = 0.5f), CircleShape),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            imageVector = Icons.Default.Warning,
+            contentDescription = null,
+            tint = heroAccent,
+            modifier = Modifier.size(22.dp)
+        )
     }
 }
 

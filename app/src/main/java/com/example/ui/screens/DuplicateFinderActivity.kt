@@ -72,6 +72,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import com.example.GlassCard
 import com.example.formatBytes
+import com.example.service.StorageScanCache
 import com.example.ui.theme.AppTheme
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
@@ -419,6 +420,7 @@ fun DuplicateFinderScreen(onBack: () -> Unit) {
                                         IconButton(onClick = {
                                             scope.launch(Dispatchers.IO) {
                                                 val deleted = deleteFileComplete(file)
+                                                if (deleted) StorageScanCache.invalidate()
                                                 withContext(Dispatchers.Main) {
                                                     if (deleted) {
                                                         val newFiles = group.files.filter { it != file }
@@ -481,6 +483,7 @@ fun DuplicateFinderScreen(onBack: () -> Unit) {
                                     remainingGroups.add(group.copy(files = leftovers))
                                 }
                             }
+                            if (removedCount > 0) StorageScanCache.invalidate()
                             withContext(Dispatchers.Main) {
                                 duplicateGroups = remainingGroups
                                 isScanning = false

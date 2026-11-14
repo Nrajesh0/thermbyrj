@@ -85,6 +85,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.example.GlassCard
 import com.example.formatBytes
+import com.example.service.StorageScanCache
 import com.example.ui.theme.AppTheme
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
@@ -329,6 +330,7 @@ fun VaultScreen(onBack: () -> Unit) {
                         }
                     }
                     registry.edit().putString(uuid, fileName).apply()
+                    StorageScanCache.invalidate()
                     withContext(Dispatchers.Main) {
                         Toast.makeText(context, "File encrypted with AES-256 GCM!", Toast.LENGTH_SHORT).show()
                         refreshVault()
@@ -587,6 +589,7 @@ fun VaultScreen(onBack: () -> Unit) {
                                 IconButton(onClick = {
                                     entry.encryptedFile.delete()
                                     registry.edit().remove(entry.id).apply()
+                                    StorageScanCache.invalidate()
                                     refreshVault()
                                 }) {
                                     Icon(Icons.Default.Delete, contentDescription = "Delete Permanently", tint = AuraRose)

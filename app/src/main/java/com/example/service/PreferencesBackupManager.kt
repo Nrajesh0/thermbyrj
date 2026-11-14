@@ -65,6 +65,7 @@ object PreferencesBackupManager {
         return root.toString(2)
     }
 
+    @Synchronized
     fun importFromJson(context: Context, jsonStr: String): Boolean {
         return try {
             val root = JSONObject(jsonStr)
@@ -139,6 +140,7 @@ object PreferencesBackupManager {
         }
     }
 
+    @Synchronized
     fun saveMirrorSnapshot(context: Context) {
         try {
             markInitialized(context)
@@ -165,6 +167,7 @@ object PreferencesBackupManager {
      * Automatically restores settings if SharedPreferences were cleared (e.g. reinstall / prefs reset)
      * using either the internal atomic mirror or the user-permitted Documents/dot backup.
      */
+    @Synchronized
     fun autoRestoreIfCleared(context: Context): Boolean {
         val prefs = context.getSharedPreferences(THERMAL_PREFS, Context.MODE_PRIVATE)
         val hasAnySavedPref = prefs.getBoolean(KEY_INITIALIZED, false) ||

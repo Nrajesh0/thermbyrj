@@ -86,6 +86,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import com.example.GlassCard
 import com.example.formatBytes
+import com.example.service.StorageScanCache
 import com.example.ui.theme.AppTheme
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
@@ -441,6 +442,7 @@ fun DeepCleanScreen(onBack: () -> Unit) {
                             scope.launch(Dispatchers.IO) {
                                 val root = Environment.getExternalStorageDirectory()
                                 val (removedCount, freedBytes) = cleanFilesAndPruneEmptyParents(itemsToClean, root)
+                                if (removedCount > 0) StorageScanCache.invalidate()
                                 withContext(Dispatchers.Main) {
                                     Toast.makeText(
                                         context,

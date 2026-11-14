@@ -1,9 +1,20 @@
 package com.example.service
 
+import android.content.ContentUris
 import android.content.Context
+import android.content.Intent
 import android.media.MediaScannerConnection
 import android.net.Uri
+import android.os.Build
 import android.provider.MediaStore
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
@@ -38,9 +49,131 @@ data class ShredResult(
     val failedTargets: List<ShredTarget>
 )
 
+data class ShredJobState(
+    val isRunning: Boolean = false,
+    val progress: Float = 0f,
+    val completedFiles: Int = 0,
+    val totalFiles: Int = 0,
+    val statusText: String = "",
+    val completionId: Long = 0L,
+    val lastResult: ShredResult? = null,
+    val attemptedTargetPaths: Set<String> = emptySet(),
+    val attemptedTargetUris: Set<String> = emptySet()
+)
+
+object ShredJobCoordinator {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val _state = MutableStateFlow(ShredJobState())
+    val state: StateFlow<ShredJobState> = _state.asStateFlow()
+
+    @Volatile
+    private var activeJob: Job? = null
+
+    fun startBackgroundShred(
+        context: Context,
+        targets: List<ShredTarget>,
+        standard: ShredStandard
+    ): Boolean {
+        if (targets.isEmpty() || _state.value.isRunning) return false
+        val appContext = context.applicationContext
+
+        try {
+            val svcIntent = Intent(appContext, FileShredService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                appContext.startForegroundService(svcIntent)
+            } else {
+                appContext.startService(svcIntent)
+            }
+        } catch (_: Exception) {
+        }
+
+        val initialTotal = targets.size.coerceAtLeast(1)
+        _state.value = ShredJobState(
+            isRunning = true,
+            progress = 0f,
+            completedFiles = 0,
+            totalFiles = initialTotal,
+            statusText = "Starting ${standard.title}...",
+            completionId = _state.value.completionId,
+            lastResult = _state.value.lastResult,
+            attemptedTargetPaths = targets.mapNotNull { it.file.absolutePath.takeIf(String::isNotBlank) }.toSet(),
+            attemptedTargetUris = targets.mapNotNull { it.contentUri?.toString() }.toSet()
+        )
+
+        activeJob = scope.launch {
+            val result = FileShredder.shredTargets(
+                context = appContext,
+                targets = targets,
+                standard = standard
+            ) { done, total, label ->
+                val fraction = if (total > 0) (done.toFloat() / total.toFloat()).coerceIn(0f, 1f) else 0f
+                _state.value = _state.value.copy(
+                    isRunning = true,
+                    progress = fraction,
+                    completedFiles = done,
+                    totalFiles = total,
+                    statusText = label
+                )
+            }
+
+            if (result.shreddedCount > 0) {
+                StorageScanCache.invalidate()
+            }
+
+            _state.value = _state.value.copy(
+                isRunning = false,
+                progress = 1f,
+                completionId = System.currentTimeMillis(),
+                lastResult = result,
+                statusText = if (result.blockedForOverwrite.isNotEmpty()) {
+                    "Shredded ${result.shreddedCount}; ${result.blockedForOverwrite.size} blocked"
+                } else {
+                    "Shredded ${result.shreddedCount} file(s)"
+                }
+            )
+        }
+        return true
+    }
+}
+
 object FileShredder {
 
+    private const val SHRED_PREFS = "shred_state_prefs"
+    private const val KEY_INTERRUPTED_PATH = "interrupted_shred_path"
     private val random = SecureRandom()
+
+    fun peekInterruptedShredPath(context: Context): String? {
+        return try {
+            val path = context.applicationContext
+                .getSharedPreferences(SHRED_PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_INTERRUPTED_PATH, null)
+            if (!path.isNullOrBlank() && File(path).exists()) path else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun clearInterruptedShredPath(context: Context) {
+        try {
+            context.applicationContext
+                .getSharedPreferences(SHRED_PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .remove(KEY_INTERRUPTED_PATH)
+                .apply()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun markActiveShredPath(context: Context, path: String) {
+        try {
+            context.applicationContext
+                .getSharedPreferences(SHRED_PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_INTERRUPTED_PATH, path)
+                .commit()
+        } catch (_: Exception) {
+        }
+    }
 
     fun shredTargets(
         context: Context,
@@ -82,6 +215,7 @@ object FileShredder {
             val fileLen = if (file.exists()) file.length() else 0L
 
             if (file.exists() && file.isFile && file.canWrite()) {
+                markActiveShredPath(context, file.absolutePath)
                 wipedSuccessfully = overwriteAndDestroyLocalFile(
                     context = context,
                     file = file,
@@ -89,7 +223,11 @@ object FileShredder {
                     standard = standard,
                     buffer = buffer
                 )
+                clearInterruptedShredPath(context)
             } else if (target.contentUri != null) {
+                if (file.absolutePath.isNotBlank() && file.exists()) {
+                    markActiveShredPath(context, file.absolutePath)
+                }
                 wipedSuccessfully = overwriteViaContentUri(
                     context = context,
                     uri = target.contentUri,
@@ -97,6 +235,7 @@ object FileShredder {
                     standard = standard,
                     buffer = buffer
                 )
+                clearInterruptedShredPath(context)
             }
 
             if (wipedSuccessfully) {
@@ -249,6 +388,35 @@ object FileShredder {
         return if (file.renameTo(target)) target else file
     }
 
+    fun findMediaContentUriForFile(context: Context, file: File): Uri? {
+        val path = file.absolutePath
+        if (path.isBlank()) return null
+        val uris = listOf(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+            MediaStore.Files.getContentUri("external")
+        )
+        for (baseUri in uris) {
+            try {
+                context.contentResolver.query(
+                    baseUri,
+                    arrayOf(MediaStore.MediaColumns._ID),
+                    "${MediaStore.MediaColumns.DATA} = ?",
+                    arrayOf(path),
+                    null
+                )?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val id = cursor.getLong(0)
+                        return ContentUris.withAppendedId(baseUri, id)
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+        return null
+    }
+
     fun cleanupMediaStoreEntry(context: Context, path: String?, contentUri: Uri?) {
         if (contentUri != null) {
             try {
@@ -280,14 +448,14 @@ object FileShredder {
             }
         } catch (_: Exception) {
         }
-        if (contentUri != null) {
+        if (deleted) {
+            cleanupMediaStoreEntry(context, file.absolutePath, contentUri)
+        } else if (contentUri != null) {
             try {
                 val rows = context.contentResolver.delete(contentUri, null, null)
                 if (rows > 0) deleted = true
             } catch (_: Exception) {
             }
-        } else if (deleted) {
-            cleanupMediaStoreEntry(context, file.absolutePath, null)
         }
         return deleted || !file.exists()
     }

@@ -102,6 +102,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -182,7 +183,7 @@ fun VitalsScreen(viewModel: ThermalViewModel, warningTemp: Float = 35f) {
     val prefs = remember(context) { context.getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE) }
 
     val liveData by viewModel.thermalMonitor.liveData.collectAsStateWithLifecycle(initialValue = LiveThermalData())
-    val allRecords by viewModel.allRecords.collectAsStateWithLifecycle()
+    val allRecords by viewModel.recentRecords24h.collectAsStateWithLifecycle()
 
     var selectedCategory by remember { mutableStateOf(HiddenSettingCategory.ALL) }
     var searchQuery by remember { mutableStateOf("") }
@@ -348,7 +349,7 @@ fun VitalsScreen(viewModel: ThermalViewModel, warningTemp: Float = 35f) {
                     showChart = showChartInTempCard,
                     onToggleChart = { showChartInTempCard = !showChartInTempCard },
                     onWarningTempChange = { newTemp ->
-                        prefs.edit().putFloat("warning_temp", newTemp).commit()
+                        prefs.edit().putFloat("warning_temp", newTemp).apply()
                     }
                 )
             }
@@ -510,6 +511,7 @@ private fun SingleTempTrackingCard(
     onWarningTempChange: (Float) -> Unit
 ) {
     var showThresholdSlider by remember { mutableStateOf(false) }
+    var draftTemp by remember(warningTemp) { mutableFloatStateOf(warningTemp.coerceIn(30f, 50f)) }
     val criticalTemp = warningTemp + 5f
     val last24h = remember(allRecords) {
         val cutoff = System.currentTimeMillis() - (24L * 60 * 60 * 1000L)
@@ -650,14 +652,15 @@ private fun SingleTempTrackingCard(
                         style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold)
                     )
                     Text(
-                        text = "${warningTemp.toInt()}°C (Crit ${(warningTemp + 5).toInt()}°C)",
+                        text = "${draftTemp.toInt()}°C (Crit ${(draftTemp + 5).toInt()}°C)",
                         color = AuraOrange,
                         style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
                     )
                 }
                 Slider(
-                    value = warningTemp.coerceIn(30f, 50f),
-                    onValueChange = onWarningTempChange,
+                    value = draftTemp,
+                    onValueChange = { draftTemp = it },
+                    onValueChangeFinished = { onWarningTempChange(draftTemp) },
                     valueRange = 30f..50f,
                     steps = 19,
                     colors = SliderDefaults.colors(
@@ -1281,13 +1284,12 @@ internal fun buildHiddenSettingsCatalog(context: Context): List<HiddenSettingIte
         HiddenSettingItem(
             id = "priv_dashboard",
             title = "Privacy Dashboard",
-            subtitle = "OS 7-day sensor timeline",
+            subtitle = "OS privacy & sensor permissions",
             category = HiddenSettingCategory.PRIVACY,
             icon = Icons.Default.PrivacyTip,
             targets = listOf(
-                HiddenSettingTarget(action = "android.intent.action.REVIEW_PERMISSION_USAGE"),
-                HiddenSettingTarget(action = Intent.ACTION_VIEW_PERMISSION_USAGE),
-                HiddenSettingTarget(action = Settings.ACTION_PRIVACY_SETTINGS)
+                HiddenSettingTarget(action = Settings.ACTION_PRIVACY_SETTINGS),
+                HiddenSettingTarget(action = Settings.ACTION_SECURITY_SETTINGS)
             )
         ),
         HiddenSettingItem(

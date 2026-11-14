@@ -6,6 +6,8 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.appwidget.AppWidgetManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -142,9 +144,17 @@ class ThermalTrackerService : Service() {
     }
 
     private suspend fun updateWidget(@Suppress("UNUSED_PARAMETER") temp: Float) {
+        val widgetManager = AppWidgetManager.getInstance(this)
+        val widgetIds = widgetManager.getAppWidgetIds(ComponentName(this, ThermalWidgetProvider::class.java))
+        if (widgetIds.isEmpty()) return
         val oneHourAgo = System.currentTimeMillis() - (60 * 60 * 1000L)
         val recentRecords = repository.getRecordsSinceSync(oneHourAgo)
-        ThermalWidgetProvider.updateAllWidgets(this, recentRecords = recentRecords)
+        ThermalWidgetProvider.updateAllWidgets(
+            context = this,
+            recentRecords = recentRecords,
+            appWidgetManager = widgetManager,
+            appWidgetIds = widgetIds
+        )
     }
 
     private fun checkThermalAlerts(temp: Float) {
@@ -283,5 +293,14 @@ class ThermalTrackerService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         serviceJob.cancel()
+        if (::liveGuardMonitor.isInitialized) {
+            liveGuardMonitor.onGuardAlert = null
+            if (!com.example.MainActivity.isUiForeground) {
+                liveGuardMonitor.stopMonitoring()
+            }
+        }
+        if (::thermalMonitor.isInitialized && !com.example.MainActivity.isUiForeground) {
+            thermalMonitor.stopMonitoring()
+        }
     }
 }
