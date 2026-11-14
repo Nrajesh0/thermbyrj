@@ -158,6 +158,7 @@ class AppListActivity : ComponentActivity() {
     }
 }
 
+@Suppress("DEPRECATION")
 private fun hasUsagePermission(context: Context): Boolean {
     val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
     val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {

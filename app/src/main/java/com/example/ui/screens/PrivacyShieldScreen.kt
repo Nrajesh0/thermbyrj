@@ -167,6 +167,7 @@ fun PrivacyShieldScreen() {
         val byFilter = when (activeAppFilter) {
             "ALL" -> list
             "HIGH_RISK" -> list.filter { it.riskScore >= 35 }
+            "SIDELOADED" -> list.filter { it.isSideloaded }
             else -> {
                 val cat = PermissionCategory.entries.find { it.name == activeAppFilter }
                 if (cat != null) list.filter { app -> app.grantedPermissions.any { it.category == cat } } else list
@@ -452,9 +453,11 @@ fun PrivacyShieldScreen() {
                             .horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
+                        val sideloadCount = currentSummary.appReports.count { it.isSideloaded }
                         val pills = listOf(
                             Triple("ALL", "All (${currentSummary.appReports.size})", AuraGreen),
                             Triple("HIGH_RISK", "High Risk (${currentSummary.highRiskAppCount})", AuraRose),
+                            Triple("SIDELOADED", "Sideloaded ($sideloadCount)", AuraOrange),
                             Triple(PermissionCategory.CAMERA_MIC.name, "Cam & Mic (${currentSummary.categoryCounts[PermissionCategory.CAMERA_MIC] ?: 0})", AuraOrange),
                             Triple(PermissionCategory.LOCATION.name, "Location (${currentSummary.categoryCounts[PermissionCategory.LOCATION] ?: 0})", AuraCyan),
                             Triple(PermissionCategory.CONTACTS_SMS.name, "Contacts/SMS (${currentSummary.categoryCounts[PermissionCategory.CONTACTS_SMS] ?: 0})", AuraPurple),

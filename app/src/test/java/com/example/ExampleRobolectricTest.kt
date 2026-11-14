@@ -56,13 +56,20 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `live guard monitor runs 8 point deep audit and logs events`() {
+    fun `live guard monitor runs 10 point deep audit, ignore list, and logs events`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val monitor = LiveGuardMonitor.getInstance(context)
         monitor.startMonitoring()
 
         val vectors = monitor.runDeepSecurityAudit(includeSystemApps = false)
-        assertEquals(8, vectors.size)
+        assertEquals(10, vectors.size)
+        assertTrue(vectors.any { it.id == "bg_location" })
+        assertTrue(vectors.any { it.id == "clipboard_access" })
+
+        monitor.ignorePackage("com.example.ignored.test")
+        assertTrue(monitor.isPackageIgnored("com.example.ignored.test"))
+        monitor.unignorePackage("com.example.ignored.test")
+        assertFalse(monitor.isPackageIgnored("com.example.ignored.test"))
 
         monitor.recordEvent(
             type = "SCREEN",
@@ -87,10 +94,34 @@ class ExampleRobolectricTest {
         assertTrue(PrivacyAnalyzer.isBrandOrOemPackage("com.xiaomi.market"))
         assertTrue(PrivacyAnalyzer.isBrandOrOemPackage("com.samsung.android.app.smartcapture"))
         assertFalse(PrivacyAnalyzer.isBrandOrOemPackage("org.random.unknown.sideloaded"))
+    }
 
+    @Test
+    fun `timeline reports only verified sensor or appops accesses and ignores unopened apps`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        val timeline = PrivacyAnalyzer.getPermissionAccessTimeline(context, includeSystemApps = false)
-        assertTrue(timeline.size >= 0)
+        val monitor = LiveGuardMonitor.getInstance(context)
+        monitor.clearEvents()
+        PrivacyAnalyzer.invalidateTimelineCache()
+
+        // Audit & simulated guard test events must NOT appear as sensor/permission accesses
+        monitor.runDeepSecurityAudit(includeSystemApps = false)
+        monitor.triggerSimulatedGuardTest()
+        val baselineTimeline = PrivacyAnalyzer.getPermissionAccessTimeline(context, includeSystemApps = false)
+        assertTrue(
+            "Unopened apps and audit events must not create fake timeline entries",
+            baselineTimeline.all { it.accessContext == "Verified AppOps" }
+        )
+
+        // Genuine live sensor detection MUST appear in the timeline
+        monitor.recordEvent(
+            type = "MIC",
+            title = "Microphone Active",
+            description = "1 audio stream(s) recording.",
+            severity = AuditSeverity.WARNING,
+            packageName = null
+        )
+        val afterMic = PrivacyAnalyzer.getPermissionAccessTimeline(context, includeSystemApps = false)
+        assertTrue(afterMic.any { it.permissionInfo.permissionName == android.Manifest.permission.RECORD_AUDIO })
     }
 
     @Test
@@ -104,5 +135,157 @@ class ExampleRobolectricTest {
         val softWhite = com.example.ui.theme.SurfacePreset.SOFT_WHITE
         assertTrue(pureWhite.isLight)
         assertTrue(softWhite.isLight)
+    }
+
+    @Test
+    fun `guard rules support granular per-sensor trust, snoozes, and system app discovery`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val monitor = LiveGuardMonitor.getInstance(context)
+        monitor.clearIgnoredPackages()
+        monitor.clearAllSnoozes()
+
+        val initialConfig = monitor.rulesConfig.value
+        val updatedConfig = initialConfig.copy(
+            alertMode = com.example.service.GuardAlertMode.ALL_ACTIVITY,
+            debounceEnabled = false,
+            silenceDuringCalls = false
+        )
+        monitor.updateRulesConfig(updatedConfig)
+        assertEquals(com.example.service.GuardAlertMode.ALL_ACTIVITY, monitor.rulesConfig.value.alertMode)
+        assertFalse(monitor.rulesConfig.value.debounceEnabled)
+        monitor.updateRulesConfig(com.example.service.GuardRulesConfig())
+        assertEquals(com.example.service.GuardAlertMode.SMART_COVERT, monitor.rulesConfig.value.alertMode)
+
+        // Granular per-sensor trust: trusting only MIC must keep CAMERA alerts active
+        val recorderPkg = "com.example.recorder.unit"
+        monitor.setAppTrust(recorderPkg, setOf(com.example.service.GuardSensorType.MIC), source = "Test")
+        assertTrue(monitor.isSensorTrusted(recorderPkg, com.example.service.GuardSensorType.MIC))
+        assertFalse(monitor.isSensorTrusted(recorderPkg, com.example.service.GuardSensorType.CAMERA))
+        assertTrue(monitor.isSensorTrustedOrSnoozed(recorderPkg, com.example.service.GuardSensorType.MIC))
+        assertFalse(monitor.isSensorTrustedOrSnoozed(recorderPkg, com.example.service.GuardSensorType.CAMERA))
+
+        // Global / sensor snoozes suppress alerts until cancelled
+        monitor.snoozeTarget("SENSOR:CAMERA", "Camera (1h)")
+        assertTrue(monitor.isSensorTrustedOrSnoozed(recorderPkg, com.example.service.GuardSensorType.CAMERA))
+        monitor.cancelSnooze("SENSOR:CAMERA")
+        assertFalse(monitor.isSensorTrustedOrSnoozed(recorderPkg, com.example.service.GuardSensorType.CAMERA))
+
+        monitor.removeAppTrust(recorderPkg)
+        assertFalse(monitor.isSensorTrusted(recorderPkg, com.example.service.GuardSensorType.MIC))
+
+        // Dynamic system app discovery runs safely on any device/environment
+        val discovered = com.example.service.GuardSystemAppDiscovery.discoverSystemSensorApps(context)
+        assertTrue(discovered.all { it.packageName.isNotBlank() && it.recommendedSensors.isNotEmpty() })
+    }
+
+    @Test
+    fun `preferences backup manager saves mirror snapshot, exports json, and auto restores cleared prefs`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val thermalPrefs = context.getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
+        val guardPrefs = context.getSharedPreferences("guard_events_prefs", Context.MODE_PRIVATE)
+        val bookmarkPrefs = context.getSharedPreferences("file_bookmarks_prefs", Context.MODE_PRIVATE)
+
+        thermalPrefs.edit()
+            .putString("theme_accent", "EMERALD")
+            .putString("theme_surface", "PURE_WHITE")
+            .putFloat("warning_temp", 39.5f)
+            .putBoolean("ambient_glow", true)
+            .commit()
+
+        LiveGuardMonitor.resetInstanceForTests()
+        val monitor = LiveGuardMonitor.getInstance(context)
+        monitor.updateRulesConfig(
+            com.example.service.GuardRulesConfig(
+                alertMode = com.example.service.GuardAlertMode.ALL_ACTIVITY,
+                debounceEnabled = false
+            )
+        )
+        monitor.setAppTrust("com.example.trusted.app", setOf(com.example.service.GuardSensorType.MIC), source = "Test")
+
+        bookmarkPrefs.edit()
+            .putStringSet("starred_paths", setOf("/sdcard/Download/test_star"))
+            .commit()
+
+        com.example.service.PreferencesBackupManager.saveMirrorSnapshot(context)
+        val exportedJson = com.example.service.PreferencesBackupManager.exportToJson(context)
+        assertTrue(exportedJson.contains("EMERALD"))
+        assertTrue(exportedJson.contains("PURE_WHITE"))
+        assertTrue(exportedJson.contains("com.example.trusted.app"))
+
+        // Simulate prefs being cleared on update/reset
+        thermalPrefs.edit().clear().commit()
+        guardPrefs.edit().clear().commit()
+        bookmarkPrefs.edit().clear().commit()
+
+        val restored = com.example.service.PreferencesBackupManager.autoRestoreIfCleared(context)
+        assertTrue(restored)
+        assertEquals("EMERALD", thermalPrefs.getString("theme_accent", null))
+        assertEquals("PURE_WHITE", thermalPrefs.getString("theme_surface", null))
+        assertEquals(39.5f, thermalPrefs.getFloat("warning_temp", 0f), 0.01f)
+        assertTrue(thermalPrefs.getBoolean("ambient_glow", false))
+        assertEquals(com.example.service.GuardAlertMode.ALL_ACTIVITY, monitor.rulesConfig.value.alertMode)
+        assertTrue(monitor.isSensorTrusted("com.example.trusted.app", com.example.service.GuardSensorType.MIC))
+        assertEquals(setOf("/sdcard/Download/test_star"), bookmarkPrefs.getStringSet("starred_paths", emptySet()))
+    }
+
+    @Test
+    fun `file shredder wipes files using DoD 3-pass and NIST 1-pass and supports normal delete`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val testRoot = java.io.File(context.filesDir, "shred_unit_test_dir").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+        val nestedDir = java.io.File(testRoot, "sub").apply { mkdirs() }
+        val fileA = java.io.File(testRoot, "secret_a.txt").apply { writeText("TOP_SECRET_DATA_1234567890") }
+        val fileB = java.io.File(nestedDir, "secret_b.bin").apply { writeBytes(ByteArray(4096) { 0x42 }) }
+        val expectedBytes = fileA.length() + fileB.length()
+
+        val dodResult = com.example.service.FileShredder.shredTargets(
+            context = context,
+            targets = listOf(com.example.service.ShredTarget(testRoot)),
+            standard = com.example.service.ShredStandard.DOD_5220_22_M
+        )
+        assertEquals(2, dodResult.shreddedCount)
+        assertEquals(expectedBytes, dodResult.totalBytesWiped)
+        assertTrue(dodResult.blockedForOverwrite.isEmpty())
+        assertFalse(fileA.exists())
+        assertFalse(fileB.exists())
+        assertFalse(testRoot.exists())
+
+        // NIST 1-pass check
+        val nistFile = java.io.File(context.filesDir, "nist_test.txt").apply { writeText("NIST_WIPE_PAYLOAD") }
+        val nistLen = nistFile.length()
+        val nistResult = com.example.service.FileShredder.shredTargets(
+            context = context,
+            targets = listOf(com.example.service.ShredTarget(nistFile)),
+            standard = com.example.service.ShredStandard.NIST_SP_800_88
+        )
+        assertEquals(1, nistResult.shreddedCount)
+        assertEquals(nistLen, nistResult.totalBytesWiped)
+        assertFalse(nistFile.exists())
+
+        // Normal delete check
+        val normalFile = java.io.File(context.filesDir, "normal_del.txt").apply { writeText("hello") }
+        assertTrue(com.example.service.FileShredder.normalDeleteFile(context, normalFile))
+        assertFalse(normalFile.exists())
+    }
+
+    @Test
+    fun `screen recording filter ignores normal camera or downloaded videos and matches recorder paths`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        LiveGuardMonitor.resetInstanceForTests()
+        val monitor = LiveGuardMonitor.getInstance(context)
+
+        // Normal videos must NOT trigger screen-recording alerts
+        assertFalse(monitor.isScreenRecordingMediaEntry("DCIM/Camera/", null, "VID_20261114_120000.mp4"))
+        assertFalse(monitor.isScreenRecordingMediaEntry("Download/", null, "sample_clip.mp4"))
+        assertFalse(monitor.isScreenRecordingMediaEntry("Movies/Instagram/", null, "reel_991.mp4"))
+
+        // Actual screen recorder paths and filenames MUST match
+        assertTrue(monitor.isScreenRecordingMediaEntry("DCIM/ScreenRecorder/", null, "Screenrecorder-2026.mp4"))
+        assertTrue(monitor.isScreenRecordingMediaEntry("Movies/Screen recordings/", null, "rec_01.mp4"))
+        assertTrue(monitor.isScreenRecordingMediaEntry("Movies/", null, "Screen_Recording_2026.mp4"))
+
+        assertEquals(null, monitor.detectActiveScreenRecordingFile())
     }
 }

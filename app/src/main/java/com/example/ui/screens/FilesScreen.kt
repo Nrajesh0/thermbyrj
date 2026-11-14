@@ -54,6 +54,7 @@ import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.CheckBox
 import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.CleaningServices
 import androidx.compose.material.icons.filled.Close
@@ -61,6 +62,7 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Edit
@@ -72,6 +74,7 @@ import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
@@ -89,6 +92,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
@@ -100,6 +104,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -128,6 +133,10 @@ import com.example.GlassCard
 import com.example.InfoRow
 import com.example.formatBytes
 import com.example.queryDeviceStorageTotals
+import com.example.service.FileShredder
+import com.example.service.PreferencesBackupManager
+import com.example.service.ShredStandard
+import com.example.service.ShredTarget
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
 import com.example.ui.theme.AuraOrange
@@ -176,6 +185,7 @@ private data class FileClipboard(
     val operation: ClipboardOperation
 )
 
+@Suppress("DEPRECATION")
 private fun checkUsageStatsPermission(context: Context): Boolean {
     val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
     val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -257,11 +267,19 @@ fun FilesScreen() {
     var showCreateFolderDialog by remember { mutableStateOf(false) }
     var newFolderName by remember { mutableStateOf("") }
     var showDeleteConfirm by remember { mutableStateOf(false) }
+    var deleteWithShredder by remember { mutableStateOf(false) }
+    var selectedShredStandard by remember { mutableStateOf(ShredStandard.DOD_5220_22_M) }
+    var isDeletingOrShredding by remember { mutableStateOf(false) }
+    var shredProgress by remember { mutableFloatStateOf(0f) }
+    var shredStatusText by remember { mutableStateOf("") }
 
     fun toggleStar(path: String) {
         val updated = if (path in starredPaths) starredPaths - path else starredPaths + path
         starredPaths = updated
-        bookmarkPrefs.edit().putStringSet("starred_paths", updated).apply()
+        bookmarkPrefs.edit().putStringSet("starred_paths", updated).commit()
+        coroutineScope.launch(Dispatchers.IO) {
+            PreferencesBackupManager.saveMirrorSnapshot(context)
+        }
     }
 
     BackHandler(enabled = activeSubTab == "FOLDER_BROWSER" && (selectedPaths.isNotEmpty() || currentDir.absolutePath != rootDir.absolutePath)) {
@@ -504,43 +522,186 @@ fun FilesScreen() {
         )
     }
 
-    // Delete Confirmation Dialog
+    // Dual Delete / Shredder Confirmation Dialog
     if (showDeleteConfirm && selectedPaths.isNotEmpty()) {
         AlertDialog(
-            onDismissRequest = { showDeleteConfirm = false },
+            onDismissRequest = { if (!isDeletingOrShredding) showDeleteConfirm = false },
             containerColor = GlassPanel,
-            title = { Text("Delete ${selectedPaths.size} Item(s)?", color = AuraRose, fontWeight = FontWeight.Bold) },
-            text = { Text("This cannot be undone.", color = TextSecondary) },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showDeleteConfirm = false
-                        coroutineScope.launch {
-                            val deletedCount = withContext(Dispatchers.IO) {
-                                var count = 0
-                                selectedPaths.forEach { path ->
-                                    val f = File(path)
-                                    val ok = try {
-                                        if (f.isDirectory) f.deleteRecursively() else f.delete()
-                                    } catch (_: Exception) {
-                                        false
-                                    }
-                                    if (ok) count++
-                                }
-                                count
+            title = {
+                Text(
+                    text = if (deleteWithShredder) "Shred ${selectedPaths.size} Item(s)?" else "Delete ${selectedPaths.size} Item(s)?",
+                    color = if (deleteWithShredder) AuraRose else TextPrimary,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                if (isDeletingOrShredding) {
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            shredStatusText.ifBlank { "Overwriting blocks & cleaning metadata..." },
+                            color = TextSecondary,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        LinearProgressIndicator(
+                            progress = { shredProgress },
+                            color = AuraRose,
+                            trackColor = GlassBorder,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        // Mode Selector: Normal Delete vs Shredder Delete
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(if (!deleteWithShredder) AuraCyan.copy(alpha = 0.16f) else Obsidian.copy(alpha = 0.45f))
+                                    .border(1.dp, if (!deleteWithShredder) AuraCyan else GlassBorder, RoundedCornerShape(10.dp))
+                                    .clickable { deleteWithShredder = false }
+                                    .padding(vertical = 8.dp, horizontal = 10.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    "Normal Delete",
+                                    color = if (!deleteWithShredder) AuraCyan else TextSecondary,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                                )
                             }
-                            Toast.makeText(context, "Deleted $deletedCount item(s)", Toast.LENGTH_SHORT).show()
-                            selectedPaths = emptySet()
-                            refreshTrigger++
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(if (deleteWithShredder) AuraRose.copy(alpha = 0.16f) else Obsidian.copy(alpha = 0.45f))
+                                    .border(1.dp, if (deleteWithShredder) AuraRose else GlassBorder, RoundedCornerShape(10.dp))
+                                    .clickable { deleteWithShredder = true }
+                                    .padding(vertical = 8.dp, horizontal = 10.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    "Shred Forever",
+                                    color = if (deleteWithShredder) AuraRose else TextSecondary,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                                )
+                            }
+                        }
+
+                        if (!deleteWithShredder) {
+                            Text(
+                                "Fast standard OS removal (unlinks file immediately). Cannot be undone.",
+                                color = TextSecondary,
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        } else {
+                            ShredStandard.entries.forEach { std ->
+                                val selected = selectedShredStandard == std
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(if (selected) AuraRose.copy(alpha = 0.12f) else Obsidian.copy(alpha = 0.4f))
+                                        .border(1.dp, if (selected) AuraRose else GlassBorder, RoundedCornerShape(10.dp))
+                                        .clickable { selectedShredStandard = std }
+                                        .padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = if (selected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
+                                        contentDescription = std.title,
+                                        tint = if (selected) AuraRose else TextTertiary,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column {
+                                        Text(
+                                            std.title,
+                                            color = if (selected) AuraRose else TextPrimary,
+                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                                        )
+                                        Text(
+                                            std.subtitle,
+                                            color = TextTertiary,
+                                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp)
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
-                ) {
-                    Text("DELETE", color = AuraRose, fontWeight = FontWeight.Bold)
+                }
+            },
+            confirmButton = {
+                if (!isDeletingOrShredding) {
+                    Button(
+                        onClick = {
+                            if (!deleteWithShredder) {
+                                showDeleteConfirm = false
+                                coroutineScope.launch {
+                                    val deletedCount = withContext(Dispatchers.IO) {
+                                        var count = 0
+                                        selectedPaths.forEach { path ->
+                                            if (FileShredder.normalDeleteFile(context, File(path))) {
+                                                count++
+                                            }
+                                        }
+                                        count
+                                    }
+                                    Toast.makeText(context, "Deleted $deletedCount item(s)", Toast.LENGTH_SHORT).show()
+                                    selectedPaths = emptySet()
+                                    refreshTrigger++
+                                }
+                            } else {
+                                isDeletingOrShredding = true
+                                shredProgress = 0f
+                                shredStatusText = "Starting ${selectedShredStandard.title}..."
+                                val targets = selectedPaths.map { ShredTarget(File(it)) }
+                                coroutineScope.launch {
+                                    val res = withContext(Dispatchers.IO) {
+                                        FileShredder.shredTargets(
+                                            context = context,
+                                            targets = targets,
+                                            standard = selectedShredStandard
+                                        ) { done, total, status ->
+                                            shredProgress = done.toFloat() / total.toFloat()
+                                            shredStatusText = status
+                                        }
+                                    }
+                                    isDeletingOrShredding = false
+                                    showDeleteConfirm = false
+                                    val msg = when {
+                                        res.blockedForOverwrite.isNotEmpty() ->
+                                            "Shredded ${res.shreddedCount}; ${res.blockedForOverwrite.size} blocked without write permission"
+                                        else ->
+                                            "Shredded ${res.shreddedCount} file(s) (${formatBytes(res.totalBytesWiped)})"
+                                    }
+                                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                                    selectedPaths = emptySet()
+                                    refreshTrigger++
+                                }
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (deleteWithShredder) AuraRose else AuraCyan
+                        )
+                    ) {
+                        Text(
+                            if (deleteWithShredder) "SHRED FOREVER" else "DELETE",
+                            color = if (deleteWithShredder) Color.White else Obsidian,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showDeleteConfirm = false }) {
-                    Text("CANCEL", color = TextSecondary)
+                if (!isDeletingOrShredding) {
+                    TextButton(onClick = { showDeleteConfirm = false }) {
+                        Text("CANCEL", color = TextSecondary)
+                    }
                 }
             }
         )
@@ -658,9 +819,16 @@ fun FilesScreen() {
                         itemForMenu = null
                         itemForDetails = target
                     }
-                    SimpleSheetAction(Icons.Default.Delete, "Delete", AuraRose) {
+                    SimpleSheetAction(Icons.Default.Delete, "Delete", TextSecondary) {
                         itemForMenu = null
                         selectedPaths = setOf(path)
+                        deleteWithShredder = false
+                        showDeleteConfirm = true
+                    }
+                    SimpleSheetAction(Icons.Default.DeleteForever, "Shred", AuraRose) {
+                        itemForMenu = null
+                        selectedPaths = setOf(path)
+                        deleteWithShredder = true
                         showDeleteConfirm = true
                     }
                 }
@@ -1271,7 +1439,12 @@ fun FilesScreen() {
                                     refreshTrigger++
                                 }
                             }
-                            MiniBarAction(Icons.Default.Delete, "Delete", AuraRose) {
+                            MiniBarAction(Icons.Default.Delete, "Delete", TextSecondary) {
+                                deleteWithShredder = false
+                                showDeleteConfirm = true
+                            }
+                            MiniBarAction(Icons.Default.DeleteForever, "Shred", AuraRose) {
+                                deleteWithShredder = true
                                 showDeleteConfirm = true
                             }
                             IconButton(onClick = { selectedPaths = emptySet() }, modifier = Modifier.size(28.dp)) {

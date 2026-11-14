@@ -33,6 +33,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ManageSearch
 import androidx.compose.material.icons.filled.AccessibilityNew
 import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.Alarm
@@ -64,7 +65,6 @@ import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Link
-import androidx.compose.material.icons.filled.ManageSearch
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Nfc
 import androidx.compose.material.icons.filled.Notifications
@@ -1434,7 +1434,7 @@ internal fun buildHiddenSettingsCatalog(context: Context): List<HiddenSettingIte
             title = "Search & Personal Dictionary",
             subtitle = "System search & shortcuts",
             category = HiddenSettingCategory.DEVELOPER,
-            icon = Icons.Default.ManageSearch,
+            icon = Icons.AutoMirrored.Filled.ManageSearch,
             targets = listOf(
                 HiddenSettingTarget(action = Settings.ACTION_SEARCH_SETTINGS),
                 HiddenSettingTarget(action = Settings.ACTION_USER_DICTIONARY_SETTINGS)

@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -11,13 +12,13 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
-import androidx.compose.ui.graphics.toArgb
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.example.data.AppDatabase
 import com.example.data.ThermalRecord
 import com.example.data.ThermalRepository
+import com.example.ui.screens.GuardRulesActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -50,10 +51,11 @@ class ThermalTrackerService : Service() {
         thermalMonitor.startMonitoring()
 
         liveGuardMonitor = LiveGuardMonitor.getInstance(this)
-        liveGuardMonitor.onHighPriorityAlert = { title, message ->
+        liveGuardMonitor.onHighPriorityAlert = null
+        liveGuardMonitor.onGuardAlert = { payload ->
             val prefs = getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
             if (prefs.getBoolean("live_guard_alerts", true)) {
-                sendGuardNotification(title, message)
+                sendGuardNotification(payload)
             }
         }
         liveGuardMonitor.startMonitoring()
@@ -139,75 +141,10 @@ class ThermalTrackerService : Service() {
         }
     }
 
-    private suspend fun updateWidget(temp: Float) {
-        val appWidgetManager = android.appwidget.AppWidgetManager.getInstance(this)
-        val componentName = android.content.ComponentName(this, ThermalWidgetProvider::class.java)
-        val appWidgetIds = appWidgetManager.getAppWidgetIds(componentName)
-        if (appWidgetIds.isEmpty()) return
-
+    private suspend fun updateWidget(@Suppress("UNUSED_PARAMETER") temp: Float) {
         val oneHourAgo = System.currentTimeMillis() - (60 * 60 * 1000L)
         val recentRecords = repository.getRecordsSinceSync(oneHourAgo)
-
-        val views = android.widget.RemoteViews(packageName, com.example.R.layout.widget_thermal)
-        views.setTextViewText(com.example.R.id.widget_temp_text, "${String.format(Locale.US, "%.1f", temp)}°C")
-
-        val prefs = getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
-        val warningTemp = prefs.getFloat("warning_temp", 35f)
-        val criticalTemp = warningTemp + 5f
-
-        val color = when {
-            temp >= criticalTemp -> com.example.ui.theme.AuraRose.toArgb()
-            temp >= warningTemp -> com.example.ui.theme.AuraOrange.toArgb()
-            temp >= 20f -> com.example.ui.theme.AuraGreen.toArgb()
-            else -> com.example.ui.theme.AuraCyan.toArgb()
-        }
-        views.setTextColor(com.example.R.id.widget_temp_text, color)
-
-        if (recentRecords.size >= 2) {
-            val bitmap = createSparklineBitmap(recentRecords, color)
-            views.setImageViewBitmap(com.example.R.id.widget_sparkline, bitmap)
-        }
-
-        appWidgetManager.updateAppWidget(appWidgetIds, views)
-    }
-
-    private fun createSparklineBitmap(records: List<ThermalRecord>, lineColor: Int): android.graphics.Bitmap {
-        val width = 400
-        val height = 150
-        val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
-        val canvas = android.graphics.Canvas(bitmap)
-
-        val minTemp = records.minOf { it.batteryTemp } - 2f
-        val maxTemp = records.maxOf { it.batteryTemp } + 2f
-        val timeStart = records.first().timestamp
-        val timeRange = records.last().timestamp - timeStart
-        val tempRange = (maxTemp - minTemp).coerceAtLeast(1f)
-
-        val path = android.graphics.Path()
-        var firstPoint = true
-
-        records.forEach { record ->
-            val x = if (timeRange == 0L) 0f else ((record.timestamp - timeStart).toFloat() / timeRange) * width
-            val y = height - (((record.batteryTemp - minTemp) / tempRange) * height)
-            if (firstPoint) {
-                path.moveTo(x, y)
-                firstPoint = false
-            } else {
-                path.lineTo(x, y)
-            }
-        }
-
-        val paint = android.graphics.Paint().apply {
-            color = lineColor
-            style = android.graphics.Paint.Style.STROKE
-            strokeWidth = 6f
-            isAntiAlias = true
-            strokeJoin = android.graphics.Paint.Join.ROUND
-            strokeCap = android.graphics.Paint.Cap.ROUND
-        }
-
-        canvas.drawPath(path, paint)
-        return bitmap
+        ThermalWidgetProvider.updateAllWidgets(this, recentRecords = recentRecords)
     }
 
     private fun checkThermalAlerts(temp: Float) {
@@ -254,22 +191,64 @@ class ThermalTrackerService : Service() {
         notificationManager.notify(ALERT_NOTIFICATION_ID, alertNotification)
     }
 
-    private fun sendGuardNotification(title: String, message: String) {
+    private fun sendGuardNotification(payload: GuardAlertPayload) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             return
         }
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val guardNotification = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
-            .setContentTitle(title)
-            .setContentText(message)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(message))
+
+        val rulesIntent = Intent(this, GuardRulesActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+        val contentPi = PendingIntent.getActivity(
+            this,
+            3001,
+            rulesIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val snoozeIntent = Intent(this, GuardAlertActionReceiver::class.java).apply {
+            action = GuardAlertActionReceiver.ACTION_SNOOZE_1H
+            putExtra(GuardAlertActionReceiver.EXTRA_PACKAGE_NAME, payload.packageName)
+            putExtra(GuardAlertActionReceiver.EXTRA_SENSOR_TYPE, payload.sensorType.name)
+            putExtra(GuardAlertActionReceiver.EXTRA_NOTIFICATION_ID, GUARD_ALERT_NOTIFICATION_ID)
+        }
+        val snoozePi = PendingIntent.getBroadcast(
+            this,
+            3002 + (payload.packageName?.hashCode() ?: payload.sensorType.ordinal),
+            snoozeIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val builder = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
+            .setContentTitle(payload.title)
+            .setContentText(payload.message)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(payload.message))
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
-            .build()
-        notificationManager.notify(GUARD_ALERT_NOTIFICATION_ID, guardNotification)
+            .setContentIntent(contentPi)
+            .addAction(0, "Snooze 1h", snoozePi)
+
+        if (!payload.packageName.isNullOrBlank()) {
+            val trustIntent = Intent(this, GuardAlertActionReceiver::class.java).apply {
+                action = GuardAlertActionReceiver.ACTION_TRUST_APP
+                putExtra(GuardAlertActionReceiver.EXTRA_PACKAGE_NAME, payload.packageName)
+                putExtra(GuardAlertActionReceiver.EXTRA_SENSOR_TYPE, payload.sensorType.name)
+                putExtra(GuardAlertActionReceiver.EXTRA_NOTIFICATION_ID, GUARD_ALERT_NOTIFICATION_ID)
+            }
+            val trustPi = PendingIntent.getBroadcast(
+                this,
+                3100 + payload.packageName.hashCode(),
+                trustIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            builder.addAction(0, "Trust App", trustPi)
+        }
+
+        notificationManager.notify(GUARD_ALERT_NOTIFICATION_ID, builder.build())
     }
 
     private fun createNotification(content: String): Notification {

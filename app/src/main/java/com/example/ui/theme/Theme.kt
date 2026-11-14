@@ -16,6 +16,10 @@ fun AppTheme(
     content: @Composable () -> Unit
 ) {
     val context = LocalContext.current
+    androidx.compose.runtime.remember(context) {
+        ThemeState.loadFromPrefs(context)
+        true
+    }
     LaunchedEffect(Unit) {
         ThemeState.loadFromPrefs(context)
     }

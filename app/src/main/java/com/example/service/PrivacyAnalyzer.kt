@@ -485,6 +485,12 @@ object PrivacyAnalyzer {
     fun peekCachedTimeline(includeSystemApps: Boolean = false): List<PermissionAccessEvent>? =
         if (includeSystemApps) cachedTimelineSystem else cachedTimelineUser
 
+    fun invalidateTimelineCache() {
+        cachedTimelineUser = null
+        cachedTimelineSystem = null
+        cachedTimelineTimeMs = 0L
+    }
+
     fun peekCachedChanges(): List<PrivacyChangeEvent>? = cachedChangeEvents
 
     fun analyzeDevicePrivacy(
@@ -526,7 +532,7 @@ object PrivacyAnalyzer {
             "com.samsung.android.app.omcagent",
             "com.xiaomi.market",
             "com.xiaomi.discover",
-            "com.miui.packageinstaller",
+            "com.xiaomi.mipicks",
             "com.miui.securitycenter",
             "com.miui.cloudbackup",
             "com.miui.backup",
@@ -603,8 +609,13 @@ object PrivacyAnalyzer {
                 }
             }
 
-            val installer = getInstallerPackage(pm, pkgInfo.packageName)
-            val isSideloaded = !isSystem && !isBrandOem && (installer == null || installer !in trustedStoreInstallers)
+            val installDetails = getInstallOriginDetails(pm, pkgInfo.packageName)
+            val installer = installDetails.installerPackage
+            val isSideloaded = !isSystem && !isBrandOem && (
+                installDetails.isExplicitLocalOrDownloadedSource ||
+                    installer == null ||
+                    installer !in trustedStoreInstallers
+                )
 
             val lastUsed = usageMap[pkgInfo.packageName] ?: 0L
             val isUnusedRecently = lastUsed in 1L until (now - sevenDaysMs)
@@ -1032,6 +1043,7 @@ object PrivacyAnalyzer {
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun checkAppOpAllowed(
         appOps: AppOpsManager,
         op: String,
@@ -1061,16 +1073,30 @@ object PrivacyAnalyzer {
         return perm in reqPerms
     }
 
-    private fun getInstallerPackage(pm: PackageManager, packageName: String): String? {
+    private data class InstallOriginDetails(
+        val installerPackage: String?,
+        val isExplicitLocalOrDownloadedSource: Boolean
+    )
+
+    private fun getInstallOriginDetails(pm: PackageManager, packageName: String): InstallOriginDetails {
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                pm.getInstallSourceInfo(packageName).installingPackageName
+                val info = pm.getInstallSourceInfo(packageName)
+                val installerPkg = info.installingPackageName ?: info.initiatingPackageName
+                val isLocalSource = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    val src = info.packageSource
+                    src == android.content.pm.PackageInstaller.PACKAGE_SOURCE_LOCAL_FILE ||
+                        src == android.content.pm.PackageInstaller.PACKAGE_SOURCE_DOWNLOADED_FILE
+                } else {
+                    false
+                }
+                InstallOriginDetails(installerPkg, isLocalSource)
             } else {
                 @Suppress("DEPRECATION")
-                pm.getInstallerPackageName(packageName)
+                InstallOriginDetails(pm.getInstallerPackageName(packageName), false)
             }
         } catch (_: Exception) {
-            null
+            InstallOriginDetails(null, false)
         }
     }
 
@@ -1080,16 +1106,21 @@ object PrivacyAnalyzer {
         return when (installerPkg) {
             "com.android.vending", "com.google.android.feedback" -> "Play Store"
             "com.sec.android.app.samsungapps", "com.samsung.android.app.omcagent" -> "Galaxy Store"
-            "com.xiaomi.market", "com.xiaomi.discover", "com.miui.packageinstaller", "com.android.updater" -> "Xiaomi Store"
+            "com.xiaomi.market", "com.xiaomi.discover", "com.xiaomi.mipicks", "com.android.updater" -> "Xiaomi Store"
             "com.heytap.market", "com.oppo.market" -> "App Market"
             "com.vivo.appstore", "com.bbk.appstore" -> "V-Appstore"
             "com.huawei.appmarket" -> "AppGallery"
-            "com.google.android.packageinstaller", "com.android.packageinstaller" -> "APK Installer"
+            "com.google.android.packageinstaller",
+            "com.android.packageinstaller",
+            "com.miui.packageinstaller",
+            "com.samsung.android.packageinstaller",
+            "com.oplus.appdetail" -> "APK Installer"
             null -> "Sideloaded APK"
             else -> installerPkg
         }
     }
 
+    @Suppress("DEPRECATION")
     fun hasUsageStatsPermission(context: Context): Boolean {
         return try {
             val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
@@ -1105,60 +1136,59 @@ object PrivacyAnalyzer {
         }
     }
 
+    private val clipboardTimelineInfo = PlainPermissionInfo(
+        permissionName = "SPECIAL_CLIPBOARD_READ",
+        permissionGroup = "SPECIAL_CLIPBOARD",
+        shortTag = "Clipboard",
+        friendlyTitle = "Read Clipboard",
+        simpleExplanation = "Read text or links copied to your clipboard.",
+        whyItMatters = "Background clipboard reads can capture copied passwords or 2FA codes.",
+        riskLevel = PermissionRiskLevel.HIGH,
+        category = PermissionCategory.SPECIAL_ACCESS
+    )
+
+    private val screenCaptureTimelineInfo = PlainPermissionInfo(
+        permissionName = "SPECIAL_SCREEN_CAPTURE",
+        permissionGroup = "SPECIAL_SCREEN",
+        shortTag = "Screen Rec",
+        friendlyTitle = "Screen Recording",
+        simpleExplanation = "Captured or mirrored your screen display.",
+        whyItMatters = "Verify that screen recording or casting was started by you.",
+        riskLevel = PermissionRiskLevel.CRITICAL,
+        category = PermissionCategory.SPECIAL_ACCESS
+    )
+
     fun getPermissionAccessTimeline(
         context: Context,
         includeSystemApps: Boolean = false
     ): List<PermissionAccessEvent> {
         val summary = analyzeDevicePrivacy(context, includeSystemApps = includeSystemApps)
-        val reports = summary.appReports.filter { it.grantedPermissions.isNotEmpty() }
         val appOpsTimes = queryAppOpsLastAccessMap(context)
-        val sessionTimes = queryRecentUsageSessionsMap(context)
         val pm = context.packageManager
+        val guardMonitor = LiveGuardMonitor.getInstance(context)
+        val ignored = guardMonitor.ignoredPackages.value
+        val now = System.currentTimeMillis()
 
         val timeline = mutableListOf<PermissionAccessEvent>()
 
-        for (app in reports) {
-            val pkgOps = appOpsTimes[app.packageName] ?: emptyMap()
-            val (lastFgTime, lastSvcTime) = sessionTimes[app.packageName] ?: (app.lastTimeUsedMs to 0L)
-            val fallbackInstallTime = try {
-                pm.getPackageInfo(app.packageName, 0).lastUpdateTime
-            } catch (_: Exception) {
-                0L
+        // 1. Verified OS AppOps last-access timestamps ONLY (never guessed from app open, background service, or install time)
+        for (app in summary.appReports) {
+            if (app.packageName in ignored) continue
+            val pkgOps = appOpsTimes[app.packageName] ?: continue
+            if (pkgOps.isEmpty()) continue
+
+            val candidates = buildList {
+                addAll(app.grantedPermissions)
+                if (pkgOps.containsKey("SPECIAL_CLIPBOARD_READ")) add(clipboardTimelineInfo)
+                if (pkgOps.containsKey("SPECIAL_SCREEN_CAPTURE")) add(screenCaptureTimelineInfo)
             }
 
-            // Show up to the most important sensitive permissions per app with their exact access timestamps
-            for (perm in app.grantedPermissions) {
+            for (perm in candidates) {
                 val appOpTime = pkgOps[perm.permissionName] ?: 0L
-                val bestTimestamp: Long
-                val contextLabel: String
-
-                when {
-                    appOpTime > 0L -> {
-                        bestTimestamp = appOpTime
-                        contextLabel = "System AppOps"
-                    }
-                    lastSvcTime > 0L && lastSvcTime >= lastFgTime -> {
-                        bestTimestamp = lastSvcTime
-                        contextLabel = "Background service"
-                    }
-                    lastFgTime > 0L -> {
-                        bestTimestamp = lastFgTime
-                        contextLabel = "Foreground session"
-                    }
-                    app.lastTimeUsedMs > 0L -> {
-                        bestTimestamp = app.lastTimeUsedMs
-                        contextLabel = "Recent session"
-                    }
-                    else -> {
-                        bestTimestamp = fallbackInstallTime
-                        contextLabel = "Granted on install"
-                    }
-                }
-
-                if (bestTimestamp > 0L) {
+                if (appOpTime in 1L..now) {
                     timeline.add(
                         PermissionAccessEvent(
-                            id = "${app.packageName}_${perm.permissionName}",
+                            id = "appops_${app.packageName}_${perm.permissionName}_$appOpTime",
                             packageName = app.packageName,
                             appName = app.appName,
                             icon = app.icon,
@@ -1166,12 +1196,89 @@ object PrivacyAnalyzer {
                             shortTag = perm.shortTag,
                             category = perm.category,
                             riskLevel = perm.riskLevel,
-                            timestamp = bestTimestamp,
-                            accessContext = contextLabel,
+                            timestamp = appOpTime,
+                            accessContext = "Verified AppOps",
                             permissionInfo = perm
                         )
                     )
                 }
+            }
+        }
+
+        // 2. Real-time hardware & OS events genuinely observed by LiveGuardMonitor
+        val sensorEvents = guardMonitor.events.value.filter { ev ->
+            ev.type in setOf("MIC", "CAMERA", "LOCATION", "CLIPBOARD", "SCREEN") &&
+                !ev.title.contains("Guard Test", ignoreCase = true)
+        }
+
+        for (ev in sensorEvents) {
+            val pkg = ev.packageName
+            if (pkg != null && pkg in ignored) continue
+
+            val permInfo = when (ev.type) {
+                "MIC" -> permissionCatalog[Manifest.permission.RECORD_AUDIO]
+                "CAMERA" -> permissionCatalog[Manifest.permission.CAMERA]
+                "LOCATION" -> permissionCatalog[Manifest.permission.ACCESS_FINE_LOCATION]
+                "CLIPBOARD" -> clipboardTimelineInfo
+                "SCREEN" -> screenCaptureTimelineInfo
+                else -> null
+            } ?: continue
+
+            var resolvedPkg = "system.sensor"
+            var resolvedName = when (ev.type) {
+                "MIC" -> "Microphone Hardware"
+                "CAMERA" -> "Camera Hardware"
+                "SCREEN" -> "Screen Capture"
+                else -> ev.title
+            }
+            var resolvedIcon: Drawable = context.applicationInfo.loadIcon(pm)
+
+            if (!pkg.isNullOrBlank()) {
+                val appInfo = try {
+                    pm.getApplicationInfo(pkg, 0)
+                } catch (_: Exception) {
+                    null
+                }
+                if (appInfo != null) {
+                    val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0 ||
+                        (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+                    if (isSystem && !includeSystemApps) continue
+                    resolvedPkg = pkg
+                    resolvedName = try {
+                        pm.getApplicationLabel(appInfo).toString()
+                    } catch (_: Exception) {
+                        pkg
+                    }
+                    resolvedIcon = try {
+                        pm.getApplicationIcon(appInfo)
+                    } catch (_: Exception) {
+                        context.applicationInfo.loadIcon(pm)
+                    }
+                }
+            }
+
+            // Avoid duplicate entry if AppOps already logged the exact same app & permission within 60 seconds
+            val duplicateNearby = timeline.any { existing ->
+                existing.packageName == resolvedPkg &&
+                    existing.permissionInfo.permissionName == permInfo.permissionName &&
+                    kotlin.math.abs(existing.timestamp - ev.timestamp) < 60_000L
+            }
+            if (!duplicateNearby) {
+                timeline.add(
+                    PermissionAccessEvent(
+                        id = "guard_${ev.id}_${permInfo.permissionName}",
+                        packageName = resolvedPkg,
+                        appName = resolvedName,
+                        icon = resolvedIcon,
+                        permissionTitle = permInfo.friendlyTitle,
+                        shortTag = permInfo.shortTag,
+                        category = permInfo.category,
+                        riskLevel = permInfo.riskLevel,
+                        timestamp = ev.timestamp,
+                        accessContext = if (resolvedPkg == "system.sensor") "Hardware Sensor" else "Live Sensor",
+                        permissionInfo = permInfo
+                    )
+                )
             }
         }
 
@@ -1188,48 +1295,9 @@ object PrivacyAnalyzer {
         return sortedTimeline
     }
 
-    private fun queryRecentUsageSessionsMap(context: Context): Map<String, Pair<Long, Long>> {
-        val result = mutableMapOf<String, Pair<Long, Long>>()
-        try {
-            val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
-            val end = System.currentTimeMillis()
-            val start = end - (7L * 24 * 60 * 60 * 1000L)
-
-            // 1. Base usage stats (lastTimeUsed + lastTimeForegroundServiceUsed)
-            val stats = usm.queryUsageStats(UsageStatsManager.INTERVAL_WEEKLY, start, end)
-            stats?.forEach { st ->
-                val fg = st.lastTimeUsed
-                val svc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    st.lastTimeForegroundServiceUsed
-                } else 0L
-                val existing = result[st.packageName]
-                result[st.packageName] = maxOf(existing?.first ?: 0L, fg) to maxOf(existing?.second ?: 0L, svc)
-            }
-
-            // 2. Exact event stream from last 24 hours
-            val events = usm.queryEvents(end - (24L * 60 * 60 * 1000L), end)
-            val event = android.app.usage.UsageEvents.Event()
-            while (events != null && events.hasNextEvent()) {
-                events.getNextEvent(event)
-                val pkg = event.packageName ?: continue
-                val ts = event.timeStamp
-                val cur = result[pkg] ?: (0L to 0L)
-                when (event.eventType) {
-                    android.app.usage.UsageEvents.Event.ACTIVITY_RESUMED -> {
-                        if (ts > cur.first) result[pkg] = ts to cur.second
-                    }
-                    android.app.usage.UsageEvents.Event.FOREGROUND_SERVICE_START -> {
-                        if (ts > cur.second) result[pkg] = cur.first to ts
-                    }
-                }
-            }
-        } catch (_: Exception) {
-        }
-        return result
-    }
-
     private fun queryAppOpsLastAccessMap(context: Context): Map<String, Map<String, Long>> {
         val map = mutableMapOf<String, MutableMap<String, Long>>()
+        val now = System.currentTimeMillis()
         try {
             val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
             val getPackagesForOps = appOps.javaClass.getMethod("getPackagesForOps", IntArray::class.java)
@@ -1249,30 +1317,39 @@ object PrivacyAnalyzer {
                         null
                     } ?: continue
 
+                    // Use getLastAccessTime ONLY (never getTime(), which can reflect op-grant/mode-change time)
                     val lastTime = try {
                         val m = opEntry.javaClass.getMethod("getLastAccessTime", Int::class.javaPrimitiveType)
                         (m.invoke(opEntry, 0x1f) as? Long) ?: 0L
                     } catch (_: Exception) {
-                        try {
-                            val m2 = opEntry.javaClass.getMethod("getTime")
-                            (m2.invoke(opEntry) as? Long) ?: 0L
-                        } catch (_: Exception) {
-                            0L
-                        }
+                        0L
                     }
 
-                    if (lastTime > 0L) {
+                    if (lastTime in 1L..(now + 60_000L)) {
                         val mappedPerm = when (opStr) {
-                            AppOpsManager.OPSTR_CAMERA -> Manifest.permission.CAMERA
-                            AppOpsManager.OPSTR_RECORD_AUDIO -> Manifest.permission.RECORD_AUDIO
-                            AppOpsManager.OPSTR_FINE_LOCATION -> Manifest.permission.ACCESS_FINE_LOCATION
-                            AppOpsManager.OPSTR_COARSE_LOCATION -> Manifest.permission.ACCESS_COARSE_LOCATION
-                            AppOpsManager.OPSTR_READ_CONTACTS -> Manifest.permission.READ_CONTACTS
-                            AppOpsManager.OPSTR_READ_SMS -> Manifest.permission.READ_SMS
-                            AppOpsManager.OPSTR_READ_CALL_LOG -> Manifest.permission.READ_CALL_LOG
-                            AppOpsManager.OPSTR_READ_PHONE_STATE -> Manifest.permission.READ_PHONE_STATE
-                            AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW -> Manifest.permission.SYSTEM_ALERT_WINDOW
-                            AppOpsManager.OPSTR_READ_EXTERNAL_STORAGE -> Manifest.permission.READ_EXTERNAL_STORAGE
+                            AppOpsManager.OPSTR_CAMERA, "android:camera" -> Manifest.permission.CAMERA
+                            AppOpsManager.OPSTR_RECORD_AUDIO, "android:record_audio" -> Manifest.permission.RECORD_AUDIO
+                            AppOpsManager.OPSTR_FINE_LOCATION,
+                            "android:fine_location",
+                            "android:monitor_location",
+                            "android:monitor_location_high_power" -> Manifest.permission.ACCESS_FINE_LOCATION
+                            AppOpsManager.OPSTR_COARSE_LOCATION, "android:coarse_location" -> Manifest.permission.ACCESS_COARSE_LOCATION
+                            AppOpsManager.OPSTR_READ_CONTACTS, "android:read_contacts" -> Manifest.permission.READ_CONTACTS
+                            AppOpsManager.OPSTR_READ_SMS, "android:read_sms" -> Manifest.permission.READ_SMS
+                            "android:receive_sms" -> Manifest.permission.RECEIVE_SMS
+                            "android:send_sms" -> Manifest.permission.SEND_SMS
+                            AppOpsManager.OPSTR_READ_CALL_LOG, "android:read_call_log" -> Manifest.permission.READ_CALL_LOG
+                            AppOpsManager.OPSTR_READ_PHONE_STATE, "android:read_phone_state" -> Manifest.permission.READ_PHONE_STATE
+                            AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW, "android:system_alert_window" -> Manifest.permission.SYSTEM_ALERT_WINDOW
+                            AppOpsManager.OPSTR_READ_EXTERNAL_STORAGE, "android:read_external_storage" -> Manifest.permission.READ_EXTERNAL_STORAGE
+                            "android:write_external_storage" -> Manifest.permission.WRITE_EXTERNAL_STORAGE
+                            "android:read_media_images" -> Manifest.permission.READ_MEDIA_IMAGES
+                            "android:read_media_video" -> Manifest.permission.READ_MEDIA_VIDEO
+                            "android:manage_external_storage" -> Manifest.permission.MANAGE_EXTERNAL_STORAGE
+                            "android:request_install_packages" -> Manifest.permission.REQUEST_INSTALL_PACKAGES
+                            AppOpsManager.OPSTR_GET_USAGE_STATS, "android:get_usage_stats" -> Manifest.permission.PACKAGE_USAGE_STATS
+                            "android:read_clipboard" -> "SPECIAL_CLIPBOARD_READ"
+                            "android:project_media" -> "SPECIAL_SCREEN_CAPTURE"
                             else -> null
                         }
                         if (mappedPerm != null) {

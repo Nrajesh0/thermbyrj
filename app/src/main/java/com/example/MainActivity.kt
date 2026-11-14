@@ -59,11 +59,11 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Shield
-import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Shield
-import androidx.compose.material.icons.outlined.Speed
+import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -111,6 +111,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.service.LiveGuardMonitor
 import com.example.service.ThermalTrackerService
+import com.example.service.ThermalWidgetProvider
 import com.example.ui.screens.FilesScreen
 import com.example.ui.screens.LiveGuardScreen
 import com.example.ui.screens.PrivacyShieldScreen
@@ -128,12 +129,15 @@ import com.example.ui.theme.SurfacePreset
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import androidx.lifecycle.lifecycleScope
+import android.widget.Toast
+import com.example.service.PreferencesBackupManager
 import com.example.service.PrivacyAnalyzer
 import com.example.ui.theme.TextTertiary
 import com.example.ui.theme.ThemeState
 import com.example.viewmodel.ThermalViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Locale
 import kotlin.math.log10
 import kotlin.math.pow
@@ -144,6 +148,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        PreferencesBackupManager.autoRestoreIfCleared(this)
         val prefs = getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
         ThemeState.loadFromPrefs(this)
         if (prefs.getBoolean("background_monitoring", true)) {
@@ -202,16 +207,26 @@ fun MainScreen(viewModel: ThermalViewModel) {
     var hapticEnabled by remember { mutableStateOf(prefs.getBoolean("haptic_feedback", true)) }
     var bgMonitoringEnabled by remember { mutableStateOf(prefs.getBoolean("background_monitoring", true)) }
     var liveGuardAlertsEnabled by remember { mutableStateOf(prefs.getBoolean("live_guard_alerts", true)) }
+    val syncScope = rememberCoroutineScope()
 
     DisposableEffect(prefs) {
         val listener = SharedPreferences.OnSharedPreferenceChangeListener { sp, key ->
             when (key) {
-                "warning_temp" -> warningTemp = sp.getFloat("warning_temp", 35f)
+                "warning_temp" -> {
+                    warningTemp = sp.getFloat("warning_temp", 35f)
+                    ThermalWidgetProvider.updateAllWidgets(context)
+                }
                 "haptic_feedback" -> hapticEnabled = sp.getBoolean("haptic_feedback", true)
                 "background_monitoring" -> bgMonitoringEnabled = sp.getBoolean("background_monitoring", true)
                 "live_guard_alerts" -> liveGuardAlertsEnabled = sp.getBoolean("live_guard_alerts", true)
                 "theme_accent", "theme_surface", "ultra_minimal_cards", "ambient_glow" -> {
                     ThemeState.loadFromPrefs(context)
+                    ThermalWidgetProvider.updateAllWidgets(context)
+                }
+            }
+            if (key != null && key != "prefs_initialized") {
+                syncScope.launch(Dispatchers.IO) {
+                    PreferencesBackupManager.saveMirrorSnapshot(context)
                 }
             }
         }
@@ -242,7 +257,7 @@ fun MainScreen(viewModel: ThermalViewModel) {
             TabItem("Files", Icons.Filled.Folder, Icons.Outlined.Folder),
             TabItem("Privacy", Icons.Filled.Shield, Icons.Outlined.Shield),
             TabItem("Guard", Icons.Filled.Security, Icons.Outlined.Security),
-            TabItem("Vitals", Icons.Filled.Speed, Icons.Outlined.Speed)
+            TabItem("Tools", Icons.Filled.Tune, Icons.Outlined.Tune)
         )
     }
 
@@ -480,7 +495,40 @@ fun MorphingSettingsOrb(
 ) {
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
+    val scope = rememberCoroutineScope()
     var isExpanded by remember { mutableStateOf(false) }
+    var autoDocBackup by remember { mutableStateOf(prefs.getBoolean("auto_backup_documents", true)) }
+
+    val exportBackupLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri != null) {
+            scope.launch {
+                val ok = withContext(Dispatchers.IO) { PreferencesBackupManager.exportToUri(context, uri) }
+                Toast.makeText(
+                    context,
+                    if (ok) "Settings & Guard rules exported" else "Failed to export backup",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
+    val importBackupLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            scope.launch {
+                val ok = withContext(Dispatchers.IO) { PreferencesBackupManager.importFromUri(context, uri) }
+                if (ok) {
+                    autoDocBackup = prefs.getBoolean("auto_backup_documents", true)
+                    Toast.makeText(context, "Settings & Guard rules restored!", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(context, "Invalid backup file", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
 
     BackHandler(enabled = isExpanded) {
         isExpanded = false
@@ -600,7 +648,7 @@ fun MorphingSettingsOrb(
                                     .border(1.5.dp, if (selected) preset.color else GlassBorder, RoundedCornerShape(100.dp))
                                     .clickable {
                                         ThemeState.accentPreset = preset
-                                        prefs.edit().putString("theme_accent", preset.key).apply()
+                                        prefs.edit().putString("theme_accent", preset.key).commit()
                                     }
                                     .padding(horizontal = 12.dp, vertical = 8.dp),
                                 verticalAlignment = Alignment.CenterVertically
@@ -646,7 +694,7 @@ fun MorphingSettingsOrb(
                                     .border(1.5.dp, if (selected) AuraCyan else GlassBorder, RoundedCornerShape(12.dp))
                                     .clickable {
                                         ThemeState.surfacePreset = preset
-                                        prefs.edit().putString("theme_surface", preset.key).apply()
+                                        prefs.edit().putString("theme_surface", preset.key).commit()
                                     }
                                     .padding(horizontal = 12.dp, vertical = 10.dp),
                                 verticalAlignment = Alignment.CenterVertically
@@ -676,7 +724,7 @@ fun MorphingSettingsOrb(
                         checked = ThemeState.ultraMinimalCards,
                         onCheckedChange = { enabled ->
                             ThemeState.ultraMinimalCards = enabled
-                            prefs.edit().putBoolean("ultra_minimal_cards", enabled).apply()
+                            prefs.edit().putBoolean("ultra_minimal_cards", enabled).commit()
                         }
                     )
 
@@ -686,7 +734,7 @@ fun MorphingSettingsOrb(
                         checked = ThemeState.showAmbientGlow,
                         onCheckedChange = { enabled ->
                             ThemeState.showAmbientGlow = enabled
-                            prefs.edit().putBoolean("ambient_glow", enabled).apply()
+                            prefs.edit().putBoolean("ambient_glow", enabled).commit()
                         }
                     )
 
@@ -707,7 +755,7 @@ fun MorphingSettingsOrb(
                         subtitle = "Tactile feedback on navigation and controls",
                         checked = hapticEnabled,
                         onCheckedChange = { enabled ->
-                            prefs.edit().putBoolean("haptic_feedback", enabled).apply()
+                            prefs.edit().putBoolean("haptic_feedback", enabled).commit()
                             if (enabled) haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                         }
                     )
@@ -718,7 +766,7 @@ fun MorphingSettingsOrb(
                         checked = liveGuardAlertsEnabled,
                         onCheckedChange = { enabled ->
                             if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            prefs.edit().putBoolean("live_guard_alerts", enabled).apply()
+                            prefs.edit().putBoolean("live_guard_alerts", enabled).commit()
                         }
                     )
 
@@ -728,7 +776,7 @@ fun MorphingSettingsOrb(
                         checked = bgMonitoringEnabled,
                         onCheckedChange = { enabled ->
                             if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            prefs.edit().putBoolean("background_monitoring", enabled).apply()
+                            prefs.edit().putBoolean("background_monitoring", enabled).commit()
                             if (enabled) {
                                 startTrackingServiceSafely(context)
                             } else {
@@ -741,9 +789,78 @@ fun MorphingSettingsOrb(
                         title = "Warning Temp Limit",
                         value = warningTemp,
                         onValueChange = { newTemp ->
-                            prefs.edit().putFloat("warning_temp", newTemp).apply()
+                            prefs.edit().putFloat("warning_temp", newTemp).commit()
                         }
                     )
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    HorizontalDivider(color = GlassBorder)
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Text(
+                        "BACKUP & RESTORE SETTINGS",
+                        style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 3.sp, fontWeight = FontWeight.Bold),
+                        color = AuraCyan
+                    )
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    SettingsToggleRow(
+                        title = "Auto-Backup to Documents",
+                        subtitle = "Sync theme, rules & starred folders to Documents/dot (when All Files Access is granted)",
+                        checked = autoDocBackup,
+                        onCheckedChange = { enabled ->
+                            autoDocBackup = enabled
+                            prefs.edit().putBoolean("auto_backup_documents", enabled).commit()
+                        }
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("export_settings_button")
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(AuraCyan.copy(alpha = 0.14f))
+                                .border(1.dp, AuraCyan.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+                                .clickable {
+                                    exportBackupLauncher.launch("dot_settings_backup.json")
+                                }
+                                .padding(vertical = 12.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                "EXPORT JSON",
+                                color = AuraCyan,
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                            )
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("import_settings_button")
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(GlassPanel)
+                                .border(1.dp, GlassBorder, RoundedCornerShape(12.dp))
+                                .clickable {
+                                    importBackupLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                                }
+                                .padding(vertical = 12.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                "RESTORE JSON",
+                                color = TextPrimary,
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                            )
+                        }
+                    }
 
                     Spacer(modifier = Modifier.height(16.dp))
 

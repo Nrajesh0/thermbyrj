@@ -52,6 +52,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Contacts
+import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Folder
@@ -68,10 +69,12 @@ import androidx.compose.material.icons.filled.QueryStats
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.SdStorage
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Sms
 import androidx.compose.material.icons.filled.SystemUpdate
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
@@ -82,6 +85,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -154,6 +159,9 @@ fun LiveGuardScreen() {
     val guardMonitor = remember(context) { LiveGuardMonitor.getInstance(context) }
     val captureState by guardMonitor.captureState.collectAsStateWithLifecycle()
     val events by guardMonitor.events.collectAsStateWithLifecycle()
+    val ignoredPackages by guardMonitor.ignoredPackages.collectAsStateWithLifecycle()
+    val rulesConfig by guardMonitor.rulesConfig.collectAsStateWithLifecycle()
+    val activeSnoozes by guardMonitor.activeSnoozes.collectAsStateWithLifecycle()
 
     var activeSubTab by remember { mutableStateOf("CHECKS") } // "CHECKS", "TIMELINE", "LOG"
     var auditVectors by remember { mutableStateOf(guardMonitor.peekCachedAuditVectors() ?: emptyList()) }
@@ -184,9 +192,13 @@ fun LiveGuardScreen() {
 
     LaunchedEffect(
         refreshTrigger,
+        ignoredPackages,
+        events.firstOrNull()?.id,
         captureState.isScreenRecordingOrCasting,
         captureState.isMicActive,
-        captureState.isCameraActive
+        captureState.isCameraActive,
+        captureState.isBackgroundLocationActive,
+        captureState.isClipboardAccessedRecently
     ) {
         if (!isScanning) {
             withContext(Dispatchers.IO) {
@@ -263,6 +275,10 @@ fun LiveGuardScreen() {
                     } catch (_: Exception) {
                     }
                 },
+                onIgnoreApp = { pkg, appLabel ->
+                    guardMonitor.ignorePackage(pkg)
+                    Toast.makeText(context, "Ignored $appLabel in Live Guard", Toast.LENGTH_SHORT).show()
+                },
                 onClose = { selectedVector = null }
             )
         }
@@ -282,6 +298,8 @@ fun LiveGuardScreen() {
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
+            val activeRuleCount = ignoredPackages.size + activeSnoozes.size
+            val modeTint = if (activeSnoozes.isNotEmpty()) AuraOrange else AuraCyan
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = "LIVE GUARD",
@@ -289,11 +307,44 @@ fun LiveGuardScreen() {
                     color = if (captureState.isScreenRecordingOrCasting) AuraRose else AuraCyan
                 )
                 Text(
-                    text = "Sensors, Permission Timeline & Audit",
+                    text = when {
+                        activeSnoozes.isNotEmpty() -> "${rulesConfig.alertMode.title} • ${activeSnoozes.size} snoozed"
+                        else -> "${rulesConfig.alertMode.title} • Sensors & Timeline"
+                    },
                     style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary
+                    color = TextSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
+
+            Box(
+                modifier = Modifier
+                    .testTag("guard_rules_button")
+                    .clip(RoundedCornerShape(100.dp))
+                    .background(if (activeRuleCount > 0) modeTint.copy(alpha = 0.14f) else GlassPanel)
+                    .border(1.dp, if (activeRuleCount > 0) modeTint.copy(alpha = 0.4f) else GlassBorder, RoundedCornerShape(100.dp))
+                    .clickable {
+                        context.startActivity(Intent(context, GuardRulesActivity::class.java))
+                    }
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Default.Tune,
+                        contentDescription = "Guard Rules",
+                        tint = if (activeRuleCount > 0) modeTint else TextSecondary,
+                        modifier = Modifier.size(13.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = if (activeRuleCount > 0) "Rules ($activeRuleCount)" else "Rules",
+                        color = if (activeRuleCount > 0) modeTint else TextSecondary,
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.width(6.dp))
 
             Box(
                 modifier = Modifier
@@ -437,12 +488,20 @@ fun LiveGuardScreen() {
                             .background(AuraOrange.copy(alpha = 0.14f))
                             .border(1.dp, AuraOrange.copy(alpha = 0.35f), RoundedCornerShape(100.dp))
                             .clickable {
-                                try {
-                                    context.startActivity(Intent(Intent.ACTION_VIEW_PERMISSION_USAGE))
-                                } catch (_: Exception) {
+                                val opened = listOf(
+                                    "android.intent.action.REVIEW_PERMISSION_USAGE",
+                                    Intent.ACTION_VIEW_PERMISSION_USAGE,
+                                    Settings.ACTION_PRIVACY_SETTINGS
+                                ).any { action ->
                                     try {
-                                        context.startActivity(Intent(Settings.ACTION_PRIVACY_SETTINGS))
-                                    } catch (_: Exception) {}
+                                        context.startActivity(Intent(action))
+                                        true
+                                    } catch (_: Exception) {
+                                        false
+                                    }
+                                }
+                                if (!opened) {
+                                    Toast.makeText(context, "Privacy Dashboard unavailable on this OS", Toast.LENGTH_SHORT).show()
                                 }
                             }
                             .padding(horizontal = 9.dp, vertical = 4.dp)
@@ -532,11 +591,49 @@ fun LiveGuardScreen() {
                     if (filteredTimeline.isEmpty()) {
                         item(key = "empty_timeline") {
                             GlassCard(modifier = Modifier.fillMaxWidth()) {
-                                Text(
-                                    text = "No recent permission accesses for this filter.",
-                                    color = TextSecondary,
-                                    style = MaterialTheme.typography.bodySmall
-                                )
+                                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text(
+                                        text = if (activeTimelineFilter == "ALL") {
+                                            "No verified permission accesses yet"
+                                        } else {
+                                            "No verified accesses for this filter"
+                                        },
+                                        color = TextPrimary,
+                                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold)
+                                    )
+                                    Text(
+                                        text = "dot only logs verified hardware & AppOps events—never guessed when you open or install an app. Android restricts third-party apps from reading historical AppOps logs; check OS Log for Android's built-in Privacy Dashboard.",
+                                        color = TextSecondary,
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(AuraOrange.copy(alpha = 0.16f))
+                                            .border(1.dp, AuraOrange.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                                            .clickable {
+                                                listOf(
+                                                    "android.intent.action.REVIEW_PERMISSION_USAGE",
+                                                    Intent.ACTION_VIEW_PERMISSION_USAGE,
+                                                    Settings.ACTION_PRIVACY_SETTINGS
+                                                ).any { action ->
+                                                    try {
+                                                        context.startActivity(Intent(action))
+                                                        true
+                                                    } catch (_: Exception) {
+                                                        false
+                                                    }
+                                                }
+                                            }
+                                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                                    ) {
+                                        Text(
+                                            text = "Open OS Privacy Dashboard",
+                                            color = AuraOrange,
+                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                                        )
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -576,11 +673,17 @@ fun LiveGuardScreen() {
                                         isFirst = index == 0,
                                         isLast = index == bucketEvents.lastIndex,
                                         onClick = {
-                                            PrivacyAnalyzer.openSpecificPermissionSettings(
-                                                context,
-                                                item.packageName,
-                                                item.permissionInfo
-                                            )
+                                            if (item.packageName == "system.sensor") {
+                                                try {
+                                                    context.startActivity(Intent(Settings.ACTION_PRIVACY_SETTINGS))
+                                                } catch (_: Exception) {}
+                                            } else {
+                                                PrivacyAnalyzer.openSpecificPermissionSettings(
+                                                    context,
+                                                    item.packageName,
+                                                    item.permissionInfo
+                                                )
+                                            }
                                         }
                                     )
                                 }
@@ -622,7 +725,20 @@ fun LiveGuardScreen() {
                         }
                     } else {
                         itemsIndexed(events, key = { index, ev -> "${ev.id}_$index" }) { _, ev ->
-                            GuardEventRow(ev)
+                            val isIgnored = ev.packageName != null && ev.packageName in ignoredPackages
+                            GuardEventRow(
+                                event = ev,
+                                isIgnored = isIgnored,
+                                onToggleIgnore = { pkg ->
+                                    if (isIgnored) {
+                                        guardMonitor.unignorePackage(pkg)
+                                        Toast.makeText(context, "Restored alerts", Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        guardMonitor.ignorePackage(pkg)
+                                        Toast.makeText(context, "Ignored in Live Guard", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            )
                         }
                     }
                 }
@@ -678,6 +794,8 @@ private fun permissionVisuals(perm: PlainPermissionInfo, cat: PermissionCategory
         "SPECIAL_DEVICE_ADMIN" -> Color(0xFFB91C1C) to Icons.Default.AdminPanelSettings
         android.Manifest.permission.REQUEST_INSTALL_PACKAGES -> Color(0xFFF97316) to Icons.Default.SystemUpdate
         android.Manifest.permission.PACKAGE_USAGE_STATS -> Color(0xFF0EA5E9) to Icons.Default.QueryStats
+        "SPECIAL_CLIPBOARD_READ" -> Color(0xFFA855F7) to Icons.Default.ContentPaste
+        "SPECIAL_SCREEN_CAPTURE" -> Color(0xFFFF3B5C) to Icons.AutoMirrored.Filled.ScreenShare
         else -> when (cat) {
             PermissionCategory.LOCATION -> AuraCyan to Icons.Default.LocationOn
             PermissionCategory.CAMERA_MIC -> AuraOrange to Icons.Default.Mic
@@ -873,10 +991,15 @@ private fun CompactHardwareShieldCard(
     isScanning: Boolean,
     scanProgress: Float
 ) {
-    val anyActiveCapture = captureState.isScreenRecordingOrCasting || captureState.isMicActive || captureState.isCameraActive
+    val anyActiveCapture = captureState.isScreenRecordingOrCasting ||
+        captureState.isMicActive ||
+        captureState.isCameraActive ||
+        captureState.isBackgroundLocationActive ||
+        captureState.isClipboardAccessedRecently
     val heroAccent = when {
         captureState.isScreenRecordingOrCasting -> AuraRose
-        captureState.isMicActive || captureState.isCameraActive -> AuraOrange
+        captureState.isMicActive || captureState.isCameraActive || captureState.isBackgroundLocationActive -> AuraOrange
+        captureState.isClipboardAccessedRecently -> AuraPurple
         else -> AuraGreen
     }
 
@@ -930,6 +1053,14 @@ private fun CompactHardwareShieldCard(
                             ?: "${captureState.busyCameraIds.size.coerceAtLeast(1)} active"
                         add("Camera: $camNames")
                     }
+                    if (captureState.isBackgroundLocationActive) {
+                        val locNames = captureState.activeLocationApps.takeIf { it.isNotEmpty() }?.joinToString(", ") ?: "Active"
+                        add("GPS: $locNames")
+                    }
+                    if (captureState.isClipboardAccessedRecently) {
+                        val clipNames = captureState.recentClipboardApps.takeIf { it.isNotEmpty() }?.joinToString(", ") ?: "Read"
+                        add("Clipboard: $clipNames")
+                    }
                 }.joinToString(" • ")
 
                 Text(
@@ -938,6 +1069,8 @@ private fun CompactHardwareShieldCard(
                         captureState.isMicActive && captureState.isCameraActive -> "MIC & CAMERA IN USE"
                         captureState.isMicActive -> "MICROPHONE IN USE"
                         captureState.isCameraActive -> "CAMERA IN USE"
+                        captureState.isBackgroundLocationActive -> "BACKGROUND GPS ACTIVE"
+                        captureState.isClipboardAccessedRecently -> "CLIPBOARD READ DETECTED"
                         else -> "SHIELD ACTIVE"
                     },
                     color = heroAccent,
@@ -948,7 +1081,7 @@ private fun CompactHardwareShieldCard(
                         captureState.isScreenRecordingOrCasting ->
                             captureState.activeCaptureDisplays.firstOrNull() ?: "Display is being mirrored or recorded"
                         activeSensorSummary.isNotEmpty() -> activeSensorSummary
-                        else -> "No background screen or audio capture"
+                        else -> "No background capture, GPS, or clipboard snooping"
                     },
                     color = TextSecondary,
                     style = MaterialTheme.typography.bodySmall,
@@ -977,7 +1110,7 @@ private fun CompactHardwareShieldCard(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // 3 Compact Sensor Pills
+        // 3 Primary Sensor Pills
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1005,6 +1138,31 @@ private fun CompactHardwareShieldCard(
                 status = if (captureState.isCameraActive) (captureState.activeCameraApps.firstOrNull() ?: "Live") else "Idle",
                 isActive = captureState.isCameraActive,
                 activeColor = AuraOrange
+            )
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // 2 Background Privacy Sensor Pills (Location & Clipboard)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            LiveSensorChip(
+                modifier = Modifier.weight(1f),
+                icon = Icons.Default.MyLocation,
+                label = "Bg Location",
+                status = if (captureState.isBackgroundLocationActive) (captureState.activeLocationApps.firstOrNull() ?: "Active") else "Idle",
+                isActive = captureState.isBackgroundLocationActive,
+                activeColor = AuraOrange
+            )
+            LiveSensorChip(
+                modifier = Modifier.weight(1f),
+                icon = Icons.Default.ContentPaste,
+                label = "Clipboard",
+                status = if (captureState.isClipboardAccessedRecently) (captureState.recentClipboardApps.firstOrNull() ?: "Read") else "Safe",
+                isActive = captureState.isClipboardAccessedRecently,
+                activeColor = AuraPurple
             )
         }
 
@@ -1124,6 +1282,7 @@ private fun AuditVectorDetailSheet(
     vector: SecurityAuditVector,
     onOpenSettings: (String) -> Unit,
     onInspectApp: (String) -> Unit,
+    onIgnoreApp: (packageName: String, appLabel: String) -> Unit,
     onClose: () -> Unit
 ) {
     val sevColor = when (vector.severity) {
@@ -1208,14 +1367,52 @@ private fun AuditVectorDetailSheet(
         }
 
         if (vector.flaggedApps.isNotEmpty()) {
+            var appSearch by remember(vector.id) { mutableStateOf("") }
+            val shownApps = remember(vector.flaggedApps, appSearch) {
+                if (appSearch.isBlank()) {
+                    vector.flaggedApps
+                } else {
+                    val q = appSearch.trim()
+                    vector.flaggedApps.filter {
+                        it.appName.contains(q, ignoreCase = true) ||
+                            it.packageName.contains(q, ignoreCase = true) ||
+                            it.installerName.contains(q, ignoreCase = true)
+                    }
+                }
+            }
             Spacer(modifier = Modifier.height(14.dp))
             Text(
-                text = "APPS (${vector.flaggedApps.size})",
+                text = "ALL FLAGGED APPS (${vector.flaggedApps.size})",
                 color = TextTertiary,
                 style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
             )
+            if (vector.flaggedApps.size > 6) {
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = appSearch,
+                    onValueChange = { appSearch = it },
+                    placeholder = { Text("Filter apps...", color = TextTertiary, style = MaterialTheme.typography.labelSmall) },
+                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = TextSecondary, modifier = Modifier.size(16.dp)) },
+                    trailingIcon = {
+                        if (appSearch.isNotEmpty()) {
+                            IconButton(onClick = { appSearch = "" }) {
+                                Icon(Icons.Default.Close, contentDescription = "Clear", tint = TextSecondary, modifier = Modifier.size(14.dp))
+                            }
+                        }
+                    },
+                    singleLine = true,
+                    shape = RoundedCornerShape(12.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = AuraCyan,
+                        unfocusedBorderColor = GlassBorder,
+                        focusedTextColor = TextPrimary,
+                        unfocusedTextColor = TextPrimary
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
             Spacer(modifier = Modifier.height(8.dp))
-            vector.flaggedApps.take(10).forEach { app ->
+            shownApps.forEach { app ->
                 val bmp = remember(app.packageName) { getCachedAppIconBitmap(app.packageName, app.icon) }
                 Row(
                     modifier = Modifier
@@ -1245,12 +1442,26 @@ private fun AuditVectorDetailSheet(
                             style = MaterialTheme.typography.labelSmall
                         )
                     }
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(100.dp))
+                            .background(GlassBorder.copy(alpha = 0.4f))
+                            .clickable { onIgnoreApp(app.packageName, app.appName) }
+                            .padding(horizontal = 9.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            text = "Ignore",
+                            color = TextSecondary,
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
                     Text(
                         text = "Revoke",
                         color = AuraCyan,
                         style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
                     )
-                    Spacer(modifier = Modifier.width(4.dp))
+                    Spacer(modifier = Modifier.width(3.dp))
                     Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null, tint = AuraCyan, modifier = Modifier.size(13.dp))
                 }
             }
@@ -1261,7 +1472,11 @@ private fun AuditVectorDetailSheet(
 }
 
 @Composable
-private fun GuardEventRow(event: GuardEvent) {
+private fun GuardEventRow(
+    event: GuardEvent,
+    isIgnored: Boolean,
+    onToggleIgnore: (String) -> Unit
+) {
     val color = when (event.severity) {
         AuditSeverity.DANGER -> AuraRose
         AuditSeverity.WARNING -> AuraOrange
@@ -1295,19 +1510,47 @@ private fun GuardEventRow(event: GuardEvent) {
                 Text(
                     text = event.title,
                     color = TextPrimary,
-                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold)
+                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
+                Spacer(modifier = Modifier.width(6.dp))
                 Text(
                     text = timeStr,
                     color = TextTertiary,
                     style = MaterialTheme.typography.labelSmall
                 )
             }
-            Text(
-                text = event.description,
-                color = TextSecondary,
-                style = MaterialTheme.typography.labelSmall
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = event.description,
+                    color = TextSecondary,
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (event.packageName != null) {
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(100.dp))
+                            .background(if (isIgnored) AuraCyan.copy(alpha = 0.14f) else GlassBorder.copy(alpha = 0.4f))
+                            .clickable { onToggleIgnore(event.packageName) }
+                            .padding(horizontal = 8.dp, vertical = 3.dp)
+                    ) {
+                        Text(
+                            text = if (isIgnored) "Restore" else "Ignore",
+                            color = if (isIgnored) AuraCyan else TextSecondary,
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                        )
+                    }
+                }
+            }
         }
     }
 }

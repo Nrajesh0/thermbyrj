@@ -21,6 +21,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -101,6 +102,9 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import com.example.GlassCard
 import com.example.formatBytes
+import com.example.service.FileShredder
+import com.example.service.ShredStandard
+import com.example.service.ShredTarget
 import com.example.ui.theme.AppTheme
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
@@ -116,8 +120,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.RandomAccessFile
-import java.security.SecureRandom
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -165,9 +167,12 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
     var selectedItems by remember { mutableStateOf<Set<FileItem>>(emptySet()) }
     val isSelectionMode = selectedItems.isNotEmpty()
 
+    var showNormalDeleteDialog by remember { mutableStateOf(false) }
     var showShredDialog by remember { mutableStateOf(false) }
+    var selectedShredStandard by remember { mutableStateOf(ShredStandard.DOD_5220_22_M) }
     var isShredding by remember { mutableStateOf(false) }
     var shredProgress by remember { mutableFloatStateOf(0f) }
+    var shredStatusText by remember { mutableStateOf("") }
 
     val deleteLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartIntentSenderForResult()
@@ -319,82 +324,97 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
     fun shredSelectedFiles() {
         isShredding = true
         shredProgress = 0f
-        scope.launch(Dispatchers.IO) {
-            val total = selectedItems.size
-            var current = 0
-            val random = SecureRandom()
-            val buffer = ByteArray(65536)
-            val failedUris = mutableListOf<Uri>()
-            val deletedItems = mutableSetOf<FileItem>()
-
-            selectedItems.forEach { item ->
-                try {
-                    val file = File(item.path)
-                    if (file.exists() && file.canWrite()) {
-                        val length = file.length()
-                        RandomAccessFile(file, "rws").use { raf ->
-                            raf.seek(0)
-                            var written = 0L
-                            java.util.Arrays.fill(buffer, 0.toByte())
-                            while (written < length) {
-                                val toWrite = minOf(buffer.size.toLong(), length - written).toInt()
-                                raf.write(buffer, 0, toWrite)
-                                written += toWrite
-                            }
-                        }
-                        RandomAccessFile(file, "rws").use { raf ->
-                            raf.seek(0)
-                            var written = 0L
-                            while (written < length) {
-                                random.nextBytes(buffer)
-                                val toWrite = minOf(buffer.size.toLong(), length - written).toInt()
-                                raf.write(buffer, 0, toWrite)
-                                written += toWrite
-                            }
-                        }
-                        file.delete()
-                    }
-                    val rows = context.contentResolver.delete(item.contentUri, null, null)
-                    if (rows > 0 || !file.exists()) {
-                        deletedItems.add(item)
-                    } else {
-                        failedUris.add(item.contentUri)
-                    }
-                } catch (_: Exception) {
-                    failedUris.add(item.contentUri)
+        shredStatusText = "Starting ${selectedShredStandard.title}..."
+        val itemsSnapshot = selectedItems.toList()
+        scope.launch {
+            val targets = itemsSnapshot.map { ShredTarget(File(it.path), it.contentUri) }
+            val result = withContext(Dispatchers.IO) {
+                FileShredder.shredTargets(
+                    context = context,
+                    targets = targets,
+                    standard = selectedShredStandard
+                ) { done, total, label ->
+                    shredProgress = done.toFloat() / total.toFloat()
+                    shredStatusText = label
                 }
-                current++
-                shredProgress = current.toFloat() / total.toFloat()
             }
-            withContext(Dispatchers.Main) {
-                files = files.filterNot { it in deletedItems }
-                selectedItems = selectedItems - deletedItems
-                isShredding = false
-                showShredDialog = false
 
-                if (failedUris.isNotEmpty() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    try {
-                        val pendingIntent = MediaStore.createDeleteRequest(context.contentResolver, failedUris)
-                        deleteLauncher.launch(IntentSenderRequest.Builder(pendingIntent.intentSender).build())
-                    } catch (_: Exception) {
-                        Toast.makeText(context, "Grant All Files Access in Storage Analysis for full DoD Shredding", Toast.LENGTH_LONG).show()
-                    }
-                } else {
-                    Toast.makeText(context, "Securely shredded ${deletedItems.size} files!", Toast.LENGTH_SHORT).show()
+            val deletedUris = itemsSnapshot
+                .filter { item ->
+                    result.blockedForOverwrite.none { it.contentUri == item.contentUri } &&
+                        result.failedTargets.none { it.contentUri == item.contentUri }
                 }
+                .toSet()
+
+            files = files.filterNot { it in deletedUris }
+            selectedItems = selectedItems - deletedUris
+            isShredding = false
+            showShredDialog = false
+
+            if (result.blockedForOverwrite.isNotEmpty()) {
+                val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !android.os.Environment.isExternalStorageManager()) {
+                    "Grant All Files Access for byte-level DoD/NIST shredding, or use Normal Delete for ${result.blockedForOverwrite.size} protected file(s)."
+                } else {
+                    "Shredded ${result.shreddedCount} file(s); ${result.blockedForOverwrite.size} blocked from direct overwrite."
+                }
+                Toast.makeText(context, hint, Toast.LENGTH_LONG).show()
+            } else {
+                Toast.makeText(
+                    context,
+                    "Shredded ${result.shreddedCount} file(s) (${formatBytes(result.totalBytesWiped)})",
+                    Toast.LENGTH_SHORT
+                ).show()
             }
         }
+    }
+
+    if (showNormalDeleteDialog) {
+        AlertDialog(
+            onDismissRequest = { showNormalDeleteDialog = false },
+            containerColor = GlassPanel,
+            title = { Text("Normal Delete (${selectedItems.size})", color = TextPrimary, fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "Fast standard OS removal. Removes files without multi-pass byte overwriting (use Shredder if deleting sensitive documents).",
+                    color = TextSecondary
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showNormalDeleteDialog = false
+                        deleteSelectedStandard()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = AuraCyan)
+                ) {
+                    Text("DELETE", color = Obsidian, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = {
+                        showNormalDeleteDialog = false
+                        showShredDialog = true
+                    }) {
+                        Text("Use Shredder", color = AuraRose, fontWeight = FontWeight.Bold)
+                    }
+                    TextButton(onClick = { showNormalDeleteDialog = false }) {
+                        Text("Cancel", color = TextSecondary)
+                    }
+                }
+            }
+        )
     }
 
     if (showShredDialog) {
         AlertDialog(
             onDismissRequest = { if (!isShredding) showShredDialog = false },
             containerColor = GlassPanel,
-            title = { Text("Military-Grade Shredder", color = AuraRose, fontWeight = FontWeight.Bold) },
+            title = { Text("Standard File Shredder", color = AuraRose, fontWeight = FontWeight.Bold) },
             text = {
                 if (isShredding) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
-                        Text("Overwriting sectors with cryptographic noise...", color = TextSecondary)
+                        Text(shredStatusText.ifBlank { "Overwriting blocks & obfuscating filename..." }, color = TextSecondary)
                         Spacer(modifier = Modifier.height(16.dp))
                         LinearProgressIndicator(
                             progress = { shredProgress },
@@ -404,10 +424,46 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                         )
                     }
                 } else {
-                    Text(
-                        "Permanently overwrite and destroy ${selectedItems.size} selected files so they cannot be recovered.",
-                        color = TextPrimary
-                    )
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text(
+                            "Select wipe standard for ${selectedItems.size} file(s):",
+                            color = TextPrimary,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        ShredStandard.entries.forEach { std ->
+                            val selected = selectedShredStandard == std
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(if (selected) AuraRose.copy(alpha = 0.14f) else Obsidian.copy(alpha = 0.4f))
+                                    .clickable { selectedShredStandard = std }
+                                    .padding(10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = if (selected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
+                                    contentDescription = std.title,
+                                    tint = if (selected) AuraRose else TextTertiary,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Column {
+                                    Text(
+                                        std.title,
+                                        color = if (selected) AuraRose else TextPrimary,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        std.subtitle,
+                                        color = TextTertiary,
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             },
             confirmButton = {
@@ -462,8 +518,8 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                         IconButton(onClick = { shareSelectedFiles() }) {
                             Icon(Icons.Default.Share, contentDescription = "Share Selected", tint = AuraCyan)
                         }
-                        IconButton(onClick = { deleteSelectedStandard() }) {
-                            Icon(Icons.Default.Delete, contentDescription = "Delete Selected", tint = TextPrimary)
+                        IconButton(onClick = { showNormalDeleteDialog = true }) {
+                            Icon(Icons.Default.Delete, contentDescription = "Normal Delete", tint = TextPrimary)
                         }
                         IconButton(onClick = { showShredDialog = true }) {
                             Icon(Icons.Default.DeleteForever, contentDescription = "Secure Shred", tint = AuraRose)

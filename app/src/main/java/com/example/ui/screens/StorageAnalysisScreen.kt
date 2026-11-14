@@ -112,6 +112,7 @@ data class StorageCategory(
     val icon: ImageVector
 )
 
+@Suppress("DEPRECATION")
 private fun hasUsageStatsPermission(context: Context): Boolean {
     val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
     val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
