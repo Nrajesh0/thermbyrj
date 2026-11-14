@@ -56,6 +56,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Shield
@@ -113,6 +114,7 @@ import com.example.service.LiveGuardMonitor
 import com.example.service.ThermalTrackerService
 import com.example.service.ThermalWidgetProvider
 import com.example.ui.screens.FilesScreen
+import com.example.ui.screens.GuardRulesActivity
 import com.example.ui.screens.LiveGuardScreen
 import com.example.ui.screens.PrivacyShieldScreen
 import com.example.ui.screens.VitalsScreen
@@ -315,7 +317,7 @@ fun MainScreen(viewModel: ThermalViewModel) {
                             colors = NavigationRailItemDefaults.colors(
                                 selectedIconColor = ambientColor,
                                 selectedTextColor = ambientColor,
-                                indicatorColor = Color.White.copy(alpha = 0.1f),
+                                indicatorColor = AuraCyan.copy(alpha = 0.16f),
                                 unselectedIconColor = TextSecondary,
                                 unselectedTextColor = TextSecondary
                             )
@@ -784,6 +786,41 @@ fun MorphingSettingsOrb(
                             }
                         }
                     )
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("settings_open_guard_rules")
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable {
+                                if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                isExpanded = false
+                                context.startActivity(Intent(context, GuardRulesActivity::class.java))
+                            }
+                            .padding(vertical = 10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                            Text(
+                                "Guard Rules, Alert Modes & Snoozes",
+                                color = TextPrimary,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                "Smart Covert filtering, call silencing, snoozes & trusted apps",
+                                color = TextTertiary,
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                        Icon(
+                            imageVector = Icons.Default.ChevronRight,
+                            contentDescription = "Open Guard Rules",
+                            tint = AuraCyan
+                        )
+                    }
 
                     SettingsSliderRow(
                         title = "Warning Temp Limit",

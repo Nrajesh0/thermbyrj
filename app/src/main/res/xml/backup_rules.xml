@@ -6,9 +6,4 @@
     <include domain="sharedpref" path="privacy_diff_prefs.xml"/>
     <include domain="file" path="dot_settings_mirror.json"/>
     <include domain="database" path="thermal_database"/>
-    <exclude domain="file" path="vault_files"/>
-    <exclude domain="file" path="secure_vault"/>
-    <exclude domain="sharedpref" path="secure_vault_registry.xml"/>
-    <exclude domain="sharedpref" path="vault_registry_prefs.xml"/>
-    <exclude domain="sharedpref" path="vault_secure_prefs.xml"/>
 </full-backup-content>

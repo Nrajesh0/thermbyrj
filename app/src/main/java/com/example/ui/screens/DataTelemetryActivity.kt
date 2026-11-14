@@ -98,12 +98,14 @@ import com.example.ui.theme.Obsidian
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.ui.theme.TextTertiary
+import com.example.ui.theme.ThemeState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 class DataTelemetryActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        ThemeState.loadFromPrefs(this)
         enableEdgeToEdge()
         setContent {
             AppTheme {
@@ -178,7 +180,7 @@ fun DataTelemetryScreen(onBack: () -> Unit) {
         ModalBottomSheet(
             onDismissRequest = { selectedApp = null },
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-            containerColor = Color(0xFF0F111A),
+            containerColor = GlassPanel,
             contentColor = TextPrimary
         ) {
             TelemetryDetailSheet(
@@ -501,7 +503,7 @@ private fun TelemetryAppRow(
                         Box(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(8.dp))
-                                .background(Color.White.copy(alpha = 0.08f))
+                                .background(GlassBorder.copy(alpha = 0.45f))
                                 .padding(horizontal = 8.dp, vertical = 3.dp)
                         ) {
                             Text("+${allTags.size - 4}", color = TextSecondary, style = MaterialTheme.typography.labelSmall)

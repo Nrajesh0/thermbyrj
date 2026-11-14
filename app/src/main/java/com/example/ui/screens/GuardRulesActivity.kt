@@ -1,15 +1,22 @@
 package com.example.ui.screens
 
+import android.Manifest
+import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -25,6 +32,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -44,6 +52,7 @@ import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Timer
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -79,11 +88,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.GlassCard
+import com.example.startTrackingServiceSafely
 import com.example.service.DiscoveredSystemSensorApp
 import com.example.service.GuardAlertMode
 import com.example.service.GuardSensorType
@@ -132,27 +143,82 @@ private data class InstalledAppEntry(
     val icon: Drawable?
 )
 
+private fun hasGuardNotificationPermission(context: Context): Boolean {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+    } else {
+        true
+    }
+}
+
+private fun openGuardNotificationSettings(context: Context) {
+    val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+        putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+    }
+    try {
+        context.startActivity(intent)
+    } catch (_: Exception) {
+        try {
+            context.startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.fromParts("package", context.packageName, null)
+                )
+            )
+        } catch (_: Exception) {
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun GuardRulesScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val guardMonitor = remember(context) { LiveGuardMonitor.getInstance(context) }
+    val prefs = remember(context) { context.getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE) }
 
     val rulesConfig by guardMonitor.rulesConfig.collectAsStateWithLifecycle()
     val trustedRules by guardMonitor.trustedRules.collectAsStateWithLifecycle()
     val activeSnoozes by guardMonitor.activeSnoozes.collectAsStateWithLifecycle()
 
     var hasUsageAccess by remember { mutableStateOf(PrivacyAnalyzer.hasUsageStatsPermission(context)) }
+    var bgMonitoringEnabled by remember { mutableStateOf(prefs.getBoolean("background_monitoring", true)) }
+    var liveGuardAlertsEnabled by remember { mutableStateOf(prefs.getBoolean("live_guard_alerts", true)) }
+    var hasNotificationPermission by remember { mutableStateOf(hasGuardNotificationPermission(context)) }
+
+    val notificationPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasNotificationPermission = granted
+        if (!granted) {
+            openGuardNotificationSettings(context)
+        }
+    }
+
     var discoveredSystemApps by remember { mutableStateOf<List<DiscoveredSystemSensorApp>>(emptyList()) }
     var showAddAppSheet by remember { mutableStateOf(false) }
     var installedUserApps by remember { mutableStateOf<List<InstalledAppEntry>>(emptyList()) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
 
+    DisposableEffect(prefs) {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { sp, key ->
+            when (key) {
+                "background_monitoring" -> bgMonitoringEnabled = sp.getBoolean("background_monitoring", true)
+                "live_guard_alerts" -> liveGuardAlertsEnabled = sp.getBoolean("live_guard_alerts", true)
+            }
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+
     DisposableEffect(lifecycleOwner) {
         val obs = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 hasUsageAccess = PrivacyAnalyzer.hasUsageStatsPermission(context)
+                hasNotificationPermission = hasGuardNotificationPermission(context)
+                bgMonitoringEnabled = prefs.getBoolean("background_monitoring", true)
+                liveGuardAlertsEnabled = prefs.getBoolean("live_guard_alerts", true)
                 refreshTrigger++
             }
         }
@@ -254,6 +320,61 @@ fun GuardRulesScreen(onBack: () -> Unit) {
             verticalArrangement = Arrangement.spacedBy(12.dp),
             contentPadding = PaddingValues(top = 8.dp, bottom = 36.dp)
         ) {
+            if (!bgMonitoringEnabled || !liveGuardAlertsEnabled || !hasNotificationPermission) {
+                item(key = "guard_rules_status_warning") {
+                    val (title, subtitle, buttonLabel, tint) = when {
+                        !bgMonitoringEnabled -> listOf("Background Guard Paused", "Turn on background monitoring so Guard rules run continuously.", "Turn On") to AuraRose
+                        !liveGuardAlertsEnabled -> listOf("Guard Alerts Muted", "Live alerts are muted in System Preferences.", "Unmute") to AuraOrange
+                        else -> listOf("Notifications Blocked", "Grant notification permission to receive Guard alerts.", "Allow") to AuraRose
+                    }.let { (texts, color) ->
+                        GuardStatusTuple(texts[0], texts[1], texts[2], color)
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("guard_rules_status_banner")
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(tint.copy(alpha = 0.12f))
+                            .border(1.dp, tint.copy(alpha = 0.45f), RoundedCornerShape(16.dp))
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.Warning, contentDescription = null, tint = tint, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(title, color = tint, style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold))
+                            Text(subtitle, color = TextSecondary, style = MaterialTheme.typography.labelSmall)
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Box(
+                            modifier = Modifier
+                                .heightIn(min = 36.dp)
+                                .clip(RoundedCornerShape(100.dp))
+                                .background(tint)
+                                .clickable {
+                                    when {
+                                        !bgMonitoringEnabled -> {
+                                            prefs.edit().putBoolean("background_monitoring", true).commit()
+                                            startTrackingServiceSafely(context)
+                                        }
+                                        !liveGuardAlertsEnabled -> {
+                                            prefs.edit().putBoolean("live_guard_alerts", true).commit()
+                                        }
+                                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> {
+                                            notificationPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                        }
+                                        else -> openGuardNotificationSettings(context)
+                                    }
+                                }
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(buttonLabel, color = Obsidian, style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                        }
+                    }
+                }
+            }
+
             // 1. Alert Mode Section
             item(key = "header_mode") {
                 SectionLabel("ALERT MODE")
@@ -694,11 +815,13 @@ private fun TrustedAppRuleCard(
             }
             Box(
                 modifier = Modifier
+                    .heightIn(min = 36.dp)
                     .clip(RoundedCornerShape(100.dp))
                     .background(AuraRose.copy(alpha = 0.14f))
                     .border(1.dp, AuraRose.copy(alpha = 0.35f), RoundedCornerShape(100.dp))
                     .clickable { onRemove() }
-                    .padding(horizontal = 10.dp, vertical = 4.dp)
+                    .padding(horizontal = 11.dp, vertical = 6.dp),
+                contentAlignment = Alignment.Center
             ) {
                 Text("Turn On Alerts", color = AuraRose, style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, fontSize = 10.sp))
             }
@@ -898,3 +1021,10 @@ private fun AddAppRuleSheet(
         Spacer(modifier = Modifier.height(12.dp))
     }
 }
+
+private data class GuardStatusTuple(
+    val title: String,
+    val subtitle: String,
+    val buttonLabel: String,
+    val tint: Color
+)

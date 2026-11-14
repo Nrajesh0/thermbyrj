@@ -55,7 +55,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <activity android:name=".ui.screens.StorageAnalysisActivity" android:exported="false" android:theme="@style/Theme.MyApplication" />
         <activity android:name=".ui.screens.FileCategoryActivity" android:exported="false" android:theme="@style/Theme.MyApplication" />
         <activity android:name=".ui.screens.AppListActivity" android:exported="false" android:theme="@style/Theme.MyApplication" />
         <activity android:name=".ui.screens.DuplicateFinderActivity" android:exported="false" android:theme="@style/Theme.MyApplication" />

@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -36,9 +37,12 @@ import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.AddCircleOutline
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.DataUsage
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.NewReleases
 import androidx.compose.material.icons.filled.RemoveCircleOutline
 import androidx.compose.material.icons.filled.Search
@@ -127,6 +131,7 @@ fun PrivacyShieldScreen() {
     // Bottom sheets
     var selectedAppForModal by remember { mutableStateOf<AppPrivacyReport?>(null) }
     var selectedTrackerApp by remember { mutableStateOf<AppTelemetryReport?>(null) }
+    var showPermissionGuide by remember { mutableStateOf(false) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
 
     DisposableEffect(lifecycleOwner) {
@@ -291,6 +296,17 @@ fun PrivacyShieldScreen() {
         }
     }
 
+    if (showPermissionGuide) {
+        ModalBottomSheet(
+            onDismissRequest = { showPermissionGuide = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            containerColor = GlassPanel,
+            contentColor = TextPrimary
+        ) {
+            PermissionGuideSheet(onClose = { showPermissionGuide = false })
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -335,20 +351,54 @@ fun PrivacyShieldScreen() {
                 }
             }
 
-            // Compact System Apps Toggle
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(100.dp))
-                    .background(if (includeSystemApps) AuraCyan.copy(alpha = 0.16f) else GlassPanel)
-                    .border(1.dp, if (includeSystemApps) AuraCyan else GlassBorder, RoundedCornerShape(100.dp))
-                    .clickable { includeSystemApps = !includeSystemApps }
-                    .padding(horizontal = 10.dp, vertical = 5.dp)
+            // Compact Guide + System Apps Toggles
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = if (includeSystemApps) "System: ON" else "System: OFF",
-                    color = if (includeSystemApps) AuraCyan else TextSecondary,
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                )
+                Box(
+                    modifier = Modifier
+                        .heightIn(min = 36.dp)
+                        .testTag("privacy_guide_button")
+                        .clip(RoundedCornerShape(100.dp))
+                        .background(AuraGreen.copy(alpha = 0.14f))
+                        .border(1.dp, AuraGreen.copy(alpha = 0.35f), RoundedCornerShape(100.dp))
+                        .clickable { showPermissionGuide = true }
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Default.Info,
+                            contentDescription = "Permission Guide",
+                            tint = AuraGreen,
+                            modifier = Modifier.size(13.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "Guide",
+                            color = AuraGreen,
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        )
+                    }
+                }
+
+                Box(
+                    modifier = Modifier
+                        .heightIn(min = 36.dp)
+                        .clip(RoundedCornerShape(100.dp))
+                        .background(if (includeSystemApps) AuraCyan.copy(alpha = 0.16f) else GlassPanel)
+                        .border(1.dp, if (includeSystemApps) AuraCyan else GlassBorder, RoundedCornerShape(100.dp))
+                        .clickable { includeSystemApps = !includeSystemApps }
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = if (includeSystemApps) "System: ON" else "System: OFF",
+                        color = if (includeSystemApps) AuraCyan else TextSecondary,
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    )
+                }
             }
         }
 
@@ -631,6 +681,8 @@ fun PrivacyShieldScreen() {
                         Spacer(modifier = Modifier.width(8.dp))
                         Box(
                             modifier = Modifier
+                                .heightIn(min = 36.dp)
+                                .testTag("privacy_ad_settings_button")
                                 .clip(RoundedCornerShape(100.dp))
                                 .background(AuraPurple.copy(alpha = 0.14f))
                                 .border(1.dp, AuraPurple.copy(alpha = 0.35f), RoundedCornerShape(100.dp))
@@ -643,10 +695,11 @@ fun PrivacyShieldScreen() {
                                         } catch (_: Exception) {}
                                     }
                                 }
-                                .padding(horizontal = 9.dp, vertical = 4.dp)
+                                .padding(horizontal = 11.dp, vertical = 6.dp),
+                            contentAlignment = Alignment.Center
                         ) {
                             Text(
-                                text = "Ad ID",
+                                text = "Ad Settings",
                                 color = AuraPurple,
                                 style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
                             )
@@ -660,6 +713,56 @@ fun PrivacyShieldScreen() {
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         contentPadding = PaddingValues(bottom = 112.dp)
                     ) {
+                        item(key = "telemetry_radar_banner") {
+                            GlassCard(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("open_data_telemetry_button")
+                                    .clickable {
+                                        context.startActivity(Intent(context, DataTelemetryActivity::class.java))
+                                    }
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(36.dp)
+                                            .clip(CircleShape)
+                                            .background(AuraOrange.copy(alpha = 0.15f)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            Icons.Default.DataUsage,
+                                            contentDescription = "Data Usage & Telemetry Radar",
+                                            tint = AuraOrange,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "Full Data & Tracker Breakdown",
+                                            color = TextPrimary,
+                                            style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold)
+                                        )
+                                        Text(
+                                            text = "Inspect upload/download bytes & 6 telemetry filters",
+                                            color = TextSecondary,
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+                                    }
+                                    Icon(
+                                        Icons.Default.ChevronRight,
+                                        contentDescription = "Open",
+                                        tint = AuraOrange,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
+                        }
+
                         if (filteredTrackers.isEmpty()) {
                             item {
                                 GlassCard(modifier = Modifier.fillMaxWidth()) {
@@ -813,7 +916,7 @@ private fun AppPermissionChipCard(
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(8.dp))
-                            .background(Color.White.copy(alpha = 0.06f))
+                            .background(GlassBorder.copy(alpha = 0.35f))
                             .border(1.dp, GlassBorder, RoundedCornerShape(8.dp))
                             .padding(horizontal = 8.dp, vertical = 4.dp)
                     ) {
@@ -1101,7 +1204,7 @@ private fun MinimalAppPermissionSheet(
                         .fillMaxWidth()
                         .padding(vertical = 4.dp)
                         .clip(RoundedCornerShape(12.dp))
-                        .background(Color.White.copy(alpha = 0.04f))
+                        .background(GlassBorder.copy(alpha = 0.22f))
                         .border(1.dp, GlassBorder, RoundedCornerShape(12.dp))
                         .clickable { onSpecificPermissionClick(perm) }
                         .padding(horizontal = 14.dp, vertical = 11.dp),
@@ -1283,5 +1386,143 @@ private fun formatRelativeShortTime(timestamp: Long): String {
         hours < 24L -> "${hours}h ago"
         days < 7L -> "${days}d ago"
         else -> SimpleDateFormat("MMM d", Locale.US).format(Date(timestamp))
+    }
+}
+
+@Composable
+private fun PermissionGuideSheet(onClose: () -> Unit) {
+    val dictionary = remember { PrivacyAnalyzer.getPlainDictionary() }
+    var query by remember { mutableStateOf("") }
+    val filtered = remember(dictionary, query) {
+        if (query.isBlank()) {
+            dictionary
+        } else {
+            val q = query.trim()
+            dictionary.filter {
+                it.friendlyTitle.contains(q, ignoreCase = true) ||
+                    it.shortTag.contains(q, ignoreCase = true) ||
+                    it.simpleExplanation.contains(q, ignoreCase = true) ||
+                    it.whyItMatters.contains(q, ignoreCase = true)
+            }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+            .padding(horizontal = 20.dp, vertical = 8.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "PERMISSION GUIDE",
+                    color = AuraGreen,
+                    style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 2.sp, fontWeight = FontWeight.Bold)
+                )
+                Text(
+                    text = "Plain-English explanation of what apps can access",
+                    color = TextSecondary,
+                    style = MaterialTheme.typography.labelSmall
+                )
+            }
+            IconButton(onClick = onClose) {
+                Icon(Icons.Default.Close, contentDescription = "Close", tint = TextSecondary)
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        OutlinedTextField(
+            value = query,
+            onValueChange = { query = it },
+            placeholder = { Text("Search permissions (e.g., Location, SMS)...", color = TextTertiary, style = MaterialTheme.typography.bodySmall) },
+            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = AuraGreen, modifier = Modifier.size(18.dp)) },
+            trailingIcon = {
+                if (query.isNotEmpty()) {
+                    IconButton(onClick = { query = "" }) {
+                        Icon(Icons.Default.Close, contentDescription = "Clear", tint = TextSecondary, modifier = Modifier.size(16.dp))
+                    }
+                }
+            },
+            singleLine = true,
+            shape = RoundedCornerShape(14.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = AuraGreen,
+                unfocusedBorderColor = GlassBorder,
+                focusedTextColor = TextPrimary,
+                unfocusedTextColor = TextPrimary
+            ),
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(380.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            contentPadding = PaddingValues(bottom = 16.dp)
+        ) {
+            items(filtered, key = { it.permissionName }) { info ->
+                val riskColor = when (info.riskLevel) {
+                    PermissionRiskLevel.CRITICAL -> AuraRose
+                    PermissionRiskLevel.HIGH -> AuraOrange
+                    PermissionRiskLevel.MEDIUM -> AuraCyan
+                    PermissionRiskLevel.LOW -> AuraGreen
+                }
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Obsidian.copy(alpha = 0.45f))
+                        .border(1.dp, GlassBorder, RoundedCornerShape(14.dp))
+                        .padding(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = info.friendlyTitle,
+                            color = TextPrimary,
+                            style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(riskColor.copy(alpha = 0.15f))
+                                .padding(horizontal = 7.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = info.riskLevel.name,
+                                color = riskColor,
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = info.simpleExplanation,
+                        color = TextSecondary,
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Tip: ${info.whyItMatters}",
+                        color = riskColor,
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp)
+                    )
+                }
+            }
+        }
     }
 }

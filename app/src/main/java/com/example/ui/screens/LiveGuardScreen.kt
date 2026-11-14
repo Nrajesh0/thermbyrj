@@ -1,9 +1,16 @@
 package com.example.ui.screens
 
+import android.Manifest
+import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -27,6 +34,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -115,11 +123,13 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.GlassCard
+import com.example.startTrackingServiceSafely
 import com.example.service.AuditSeverity
 import com.example.service.GuardEvent
 import com.example.service.LiveCaptureState
@@ -149,12 +159,40 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
+private fun hasPostNotificationsPermission(context: Context): Boolean {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+    } else {
+        true
+    }
+}
+
+private fun openAppNotificationSettings(context: Context) {
+    val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+        putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+    }
+    try {
+        context.startActivity(intent)
+    } catch (_: Exception) {
+        try {
+            context.startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.fromParts("package", context.packageName, null)
+                )
+            )
+        } catch (_: Exception) {
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LiveGuardScreen() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val coroutineScope = rememberCoroutineScope()
+    val prefs = remember(context) { context.getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE) }
 
     val guardMonitor = remember(context) { LiveGuardMonitor.getInstance(context) }
     val captureState by guardMonitor.captureState.collectAsStateWithLifecycle()
@@ -162,6 +200,19 @@ fun LiveGuardScreen() {
     val ignoredPackages by guardMonitor.ignoredPackages.collectAsStateWithLifecycle()
     val rulesConfig by guardMonitor.rulesConfig.collectAsStateWithLifecycle()
     val activeSnoozes by guardMonitor.activeSnoozes.collectAsStateWithLifecycle()
+
+    var bgMonitoringEnabled by remember { mutableStateOf(prefs.getBoolean("background_monitoring", true)) }
+    var liveGuardAlertsEnabled by remember { mutableStateOf(prefs.getBoolean("live_guard_alerts", true)) }
+    var hasNotificationPermission by remember { mutableStateOf(hasPostNotificationsPermission(context)) }
+
+    val notificationPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasNotificationPermission = granted
+        if (!granted) {
+            openAppNotificationSettings(context)
+        }
+    }
 
     var activeSubTab by remember { mutableStateOf("CHECKS") } // "CHECKS", "TIMELINE", "LOG"
     var auditVectors by remember { mutableStateOf(guardMonitor.peekCachedAuditVectors() ?: emptyList()) }
@@ -178,11 +229,25 @@ fun LiveGuardScreen() {
         guardMonitor.startMonitoring()
     }
 
+    DisposableEffect(prefs) {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { sp, key ->
+            when (key) {
+                "background_monitoring" -> bgMonitoringEnabled = sp.getBoolean("background_monitoring", true)
+                "live_guard_alerts" -> liveGuardAlertsEnabled = sp.getBoolean("live_guard_alerts", true)
+            }
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 guardMonitor.refreshAllStates()
                 hasUsageAccess = PrivacyAnalyzer.hasUsageStatsPermission(context)
+                hasNotificationPermission = hasPostNotificationsPermission(context)
+                bgMonitoringEnabled = prefs.getBoolean("background_monitoring", true)
+                liveGuardAlertsEnabled = prefs.getBoolean("live_guard_alerts", true)
                 refreshTrigger++
             }
         }
@@ -320,6 +385,7 @@ fun LiveGuardScreen() {
 
             Box(
                 modifier = Modifier
+                    .heightIn(min = 36.dp)
                     .testTag("guard_rules_button")
                     .clip(RoundedCornerShape(100.dp))
                     .background(if (activeRuleCount > 0) modeTint.copy(alpha = 0.14f) else GlassPanel)
@@ -327,7 +393,8 @@ fun LiveGuardScreen() {
                     .clickable {
                         context.startActivity(Intent(context, GuardRulesActivity::class.java))
                     }
-                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                    .padding(horizontal = 11.dp, vertical = 6.dp),
+                contentAlignment = Alignment.Center
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
@@ -348,20 +415,93 @@ fun LiveGuardScreen() {
 
             Box(
                 modifier = Modifier
+                    .heightIn(min = 36.dp)
                     .testTag("guard_test_alert_button")
                     .clip(RoundedCornerShape(100.dp))
                     .background(AuraPurple.copy(alpha = 0.16f))
                     .border(1.dp, AuraPurple.copy(alpha = 0.4f), RoundedCornerShape(100.dp))
                     .clickable {
                         guardMonitor.triggerSimulatedGuardTest()
-                        Toast.makeText(context, "Test alert triggered", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(
+                            context,
+                            "Sample Guard alert triggered — check Snooze & Trust actions",
+                            Toast.LENGTH_SHORT
+                        ).show()
                     }
-                    .padding(horizontal = 12.dp, vertical = 6.dp)
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                contentAlignment = Alignment.Center
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Default.NotificationsActive, contentDescription = "Test Alert", tint = AuraPurple, modifier = Modifier.size(14.dp))
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Test", color = AuraPurple, style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                    Text("Test Alert", color = AuraPurple, style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                }
+            }
+        }
+
+        if (!bgMonitoringEnabled || !liveGuardAlertsEnabled || !hasNotificationPermission) {
+            Spacer(modifier = Modifier.height(10.dp))
+            val (warnTitle, warnSubtitle, btnLabel, warnColor, onFix) = when {
+                !bgMonitoringEnabled -> GuardWarningBannerData(
+                    title = "Background Guard Paused",
+                    subtitle = "Alerts & screen-off monitoring are paused in Settings.",
+                    actionLabel = "Turn On",
+                    tint = AuraRose,
+                    onAction = {
+                        prefs.edit().putBoolean("background_monitoring", true).commit()
+                        startTrackingServiceSafely(context)
+                    }
+                )
+                !liveGuardAlertsEnabled -> GuardWarningBannerData(
+                    title = "Alert Notifications Muted",
+                    subtitle = "Live Mic, Cam & Screen alerts are muted in System Preferences.",
+                    actionLabel = "Unmute",
+                    tint = AuraOrange,
+                    onAction = {
+                        prefs.edit().putBoolean("live_guard_alerts", true).commit()
+                    }
+                )
+                else -> GuardWarningBannerData(
+                    title = "Notifications Blocked by Android",
+                    subtitle = "Allow notification access so Guard alerts can reach you.",
+                    actionLabel = "Allow",
+                    tint = AuraRose,
+                    onAction = {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            notificationPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        } else {
+                            openAppNotificationSettings(context)
+                        }
+                    }
+                )
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("guard_status_warning_banner")
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(warnColor.copy(alpha = 0.12f))
+                    .border(1.dp, warnColor.copy(alpha = 0.45f), RoundedCornerShape(16.dp))
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Default.Warning, contentDescription = null, tint = warnColor, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(10.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(warnTitle, color = warnColor, style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold))
+                    Text(warnSubtitle, color = TextSecondary, style = MaterialTheme.typography.labelSmall)
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Box(
+                    modifier = Modifier
+                        .heightIn(min = 36.dp)
+                        .clip(RoundedCornerShape(100.dp))
+                        .background(warnColor)
+                        .clickable { onFix() }
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(btnLabel, color = Obsidian, style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
                 }
             }
         }
@@ -373,7 +513,26 @@ fun LiveGuardScreen() {
             captureState = captureState,
             onScanClick = { triggerAnimatedDeepScan() },
             isScanning = isScanning,
-            scanProgress = scanProgress
+            scanProgress = scanProgress,
+            onScreenClick = {
+                context.startActivity(Intent(context, GuardRulesActivity::class.java))
+            },
+            onMicClick = {
+                activeSubTab = "TIMELINE"
+                activeTimelineFilter = "MIC"
+            },
+            onCameraClick = {
+                activeSubTab = "TIMELINE"
+                activeTimelineFilter = "CAMERA"
+            },
+            onLocationClick = {
+                activeSubTab = "TIMELINE"
+                activeTimelineFilter = "LOCATION"
+            },
+            onClipboardClick = {
+                activeSubTab = "TIMELINE"
+                activeTimelineFilter = "SPECIAL_ACCESS"
+            }
         )
 
         Spacer(modifier = Modifier.height(10.dp))
@@ -484,6 +643,8 @@ fun LiveGuardScreen() {
                     Spacer(modifier = Modifier.width(6.dp))
                     Box(
                         modifier = Modifier
+                            .heightIn(min = 36.dp)
+                            .testTag("timeline_system_log_button")
                             .clip(RoundedCornerShape(100.dp))
                             .background(AuraOrange.copy(alpha = 0.14f))
                             .border(1.dp, AuraOrange.copy(alpha = 0.35f), RoundedCornerShape(100.dp))
@@ -504,10 +665,11 @@ fun LiveGuardScreen() {
                                     Toast.makeText(context, "Privacy Dashboard unavailable on this OS", Toast.LENGTH_SHORT).show()
                                 }
                             }
-                            .padding(horizontal = 9.dp, vertical = 4.dp)
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                        contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            text = "OS Log",
+                            text = "System Log",
                             color = AuraOrange,
                             style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
                         )
@@ -984,12 +1146,25 @@ private fun formatRelativeTimelineTime(timestamp: Long): String {
     }
 }
 
+private data class GuardWarningBannerData(
+    val title: String,
+    val subtitle: String,
+    val actionLabel: String,
+    val tint: Color,
+    val onAction: () -> Unit
+)
+
 @Composable
 private fun CompactHardwareShieldCard(
     captureState: LiveCaptureState,
     onScanClick: () -> Unit,
     isScanning: Boolean,
-    scanProgress: Float
+    scanProgress: Float,
+    onScreenClick: () -> Unit,
+    onMicClick: () -> Unit,
+    onCameraClick: () -> Unit,
+    onLocationClick: () -> Unit,
+    onClipboardClick: () -> Unit
 ) {
     val anyActiveCapture = captureState.isScreenRecordingOrCasting ||
         captureState.isMicActive ||
@@ -1121,7 +1296,8 @@ private fun CompactHardwareShieldCard(
                 label = "Screen",
                 status = if (captureState.isScreenRecordingOrCasting) "Rec" else "Safe",
                 isActive = captureState.isScreenRecordingOrCasting,
-                activeColor = AuraRose
+                activeColor = AuraRose,
+                onClick = onScreenClick
             )
             LiveSensorChip(
                 modifier = Modifier.weight(1f),
@@ -1129,7 +1305,8 @@ private fun CompactHardwareShieldCard(
                 label = "Mic",
                 status = if (captureState.isMicActive) (captureState.activeMicApps.firstOrNull() ?: "Live") else "Silent",
                 isActive = captureState.isMicActive,
-                activeColor = AuraOrange
+                activeColor = AuraOrange,
+                onClick = onMicClick
             )
             LiveSensorChip(
                 modifier = Modifier.weight(1f),
@@ -1137,7 +1314,8 @@ private fun CompactHardwareShieldCard(
                 label = "Camera",
                 status = if (captureState.isCameraActive) (captureState.activeCameraApps.firstOrNull() ?: "Live") else "Idle",
                 isActive = captureState.isCameraActive,
-                activeColor = AuraOrange
+                activeColor = AuraOrange,
+                onClick = onCameraClick
             )
         }
 
@@ -1154,7 +1332,8 @@ private fun CompactHardwareShieldCard(
                 label = "Bg Location",
                 status = if (captureState.isBackgroundLocationActive) (captureState.activeLocationApps.firstOrNull() ?: "Active") else "Idle",
                 isActive = captureState.isBackgroundLocationActive,
-                activeColor = AuraOrange
+                activeColor = AuraOrange,
+                onClick = onLocationClick
             )
             LiveSensorChip(
                 modifier = Modifier.weight(1f),
@@ -1162,9 +1341,19 @@ private fun CompactHardwareShieldCard(
                 label = "Clipboard",
                 status = if (captureState.isClipboardAccessedRecently) (captureState.recentClipboardApps.firstOrNull() ?: "Read") else "Safe",
                 isActive = captureState.isClipboardAccessedRecently,
-                activeColor = AuraPurple
+                activeColor = AuraPurple,
+                onClick = onClipboardClick
             )
         }
+
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = "Tap a sensor to filter Timeline • Screen opens Rules",
+            color = TextTertiary,
+            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth()
+        )
 
         if (isScanning) {
             Spacer(modifier = Modifier.height(10.dp))
@@ -1172,7 +1361,7 @@ private fun CompactHardwareShieldCard(
                 progress = { scanProgress },
                 modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
                 color = AuraCyan,
-                trackColor = Color.White.copy(alpha = 0.08f),
+                trackColor = GlassBorder.copy(alpha = 0.45f),
                 strokeCap = StrokeCap.Round
             )
         }
@@ -1186,14 +1375,17 @@ private fun LiveSensorChip(
     label: String,
     status: String,
     isActive: Boolean,
-    activeColor: Color
+    activeColor: Color,
+    onClick: () -> Unit
 ) {
     val tint = if (isActive) activeColor else AuraGreen
     Row(
         modifier = modifier
+            .heightIn(min = 48.dp)
             .clip(RoundedCornerShape(14.dp))
             .background(tint.copy(alpha = 0.1f))
             .border(1.dp, tint.copy(alpha = 0.3f), RoundedCornerShape(14.dp))
+            .clickable { onClick() }
             .padding(vertical = 8.dp, horizontal = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.Center
@@ -1326,7 +1518,7 @@ private fun AuditVectorDetailSheet(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(14.dp))
-                .background(Color.White.copy(alpha = 0.05f))
+                .background(GlassBorder.copy(alpha = 0.22f))
                 .padding(12.dp)
         ) {
             Text(
@@ -1444,10 +1636,12 @@ private fun AuditVectorDetailSheet(
                     }
                     Box(
                         modifier = Modifier
+                            .heightIn(min = 36.dp)
                             .clip(RoundedCornerShape(100.dp))
                             .background(GlassBorder.copy(alpha = 0.4f))
                             .clickable { onIgnoreApp(app.packageName, app.appName) }
-                            .padding(horizontal = 9.dp, vertical = 4.dp)
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                        contentAlignment = Alignment.Center
                     ) {
                         Text(
                             text = "Ignore",
@@ -1538,15 +1732,17 @@ private fun GuardEventRow(
                     Spacer(modifier = Modifier.width(8.dp))
                     Box(
                         modifier = Modifier
+                            .heightIn(min = 36.dp)
                             .clip(RoundedCornerShape(100.dp))
                             .background(if (isIgnored) AuraCyan.copy(alpha = 0.14f) else GlassBorder.copy(alpha = 0.4f))
                             .clickable { onToggleIgnore(event.packageName) }
-                            .padding(horizontal = 8.dp, vertical = 3.dp)
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                        contentAlignment = Alignment.Center
                     ) {
                         Text(
                             text = if (isIgnored) "Restore" else "Ignore",
                             color = if (isIgnored) AuraCyan else TextSecondary,
-                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
                         )
                     }
                 }

@@ -96,6 +96,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -177,6 +179,7 @@ data class HiddenSettingItem(
 fun VitalsScreen(viewModel: ThermalViewModel, warningTemp: Float = 35f) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val prefs = remember(context) { context.getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE) }
 
     val liveData by viewModel.thermalMonitor.liveData.collectAsStateWithLifecycle(initialValue = LiveThermalData())
     val allRecords by viewModel.allRecords.collectAsStateWithLifecycle()
@@ -243,7 +246,7 @@ fun VitalsScreen(viewModel: ThermalViewModel, warningTemp: Float = 35f) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = "THERMAL & SETTINGS",
+                text = "TOOLS & THERMALS",
                 style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 3.sp, fontWeight = FontWeight.Bold),
                 color = tempColor
             )
@@ -343,7 +346,10 @@ fun VitalsScreen(viewModel: ThermalViewModel, warningTemp: Float = 35f) {
                     allRecords = allRecords,
                     warningTemp = warningTemp,
                     showChart = showChartInTempCard,
-                    onToggleChart = { showChartInTempCard = !showChartInTempCard }
+                    onToggleChart = { showChartInTempCard = !showChartInTempCard },
+                    onWarningTempChange = { newTemp ->
+                        prefs.edit().putFloat("warning_temp", newTemp).commit()
+                    }
                 )
             }
 
@@ -466,7 +472,7 @@ private fun SettingsOptionRow(
             )
         }
 
-        val tagText = item.liveBadge ?: item.secretDialerCode
+        val tagText = item.liveBadge ?: item.secretDialerCode?.let { "OEM • $it" }
         if (tagText != null) {
             Spacer(modifier = Modifier.width(8.dp))
             Box(
@@ -500,8 +506,10 @@ private fun SingleTempTrackingCard(
     allRecords: List<com.example.data.ThermalRecord>,
     warningTemp: Float,
     showChart: Boolean,
-    onToggleChart: () -> Unit
+    onToggleChart: () -> Unit,
+    onWarningTempChange: (Float) -> Unit
 ) {
+    var showThresholdSlider by remember { mutableStateOf(false) }
     val criticalTemp = warningTemp + 5f
     val last24h = remember(allRecords) {
         val cutoff = System.currentTimeMillis() - (24L * 60 * 60 * 1000L)
@@ -529,14 +537,17 @@ private fun SingleTempTrackingCard(
         modifier = Modifier
             .fillMaxWidth()
             .testTag("unified_temp_tracking_card")
-            .clickable { onToggleChart() }
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable { onToggleChart() }
+            ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         text = "TEMPERATURE",
@@ -579,17 +590,81 @@ private fun SingleTempTrackingCard(
                 }
             }
 
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(100.dp))
-                    .background(AuraCyan.copy(alpha = 0.14f))
-                    .border(1.dp, AuraCyan.copy(alpha = 0.35f), RoundedCornerShape(100.dp))
-                    .padding(horizontal = 10.dp, vertical = 4.dp)
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = if (showChart) "Hide 24h" else "24h Curve",
-                    color = AuraCyan,
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                Box(
+                    modifier = Modifier
+                        .heightIn(min = 34.dp)
+                        .testTag("temp_alert_limit_pill")
+                        .clip(RoundedCornerShape(100.dp))
+                        .background(if (showThresholdSlider) AuraOrange.copy(alpha = 0.18f) else GlassPanel)
+                        .border(
+                            1.dp,
+                            if (showThresholdSlider) AuraOrange else GlassBorder,
+                            RoundedCornerShape(100.dp)
+                        )
+                        .clickable { showThresholdSlider = !showThresholdSlider }
+                        .padding(horizontal = 9.dp, vertical = 5.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "Alert ${warningTemp.toInt()}°C",
+                        color = if (showThresholdSlider) AuraOrange else TextSecondary,
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    )
+                }
+
+                Box(
+                    modifier = Modifier
+                        .heightIn(min = 34.dp)
+                        .clip(RoundedCornerShape(100.dp))
+                        .background(AuraCyan.copy(alpha = 0.14f))
+                        .border(1.dp, AuraCyan.copy(alpha = 0.35f), RoundedCornerShape(100.dp))
+                        .clickable { onToggleChart() }
+                        .padding(horizontal = 10.dp, vertical = 5.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = if (showChart) "Hide 24h" else "24h Curve",
+                        color = AuraCyan,
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    )
+                }
+            }
+        }
+
+        AnimatedVisibility(visible = showThresholdSlider) {
+            Column(modifier = Modifier.fillMaxWidth().padding(top = 10.dp)) {
+                HorizontalDivider(color = GlassBorder.copy(alpha = 0.6f))
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Thermal Alert Limit",
+                        color = TextPrimary,
+                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold)
+                    )
+                    Text(
+                        text = "${warningTemp.toInt()}°C (Crit ${(warningTemp + 5).toInt()}°C)",
+                        color = AuraOrange,
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                    )
+                }
+                Slider(
+                    value = warningTemp.coerceIn(30f, 50f),
+                    onValueChange = onWarningTempChange,
+                    valueRange = 30f..50f,
+                    steps = 19,
+                    colors = SliderDefaults.colors(
+                        thumbColor = AuraOrange,
+                        activeTrackColor = AuraOrange,
+                        inactiveTrackColor = GlassBorder.copy(alpha = 0.5f)
+                    )
                 )
             }
         }

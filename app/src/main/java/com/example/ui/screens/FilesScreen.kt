@@ -115,6 +115,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -166,6 +167,13 @@ import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 import kotlin.math.max
 import kotlin.math.min
+
+data class StorageCategory(
+    val name: String,
+    val size: Long,
+    val color: Color,
+    val icon: ImageVector
+)
 
 data class BrowserFileItem(
     val file: File,
@@ -717,7 +725,7 @@ fun FilesScreen() {
         ModalBottomSheet(
             onDismissRequest = { itemForMenu = null },
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-            containerColor = Color(0xFF0F111A),
+            containerColor = GlassPanel,
             contentColor = TextPrimary
         ) {
             Column(
@@ -1100,6 +1108,23 @@ fun FilesScreen() {
         } else {
             // EXPLORER VIEW
             Column(modifier = Modifier.fillMaxSize()) {
+                if (!hasManageStorage && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    PermissionGrantBanner(
+                        icon = Icons.Default.Settings,
+                        accentColor = AuraRose,
+                        title = "All Files Access Needed",
+                        subtitle = "Required to browse, rename, move & overwrite files when shredding",
+                        onGrant = {
+                            val intent = Intent(
+                                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                Uri.parse("package:${context.packageName}")
+                            )
+                            manageStorageLauncher.launch(intent)
+                        }
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                }
+
                 // Quick Jump Shortcuts: Internal | Downloads | Camera | Docs | Pictures | Starred
                 Row(
                     modifier = Modifier
@@ -1601,7 +1626,7 @@ private fun FileDetailsSheet(
     ModalBottomSheet(
         onDismissRequest = onClose,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-        containerColor = Color(0xFF0F111A),
+        containerColor = GlassPanel,
         contentColor = TextPrimary
     ) {
         Column(
@@ -1769,20 +1794,20 @@ private fun BrowserItemCard(
             }
             Text(metaText, color = TextTertiary, style = MaterialTheme.typography.labelSmall)
         }
-        IconButton(onClick = onToggleSelect, modifier = Modifier.size(34.dp)) {
+        IconButton(onClick = onToggleSelect, modifier = Modifier.size(40.dp)) {
             Icon(
                 imageVector = if (isSelected) Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,
                 contentDescription = "Select",
                 tint = if (isSelected) AuraCyan else TextTertiary,
-                modifier = Modifier.size(19.dp)
+                modifier = Modifier.size(20.dp)
             )
         }
-        IconButton(onClick = onMoreClick, modifier = Modifier.size(34.dp)) {
+        IconButton(onClick = onMoreClick, modifier = Modifier.size(40.dp)) {
             Icon(
                 imageVector = Icons.Default.MoreVert,
                 contentDescription = "Actions",
                 tint = TextSecondary,
-                modifier = Modifier.size(19.dp)
+                modifier = Modifier.size(20.dp)
             )
         }
     }
@@ -2048,4 +2073,131 @@ private fun queryDocsSize(context: Context): Long {
     } catch (_: Exception) {
     }
     return size
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun StorageDonutChart(total: Long, used: Long, free: Long, categories: List<StorageCategory>) {
+    val safeTotal = max(1L, total)
+    val usedPct = ((used.toFloat() / safeTotal.toFloat()) * 100f).toInt().coerceIn(0, 100)
+
+    GlassCard(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column {
+                Text(
+                    text = "${formatBytes(free)} Free",
+                    style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+                    color = AuraCyan
+                )
+                Text(
+                    text = "${formatBytes(used)} used of ${formatBytes(total)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSecondary
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(100.dp))
+                    .background(AuraCyan.copy(alpha = 0.14f))
+                    .border(1.dp, AuraCyan.copy(alpha = 0.35f), RoundedCornerShape(100.dp))
+                    .padding(horizontal = 10.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    text = "$usedPct% USED",
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                    color = AuraCyan
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Segmented horizontal storage bar
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(8.dp)
+                .clip(RoundedCornerShape(4.dp))
+                .background(GlassBorder.copy(alpha = 0.45f))
+        ) {
+            categories.filter { it.size > 0L }.forEach { cat ->
+                val weightVal = (cat.size.toFloat() / safeTotal.toFloat()).coerceIn(0.01f, 1f)
+                Box(
+                    modifier = Modifier
+                        .weight(weightVal)
+                        .height(8.dp)
+                        .background(cat.color)
+                )
+            }
+            val freeWeight = (free.toFloat() / safeTotal.toFloat()).coerceIn(0f, 1f)
+            if (freeWeight > 0.01f) {
+                Spacer(modifier = Modifier.weight(freeWeight))
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            categories.filter { it.size > 0 }.forEach { cat ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(cat.color))
+                    Spacer(modifier = Modifier.width(5.dp))
+                    Text(
+                        text = "${cat.name} (${formatBytes(cat.size)})",
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                        color = TextSecondary
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun CategoryItemRow(cat: StorageCategory, totalSpace: Long, onClick: () -> Unit = {}) {
+    val isInteractive = cat.name in listOf("Images", "Videos", "Audio", "Documents", "Apps & Data")
+    val safeTotal = max(1L, totalSpace)
+    val modifier = if (isInteractive) {
+        Modifier.clickable { onClick() }
+    } else {
+        Modifier
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(modifier)
+            .padding(vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(32.dp)
+                .clip(CircleShape)
+                .background(cat.color.copy(alpha = 0.16f)),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(cat.icon, contentDescription = cat.name, tint = cat.color, modifier = Modifier.size(16.dp))
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(cat.name, style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold), color = TextPrimary)
+            Spacer(modifier = Modifier.height(3.dp))
+            LinearProgressIndicator(
+                progress = { (cat.size.toFloat() / safeTotal.toFloat()).coerceIn(0f, 1f) },
+                modifier = Modifier.fillMaxWidth().height(3.dp).clip(RoundedCornerShape(2.dp)),
+                color = cat.color,
+                trackColor = GlassBorder.copy(alpha = 0.45f),
+                strokeCap = StrokeCap.Round
+            )
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Text(formatBytes(cat.size), style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold), color = TextSecondary)
+    }
 }

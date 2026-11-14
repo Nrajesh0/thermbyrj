@@ -288,4 +288,29 @@ class ExampleRobolectricTest {
 
         assertEquals(null, monitor.detectActiveScreenRecordingFile())
     }
+
+    @Test
+    fun `manifest registers wired activities and light theme surfaces contrast properly`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val pm = context.packageManager
+
+        val dataTelemetryIntent = android.content.Intent(context, com.example.ui.screens.DataTelemetryActivity::class.java)
+        val guardRulesIntent = android.content.Intent(context, com.example.ui.screens.GuardRulesActivity::class.java)
+        assertTrue(pm.resolveActivity(dataTelemetryIntent, 0) != null)
+        assertTrue(pm.resolveActivity(guardRulesIntent, 0) != null)
+
+        val pkgInfo = pm.getPackageInfo(context.packageName, android.content.pm.PackageManager.GET_ACTIVITIES)
+        val activityNames = pkgInfo.activities?.map { it.name }.orEmpty()
+        assertFalse(activityNames.any { it.endsWith("StorageAnalysisActivity") })
+
+        val originalSurface = com.example.ui.theme.ThemeState.surfacePreset
+        try {
+            com.example.ui.theme.ThemeState.surfacePreset = com.example.ui.theme.SurfacePreset.PURE_WHITE
+            assertTrue(com.example.ui.theme.GlassPanel != com.example.ui.theme.TextPrimary)
+            assertTrue(com.example.ui.theme.GlassPanel.red > 0.8f)
+            assertTrue(com.example.ui.theme.TextPrimary.red < 0.2f)
+        } finally {
+            com.example.ui.theme.ThemeState.surfacePreset = originalSurface
+        }
+    }
 }
