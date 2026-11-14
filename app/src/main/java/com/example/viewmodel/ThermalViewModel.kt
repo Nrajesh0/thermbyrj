@@ -7,8 +7,6 @@ import com.example.data.AppDatabase
 import com.example.data.ThermalRecord
 import com.example.data.ThermalRepository
 import com.example.service.ThermalMonitor
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
@@ -28,10 +26,35 @@ class ThermalViewModel(application: Application) : AndroidViewModel(application)
         )
 
     init {
-        // Recording is now handled by ThermalTrackerService
+        thermalMonitor.startMonitoring()
+        viewModelScope.launch {
+            val live = thermalMonitor.liveData.value
+            if (live.batteryTemp > 0f && repository.getRecordCount() == 0) {
+                repository.insertRecord(
+                    ThermalRecord(
+                        timestamp = System.currentTimeMillis(),
+                        batteryTemp = live.batteryTemp,
+                        cpuTemp = live.cpuTemp,
+                        batteryLevel = live.batteryLevel
+                    )
+                )
+            }
+        }
     }
 
-    override fun onCleared() {
-        super.onCleared()
+    fun recordCurrentSampleIfNeeded() {
+        viewModelScope.launch {
+            val live = thermalMonitor.liveData.value
+            if (live.batteryTemp > 0f) {
+                repository.insertRecord(
+                    ThermalRecord(
+                        timestamp = System.currentTimeMillis(),
+                        batteryTemp = live.batteryTemp,
+                        cpuTemp = live.cpuTemp,
+                        batteryLevel = live.batteryLevel
+                    )
+                )
+            }
+        }
     }
 }

@@ -1,80 +1,142 @@
 package com.example
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.animation.core.*
+
+import android.Manifest
+import android.content.Context
+import android.content.Intent
+import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.TransformOrigin
-import androidx.compose.ui.graphics.drawscope.Stroke
-
-import android.os.BatteryManager
-import android.os.Bundle
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
-import androidx.activity.viewModels
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Analytics
-import androidx.compose.material.icons.filled.Memory
-import androidx.compose.material.icons.filled.BatteryFull
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Speed
-import androidx.compose.material.icons.outlined.Analytics
-import androidx.compose.material.icons.outlined.Memory
-import androidx.compose.material.icons.outlined.BatteryFull
+import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.Security
+import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Speed
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationRail
+import androidx.compose.material3.NavigationRailItem
+import androidx.compose.material3.NavigationRailItemDefaults
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.example.service.LiveThermalData
-import com.example.ui.components.ThermalChart
-import com.example.ui.screens.*
-import com.example.ui.theme.*
+import com.example.service.LiveGuardMonitor
+import com.example.service.ThermalTrackerService
+import com.example.ui.screens.FilesScreen
+import com.example.ui.screens.LiveGuardScreen
+import com.example.ui.screens.PrivacyShieldScreen
+import com.example.ui.screens.VitalsScreen
+import com.example.ui.theme.AppTheme
+import com.example.ui.theme.AuraCyan
+import com.example.ui.theme.AuraGreen
+import com.example.ui.theme.AuraOrange
+import com.example.ui.theme.AuraRose
+import com.example.ui.theme.GlassBorder
+import com.example.ui.theme.GlassPanel
+import com.example.ui.theme.Obsidian
+import com.example.ui.theme.TextPrimary
+import com.example.ui.theme.TextSecondary
+import com.example.ui.theme.TextTertiary
 import com.example.viewmodel.ThermalViewModel
 import kotlinx.coroutines.launch
-
-import android.content.Context
-import android.content.SharedPreferences
-import android.content.Intent
-import com.example.service.ThermalTrackerService
-import androidx.compose.ui.platform.LocalConfiguration
+import java.util.Locale
+import kotlin.math.log10
+import kotlin.math.pow
 
 class MainActivity : ComponentActivity() {
     private val viewModel: ThermalViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
-        // Start the background tracking service
-        val serviceIntent = Intent(this, ThermalTrackerService::class.java)
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            startForegroundService(serviceIntent)
-        } else {
-            startService(serviceIntent)
+
+        val prefs = getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("background_monitoring", true)) {
+            startTrackingServiceSafely(this)
         }
 
         enableEdgeToEdge()
@@ -86,33 +148,93 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+fun startTrackingServiceSafely(context: Context) {
+    try {
+        val serviceIntent = Intent(context, ThermalTrackerService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(serviceIntent)
+        } else {
+            context.startService(serviceIntent)
+        }
+    } catch (_: Exception) {
+    }
+}
+
+fun stopTrackingServiceSafely(context: Context) {
+    try {
+        context.stopService(Intent(context, ThermalTrackerService::class.java))
+    } catch (_: Exception) {
+    }
+}
+
 data class TabItem(val title: String, val selectedIcon: ImageVector, val unselectedIcon: ImageVector)
 
 @Composable
 fun MainScreen(viewModel: ThermalViewModel) {
+    val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
+    val prefs = remember { context.getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE) }
+
+    var warningTemp by remember { mutableFloatStateOf(prefs.getFloat("warning_temp", 35f)) }
+    var hapticEnabled by remember { mutableStateOf(prefs.getBoolean("haptic_feedback", true)) }
+    var bgMonitoringEnabled by remember { mutableStateOf(prefs.getBoolean("background_monitoring", true)) }
+    var liveGuardAlertsEnabled by remember { mutableStateOf(prefs.getBoolean("live_guard_alerts", true)) }
+
+    DisposableEffect(prefs) {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { sp, key ->
+            when (key) {
+                "warning_temp" -> warningTemp = sp.getFloat("warning_temp", 35f)
+                "haptic_feedback" -> hapticEnabled = sp.getBoolean("haptic_feedback", true)
+                "background_monitoring" -> bgMonitoringEnabled = sp.getBoolean("background_monitoring", true)
+                "live_guard_alerts" -> liveGuardAlertsEnabled = sp.getBoolean("live_guard_alerts", true)
+            }
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ -> }
+
+    LaunchedEffect(Unit) {
+        LiveGuardMonitor.getInstance(context).startMonitoring()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && bgMonitoringEnabled) {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
+
     val pagerState = rememberPagerState(pageCount = { 4 })
     val coroutineScope = rememberCoroutineScope()
     val liveData by viewModel.thermalMonitor.liveData.collectAsStateWithLifecycle()
-    
-    val tabs = listOf(
-        TabItem("Core", Icons.Filled.Speed, Icons.Outlined.Speed),
-        TabItem("Device", Icons.Filled.Memory, Icons.Outlined.Memory),
-        TabItem("Power", Icons.Filled.BatteryFull, Icons.Outlined.BatteryFull),
-        TabItem("Trends", Icons.Filled.Analytics, Icons.Outlined.Analytics)
-    )
-    // Force live reload
+    val captureState by LiveGuardMonitor.getInstance(context).captureState.collectAsStateWithLifecycle()
 
-    // Dynamic theming based on battery temperature
+    val tabs = remember {
+        listOf(
+            TabItem("Files", Icons.Filled.Folder, Icons.Outlined.Folder),
+            TabItem("Privacy", Icons.Filled.Shield, Icons.Outlined.Shield),
+            TabItem("Guard", Icons.Filled.Security, Icons.Outlined.Security),
+            TabItem("Vitals", Icons.Filled.Speed, Icons.Outlined.Speed)
+        )
+    }
+
+    val criticalTemp = warningTemp + 5f
     val ambientColor = when {
-        liveData.batteryTemp >= 40f -> AuraRose
-        liveData.batteryTemp >= 35f -> AuraOrange
+        captureState.isScreenRecordingOrCasting -> AuraRose
+        pagerState.currentPage == 0 -> AuraCyan
+        pagerState.currentPage == 1 -> AuraGreen
+        pagerState.currentPage == 2 -> if (captureState.isMicActive || captureState.isCameraActive) AuraOrange else AuraCyan
+        liveData.batteryTemp >= criticalTemp -> AuraRose
+        liveData.batteryTemp >= warningTemp -> AuraOrange
         liveData.batteryTemp >= 20f -> AuraGreen
         else -> AuraCyan
     }
 
-    val isExpandedScreen = LocalConfiguration.current.screenWidthDp > 600
+    BoxWithConstraints(modifier = Modifier.fillMaxSize().background(Obsidian)) {
+        val isExpandedScreen = maxWidth > 600.dp
 
-    Box(modifier = Modifier.fillMaxSize().background(Obsidian)) {
         Canvas(modifier = Modifier.fillMaxSize()) {
             drawCircle(
                 brush = Brush.radialGradient(
@@ -133,15 +255,18 @@ fun MainScreen(viewModel: ThermalViewModel) {
         if (isExpandedScreen) {
             Row(modifier = Modifier.fillMaxSize()) {
                 NavigationRail(
-                    modifier = Modifier.fillMaxHeight().width(100.dp),
+                    modifier = Modifier.fillMaxHeight().width(100.dp).statusBarsPadding(),
                     containerColor = Color(0xFF10121A).copy(alpha = 0.65f)
                 ) {
-                    Spacer(Modifier.height(48.dp))
+                    Spacer(Modifier.height(24.dp))
                     tabs.forEachIndexed { index, tab ->
                         val selected = pagerState.currentPage == index
                         NavigationRailItem(
                             selected = selected,
-                            onClick = { coroutineScope.launch { pagerState.animateScrollToPage(index) } },
+                            onClick = {
+                                if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                coroutineScope.launch { pagerState.animateScrollToPage(index) }
+                            },
                             icon = { Icon(if (selected) tab.selectedIcon else tab.unselectedIcon, contentDescription = tab.title) },
                             label = { Text(tab.title) },
                             colors = NavigationRailItemDefaults.colors(
@@ -154,16 +279,16 @@ fun MainScreen(viewModel: ThermalViewModel) {
                         )
                     }
                 }
-                
+
                 HorizontalPager(
                     state = pagerState,
                     modifier = Modifier.fillMaxSize().weight(1f)
                 ) { page ->
                     when (page) {
-                        0 -> DashboardScreen(viewModel)
-                        1 -> DeviceScreen(viewModel)
-                        2 -> PowerScreen(viewModel)
-                        3 -> HistoryScreen(viewModel)
+                        0 -> FilesScreen()
+                        1 -> PrivacyShieldScreen()
+                        2 -> LiveGuardScreen()
+                        3 -> VitalsScreen(viewModel, warningTemp)
                     }
                 }
             }
@@ -173,64 +298,64 @@ fun MainScreen(viewModel: ThermalViewModel) {
                 modifier = Modifier.fillMaxSize()
             ) { page ->
                 when (page) {
-                    0 -> DashboardScreen(viewModel)
-                    1 -> DeviceScreen(viewModel)
-                    2 -> PowerScreen(viewModel)
-                    3 -> HistoryScreen(viewModel)
+                    0 -> FilesScreen()
+                    1 -> PrivacyShieldScreen()
+                    2 -> LiveGuardScreen()
+                    3 -> VitalsScreen(viewModel, warningTemp)
                 }
             }
 
             Box(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 48.dp)
-                .fillMaxWidth(0.95f)
-                .clip(RoundedCornerShape(100.dp))
-                .background(Color(0xFF10121A).copy(alpha = 0.65f))
-                .border(1.dp, GlassBorder, RoundedCornerShape(100.dp))
-                .padding(8.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(bottom = 16.dp)
+                    .fillMaxWidth(0.92f)
+                    .clip(RoundedCornerShape(100.dp))
+                    .background(Color(0xFF10121A).copy(alpha = 0.82f))
+                    .border(1.dp, GlassBorder, RoundedCornerShape(100.dp))
+                    .padding(horizontal = 8.dp, vertical = 6.dp)
             ) {
-                tabs.forEachIndexed { index, tab ->
-                    val selected = pagerState.currentPage == index
-                    val interactionSource = remember { MutableInteractionSource() }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    tabs.forEachIndexed { index, tab ->
+                        val selected = pagerState.currentPage == index
 
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(100.dp))
-                            .background(if (selected) Color.White.copy(alpha = 0.1f) else Color.Transparent)
-                            .clickable(
-                                interactionSource = interactionSource,
-                                indication = null
-                            ) {
-                                coroutineScope.launch {
-                                    pagerState.animateScrollToPage(index)
+                        Box(
+                            modifier = Modifier
+                                .testTag("nav_tab_${tab.title.lowercase()}")
+                                .clip(RoundedCornerShape(100.dp))
+                                .background(if (selected) Color.White.copy(alpha = 0.12f) else Color.Transparent)
+                                .clickable {
+                                    if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    coroutineScope.launch {
+                                        pagerState.animateScrollToPage(index)
+                                    }
                                 }
-                            }
-                            .padding(horizontal = if (selected) 16.dp else 12.dp, vertical = 12.dp)
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = if (selected) tab.selectedIcon else tab.unselectedIcon,
-                                contentDescription = tab.title,
-                                tint = if (selected) TextPrimary else TextSecondary,
-                                modifier = Modifier.size(22.dp)
-                            )
-                            AnimatedVisibility(visible = selected) {
-                                Row {
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = tab.title,
-                                        color = TextPrimary,
-                                        style = MaterialTheme.typography.labelMedium.copy(
-                                            fontWeight = FontWeight.SemiBold,
-                                            letterSpacing = 0.5.sp
+                                .padding(horizontal = if (selected) 16.dp else 14.dp, vertical = 12.dp)
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = if (selected) tab.selectedIcon else tab.unselectedIcon,
+                                    contentDescription = tab.title,
+                                    tint = if (selected) TextPrimary else TextSecondary,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                                AnimatedVisibility(visible = selected) {
+                                    Row {
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = tab.title,
+                                            color = TextPrimary,
+                                            style = MaterialTheme.typography.labelMedium.copy(
+                                                fontWeight = FontWeight.SemiBold,
+                                                letterSpacing = 0.5.sp
+                                            )
                                         )
-                                    )
+                                    }
                                 }
                             }
                         }
@@ -238,8 +363,14 @@ fun MainScreen(viewModel: ThermalViewModel) {
                 }
             }
         }
-        }
-        MorphingSettingsOrb()
+
+        MorphingSettingsOrb(
+            prefs = prefs,
+            hapticEnabled = hapticEnabled,
+            bgMonitoringEnabled = bgMonitoringEnabled,
+            liveGuardAlertsEnabled = liveGuardAlertsEnabled,
+            warningTemp = warningTemp
+        )
     }
 }
 
@@ -248,10 +379,10 @@ fun GlassCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.()
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(32.dp))
-            .background(GlassPanel.copy(alpha = 0.5f))
+            .background(GlassPanel.copy(alpha = 0.55f))
             .border(1.dp, GlassBorder, RoundedCornerShape(32.dp))
     ) {
-        Column(modifier = Modifier.padding(28.dp), content = content)
+        Column(modifier = Modifier.padding(24.dp), content = content)
     }
 }
 
@@ -263,6 +394,7 @@ fun InfoRow(label: String, value: String) {
         verticalAlignment = Alignment.CenterVertically
     ) {
         Text(label, style = MaterialTheme.typography.labelSmall, color = TextTertiary)
+        Spacer(modifier = Modifier.width(12.dp))
         Text(value, style = MaterialTheme.typography.bodyMedium, color = TextPrimary, fontWeight = FontWeight.Medium)
     }
 }
@@ -270,8 +402,8 @@ fun InfoRow(label: String, value: String) {
 fun formatBytes(bytes: Long): String {
     if (bytes <= 0) return "0 B"
     val units = arrayOf("B", "KB", "MB", "GB", "TB")
-    val digitGroups = (Math.log10(bytes.toDouble()) / Math.log10(1024.0)).toInt()
-    return String.format("%.1f %s", bytes / Math.pow(1024.0, digitGroups.toDouble()), units[digitGroups])
+    val digitGroups = (log10(bytes.toDouble()) / log10(1024.0)).toInt().coerceIn(0, units.lastIndex)
+    return String.format(Locale.US, "%.1f %s", bytes / 1024.0.pow(digitGroups.toDouble()), units[digitGroups])
 }
 
 fun formatUptime(millis: Long): String {
@@ -283,9 +415,21 @@ fun formatUptime(millis: Long): String {
 }
 
 @Composable
-fun MorphingSettingsOrb() {
+fun MorphingSettingsOrb(
+    prefs: SharedPreferences,
+    hapticEnabled: Boolean,
+    bgMonitoringEnabled: Boolean,
+    liveGuardAlertsEnabled: Boolean,
+    warningTemp: Float
+) {
+    val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
     var isExpanded by remember { mutableStateOf(false) }
-    
+
+    BackHandler(enabled = isExpanded) {
+        isExpanded = false
+    }
+
     val infiniteTransition = rememberInfiniteTransition(label = "orb_rotation")
     val rotation by infiniteTransition.animateFloat(
         initialValue = 0f,
@@ -298,8 +442,8 @@ fun MorphingSettingsOrb() {
     )
 
     val pulse by infiniteTransition.animateFloat(
-        initialValue = 0.8f,
-        targetValue = 1.2f,
+        initialValue = 0.85f,
+        targetValue = 1.15f,
         animationSpec = infiniteRepeatable(
             animation = tween(1500, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Reverse
@@ -308,39 +452,47 @@ fun MorphingSettingsOrb() {
     )
 
     Box(modifier = Modifier.fillMaxSize()) {
-        
         // The Orb (Top Right)
         Box(
             modifier = Modifier
                 .align(Alignment.TopEnd)
-                .padding(top = 48.dp, end = 24.dp)
+                .statusBarsPadding()
+                .padding(top = 12.dp, end = 16.dp)
                 .size(48.dp)
-                .clickable(
-                    interactionSource = remember { MutableInteractionSource() },
-                    indication = null
-                ) { isExpanded = !isExpanded },
+                .testTag("settings_orb_button")
+                .semantics {
+                    contentDescription = "Open system preferences"
+                    role = Role.Button
+                }
+                .clip(RoundedCornerShape(24.dp))
+                .clickable {
+                    if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    isExpanded = !isExpanded
+                },
             contentAlignment = Alignment.Center
         ) {
-            Canvas(modifier = Modifier.size(32.dp).graphicsLayer {
-                scaleX = pulse
-                scaleY = pulse
-                rotationZ = rotation
-            }) {
+            Canvas(
+                modifier = Modifier.size(32.dp).graphicsLayer {
+                    scaleX = pulse
+                    scaleY = pulse
+                    rotationZ = rotation
+                }
+            ) {
                 drawArc(
-                    color = AuraCyan.copy(alpha = 0.6f),
+                    color = AuraCyan.copy(alpha = 0.65f),
                     startAngle = 0f,
                     sweepAngle = 270f,
                     useCenter = false,
-                    style = Stroke(width = 4.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round)
+                    style = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round)
                 )
                 drawArc(
-                    color = AuraRose.copy(alpha = 0.8f),
+                    color = AuraRose.copy(alpha = 0.85f),
                     startAngle = 90f,
                     sweepAngle = 180f,
                     useCenter = false,
                     topLeft = Offset(4.dp.toPx(), 4.dp.toPx()),
                     size = Size(size.width - 8.dp.toPx(), size.height - 8.dp.toPx()),
-                    style = Stroke(width = 2.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round)
+                    style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
                 )
             }
         }
@@ -348,59 +500,112 @@ fun MorphingSettingsOrb() {
         // Full Screen Overlay
         AnimatedVisibility(
             visible = isExpanded,
-            enter = fadeIn(tween(400)) + scaleIn(initialScale = 0.05f, transformOrigin = TransformOrigin(0.9f, 0.1f), animationSpec = tween(400, easing = FastOutSlowInEasing)),
-            exit = fadeOut(tween(300)) + scaleOut(targetScale = 0.05f, transformOrigin = TransformOrigin(0.9f, 0.1f), animationSpec = tween(300, easing = FastOutSlowInEasing)),
+            enter = fadeIn(tween(300)) + scaleIn(
+                initialScale = 0.1f,
+                transformOrigin = TransformOrigin(0.9f, 0.1f),
+                animationSpec = tween(300, easing = FastOutSlowInEasing)
+            ),
+            exit = fadeOut(tween(250)) + scaleOut(
+                targetScale = 0.1f,
+                transformOrigin = TransformOrigin(0.9f, 0.1f),
+                animationSpec = tween(250, easing = FastOutSlowInEasing)
+            ),
             modifier = Modifier.fillMaxSize()
         ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Obsidian.copy(alpha = 0.95f))
+                    .background(Obsidian.copy(alpha = 0.96f))
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null
-                    ) { isExpanded = false } // Click background to close
+                    ) { isExpanded = false }
             ) {
-                // Settings Content
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(32.dp)
+                        .statusBarsPadding()
+                        .navigationBarsPadding()
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 28.dp, vertical = 24.dp)
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null
-                        ) { /* Consume clicks so they don't close the overlay */ }
+                        ) { /* Consume background clicks */ }
                 ) {
-                    Spacer(modifier = Modifier.height(64.dp))
-                    
+                    Spacer(modifier = Modifier.height(24.dp))
+
                     Text(
-                        "SYSTEM PREFERENCES", 
+                        "SYSTEM PREFERENCES",
                         style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 4.sp, fontWeight = FontWeight.Bold),
                         color = AuraCyan
                     )
-                    
-                    Spacer(modifier = Modifier.height(48.dp))
-                    
-                    SettingsToggleRow(title = "Haptic Feedback", initial = true)
-                    SettingsToggleRow(title = "Background Monitoring", initial = true)
-                    val prefs = LocalContext.current.getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
-                    SettingsSliderRow(title = "Warning Temp Limit", prefs = prefs)
-                    SettingsToggleRow(title = "Auto-Calibration", initial = false)
-                    
-                    Spacer(modifier = Modifier.weight(1f))
-                    
+
+                    Spacer(modifier = Modifier.height(32.dp))
+
+                    SettingsToggleRow(
+                        title = "Haptic Feedback",
+                        subtitle = "Tactile feedback on navigation and controls",
+                        checked = hapticEnabled,
+                        onCheckedChange = { enabled ->
+                            prefs.edit().putBoolean("haptic_feedback", enabled).apply()
+                            if (enabled) haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        }
+                    )
+
+                    SettingsToggleRow(
+                        title = "Live Screen & Mic Guard Alerts",
+                        subtitle = "Warn immediately if an app records screen or audio in background",
+                        checked = liveGuardAlertsEnabled,
+                        onCheckedChange = { enabled ->
+                            if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            prefs.edit().putBoolean("live_guard_alerts", enabled).apply()
+                        }
+                    )
+
+                    SettingsToggleRow(
+                        title = "Background Guard & Thermal Service",
+                        subtitle = "Keep screen-recording guard & thermal telemetry active in background",
+                        checked = bgMonitoringEnabled,
+                        onCheckedChange = { enabled ->
+                            if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            prefs.edit().putBoolean("background_monitoring", enabled).apply()
+                            if (enabled) {
+                                startTrackingServiceSafely(context)
+                            } else {
+                                stopTrackingServiceSafely(context)
+                            }
+                        }
+                    )
+
+                    SettingsSliderRow(
+                        title = "Warning Temp Limit",
+                        value = warningTemp,
+                        onValueChange = { newTemp ->
+                            prefs.edit().putFloat("warning_temp", newTemp).apply()
+                        }
+                    )
+
+                    Spacer(modifier = Modifier.weight(1f, fill = false))
+                    Spacer(modifier = Modifier.height(32.dp))
+
                     Box(
                         modifier = Modifier
                             .align(Alignment.CenterHorizontally)
+                            .testTag("settings_close_button")
                             .clip(RoundedCornerShape(100.dp))
                             .clickable { isExpanded = false }
-                            .background(Color.White.copy(alpha = 0.1f))
-                            .padding(horizontal = 32.dp, vertical = 12.dp)
+                            .background(Color.White.copy(alpha = 0.12f))
+                            .padding(horizontal = 36.dp, vertical = 14.dp)
                     ) {
-                        Text("CLOSE", color = TextPrimary, style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 2.sp))
+                        Text(
+                            "CLOSE",
+                            color = TextPrimary,
+                            style = MaterialTheme.typography.labelMedium.copy(letterSpacing = 2.sp, fontWeight = FontWeight.SemiBold)
+                        )
                     }
-                    
-                    Spacer(modifier = Modifier.height(48.dp))
+
+                    Spacer(modifier = Modifier.height(24.dp))
                 }
             }
         }
@@ -408,8 +613,11 @@ fun MorphingSettingsOrb() {
 }
 
 @Composable
-fun SettingsSliderRow(title: String, prefs: SharedPreferences) {
-    var value by remember { mutableStateOf(prefs.getFloat("warning_temp", 35f)) }
+fun SettingsSliderRow(
+    title: String,
+    value: Float,
+    onValueChange: (Float) -> Unit
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -421,14 +629,16 @@ fun SettingsSliderRow(title: String, prefs: SharedPreferences) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(title, color = TextPrimary, style = MaterialTheme.typography.bodyLarge)
-            Text("${value.toInt()}°C", color = AuraCyan, style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Bold))
+            Text(
+                "${value.toInt()}°C (Crit ${(value + 5).toInt()}°C)",
+                color = AuraCyan,
+                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold)
+            )
         }
+        Spacer(modifier = Modifier.height(8.dp))
         Slider(
-            value = value,
-            onValueChange = { 
-                value = it 
-                prefs.edit().putFloat("warning_temp", it).apply()
-            },
+            value = value.coerceIn(30f, 50f),
+            onValueChange = onValueChange,
             valueRange = 30f..50f,
             steps = 19,
             colors = SliderDefaults.colors(
@@ -441,23 +651,28 @@ fun SettingsSliderRow(title: String, prefs: SharedPreferences) {
 }
 
 @Composable
-fun SettingsToggleRow(title: String, initial: Boolean) {
-    var checked by remember { mutableStateOf(initial) }
+fun SettingsToggleRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null
-            ) { checked = !checked }
-            .padding(vertical = 16.dp),
+            .clickable { onCheckedChange(!checked) }
+            .padding(vertical = 14.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(title, color = if (checked) TextPrimary else TextSecondary, style = MaterialTheme.typography.bodyLarge)
+        Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+            Text(title, color = if (checked) TextPrimary else TextSecondary, style = MaterialTheme.typography.bodyLarge)
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(subtitle, color = TextTertiary, style = MaterialTheme.typography.bodySmall)
+        }
         Switch(
             checked = checked,
-            onCheckedChange = { checked = it },
+            onCheckedChange = onCheckedChange,
             colors = SwitchDefaults.colors(
                 checkedThumbColor = Obsidian,
                 checkedTrackColor = AuraCyan,

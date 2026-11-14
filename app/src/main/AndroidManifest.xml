@@ -58,6 +58,7 @@
         <activity android:name=".ui.screens.DuplicateFinderActivity" android:exported="false" android:theme="@style/Theme.MyApplication" />
         <activity android:name=".ui.screens.DeepCleanActivity" android:exported="false" android:theme="@style/Theme.MyApplication" />
         <activity android:name=".ui.screens.VaultActivity" android:exported="false" android:theme="@style/Theme.MyApplication" />
+        <activity android:name=".ui.screens.DataTelemetryActivity" android:exported="false" android:theme="@style/Theme.MyApplication" />
         <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.fileprovider" android:exported="false" android:grantUriPermissions="true">
             <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
         </provider>

@@ -6,42 +6,70 @@ import android.app.usage.StorageStatsManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.Process
 import android.os.StatFs
-import android.net.Uri
 import android.os.storage.StorageManager
 import android.provider.MediaStore
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import com.example.ui.screens.VaultActivity
-import com.example.ui.screens.DuplicateFinderActivity
-import com.example.ui.screens.DeepCleanActivity
-import androidx.compose.material.icons.filled.FilterNone
-import androidx.compose.material.icons.filled.CleaningServices
-import androidx.compose.material.icons.filled.Lock
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.Image
-import androidx.compose.material.icons.filled.VideoLibrary
-import androidx.compose.material.icons.filled.AudioFile
-import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Apps
-import androidx.compose.material.icons.filled.SystemUpdate
+import androidx.compose.material.icons.filled.AudioFile
+import androidx.compose.material.icons.filled.CleaningServices
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.FilterNone
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material.icons.filled.SystemUpdate
+import androidx.compose.material.icons.filled.VideoLibrary
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -51,14 +79,29 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.GlassCard
 import com.example.formatBytes
-import com.example.ui.theme.*
+import com.example.ui.theme.AuraCyan
+import com.example.ui.theme.AuraGreen
+import com.example.ui.theme.AuraOrange
+import com.example.ui.theme.AuraPurple
+import com.example.ui.theme.AuraRose
+import com.example.ui.theme.GlassBorder
+import com.example.ui.theme.TextPrimary
+import com.example.ui.theme.TextSecondary
+import com.example.ui.theme.TextTertiary
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.File
+import kotlin.math.max
+import kotlin.math.min
 
 data class StorageCategory(
     val name: String,
@@ -72,62 +115,86 @@ private fun hasUsageStatsPermission(context: Context): Boolean {
     val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
         appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
     } else {
+        @Suppress("DEPRECATION")
         appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
     }
     return mode == AppOpsManager.MODE_ALLOWED
+}
+
+private fun hasMediaPermission(context: Context): Boolean {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED
+    } else {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun StorageAnalysisScreen(onBack: () -> Unit) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
     var categories by remember { mutableStateOf<List<StorageCategory>>(emptyList()) }
-    var totalSpace by remember { mutableStateOf(0L) }
-    var usedSpace by remember { mutableStateOf(0L) }
-    var freeSpace by remember { mutableStateOf(0L) }
+    var totalSpace by remember { mutableLongStateOf(0L) }
+    var usedSpace by remember { mutableLongStateOf(0L) }
+    var freeSpace by remember { mutableLongStateOf(0L) }
     var isAnalyzing by remember { mutableStateOf(true) }
     var hasUsageAccess by remember { mutableStateOf(hasUsageStatsPermission(context)) }
-    var hasManageStorage by remember { 
+    var hasManageStorage by remember {
         mutableStateOf(
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else true
         )
     }
+    var hasPermission by remember { mutableStateOf(hasMediaPermission(context)) }
+    var hasRequestedOnce by remember { mutableStateOf(false) }
+    var analysisTrigger by remember { mutableIntStateOf(0) }
 
     val manageStorageLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) {
         hasManageStorage = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else true
-    }
-
-    var hasPermission by remember { 
-        mutableStateOf(
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED &&
-                ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED &&
-                ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED
-            } else {
-                ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-            }
-        )
+        analysisTrigger++
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissions ->
-        hasPermission = permissions.values.all { it }
+    ) {
+        hasPermission = hasMediaPermission(context)
+        hasRequestedOnce = true
+        analysisTrigger++
     }
 
     val usageAccessLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) {
         hasUsageAccess = hasUsageStatsPermission(context)
-        if (hasUsageAccess) {
-            isAnalyzing = true
-        }
+        analysisTrigger++
     }
 
-    LaunchedEffect(hasPermission, hasUsageAccess, isAnalyzing) {
-        if (!hasPermission) {
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                val newUsage = hasUsageStatsPermission(context)
+                val newManage = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else true
+                val newMedia = hasMediaPermission(context)
+                if (newUsage != hasUsageAccess || newManage != hasManageStorage || newMedia != hasPermission) {
+                    hasUsageAccess = newUsage
+                    hasManageStorage = newManage
+                    hasPermission = newMedia
+                    analysisTrigger++
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    LaunchedEffect(Unit) {
+        if (!hasPermission && !hasRequestedOnce) {
+            hasRequestedOnce = true
             val perms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 arrayOf(
                     Manifest.permission.READ_MEDIA_IMAGES,
@@ -138,50 +205,57 @@ fun StorageAnalysisScreen(onBack: () -> Unit) {
                 arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
             }
             permissionLauncher.launch(perms)
-        } else if (isAnalyzing) {
-            withContext(Dispatchers.IO) {
-                val statFs = StatFs(Environment.getDataDirectory().path)
-                totalSpace = statFs.totalBytes
-                freeSpace = statFs.availableBytes
-                usedSpace = totalSpace - freeSpace
+        }
+    }
 
-                val imageSize = getMediaSize(context, MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
-                val videoSize = getMediaSize(context, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
-                val audioSize = getMediaSize(context, MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
-                val docsSize = getDocumentSize(context)
+    LaunchedEffect(analysisTrigger, hasPermission, hasUsageAccess) {
+        isAnalyzing = true
+        withContext(Dispatchers.IO) {
+            val statFs = StatFs(Environment.getDataDirectory().path)
+            val tot = statFs.totalBytes
+            val free = statFs.availableBytes
+            val used = max(0L, tot - free)
 
-                val otherUsed = maxOf(0L, usedSpace - (imageSize + videoSize + audioSize + docsSize))
-                
-                var exactAppSize = 0L
-                if (hasUsageStatsPermission(context)) {
-                    try {
-                        val storageStatsManager = context.getSystemService(Context.STORAGE_STATS_SERVICE) as StorageStatsManager
-                        val pm = context.packageManager
-                        val packages = pm.getInstalledApplications(PackageManager.GET_META_DATA)
-                        for (app in packages) {
-                            try {
-                                val stats = storageStatsManager.queryStatsForUid(StorageManager.UUID_DEFAULT, app.uid)
-                                exactAppSize += stats.appBytes + stats.dataBytes + stats.cacheBytes
-                            } catch (e: Exception) {}
+            val imageSize = if (hasPermission) getMediaSize(context, MediaStore.Images.Media.EXTERNAL_CONTENT_URI) else 0L
+            val videoSize = if (hasPermission) getMediaSize(context, MediaStore.Video.Media.EXTERNAL_CONTENT_URI) else 0L
+            val audioSize = if (hasPermission) getMediaSize(context, MediaStore.Audio.Media.EXTERNAL_CONTENT_URI) else 0L
+            val docsSize = if (hasPermission) getDocumentSize(context) else 0L
+
+            val mediaTotal = imageSize + videoSize + audioSize + docsSize
+            val otherUsed = max(0L, used - mediaTotal)
+
+            var exactAppSize = 0L
+            if (hasUsageStatsPermission(context)) {
+                try {
+                    val storageStatsManager = context.getSystemService(Context.STORAGE_STATS_SERVICE) as StorageStatsManager
+                    val pm = context.packageManager
+                    val packages = pm.getInstalledApplications(PackageManager.GET_META_DATA)
+                    for (app in packages) {
+                        try {
+                            val stats = storageStatsManager.queryStatsForUid(StorageManager.UUID_DEFAULT, app.uid)
+                            exactAppSize += stats.appBytes + stats.dataBytes + stats.cacheBytes
+                        } catch (_: Exception) {
                         }
-                    } catch (e: Exception) {}
+                    }
+                } catch (_: Exception) {
                 }
-
-                val appSize = if (exactAppSize > 0) exactAppSize else (otherUsed * 0.4).toLong() 
-                val systemSize = maxOf(0L, otherUsed - appSize)
-
-                categories = listOf(
-                    StorageCategory("Images", imageSize, AuraCyan, Icons.Default.Image),
-                    StorageCategory("Videos", videoSize, AuraOrange, Icons.Default.VideoLibrary),
-                    StorageCategory("Audio", audioSize, AuraRose, Icons.Default.AudioFile),
-                    StorageCategory("Documents", maxOf(0L, docsSize), AuraGreen, Icons.Default.Description),
-                    StorageCategory("Apps & Data", appSize, AuraPurple, Icons.Default.Apps),
-                    StorageCategory("System", systemSize, Color.Gray, Icons.Default.SystemUpdate)
-                ).sortedByDescending { it.size }
-
-                kotlinx.coroutines.delay(800)
-                isAnalyzing = false
             }
+
+            val appSize = if (exactAppSize > 0L) min(exactAppSize, otherUsed) else (otherUsed * 0.4).toLong()
+            val systemSize = max(0L, otherUsed - appSize)
+
+            totalSpace = tot
+            freeSpace = free
+            usedSpace = used
+            categories = listOf(
+                StorageCategory("Images", imageSize, AuraCyan, Icons.Default.Image),
+                StorageCategory("Videos", videoSize, AuraOrange, Icons.Default.VideoLibrary),
+                StorageCategory("Audio", audioSize, AuraRose, Icons.Default.AudioFile),
+                StorageCategory("Documents", max(0L, docsSize), AuraGreen, Icons.Default.Description),
+                StorageCategory("Apps & Data", appSize, AuraPurple, Icons.Default.Apps),
+                StorageCategory("System", systemSize, Color.Gray, Icons.Default.SystemUpdate)
+            ).sortedByDescending { it.size }
+            isAnalyzing = false
         }
     }
 
@@ -192,7 +266,7 @@ fun StorageAnalysisScreen(onBack: () -> Unit) {
                 title = { Text("Storage Analysis", color = TextPrimary, fontWeight = FontWeight.Bold) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = TextPrimary)
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = TextPrimary)
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)
@@ -200,12 +274,12 @@ fun StorageAnalysisScreen(onBack: () -> Unit) {
         }
     ) { padding ->
         if (isAnalyzing) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Box(modifier = Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     CircularProgressIndicator(color = AuraCyan)
                     Spacer(modifier = Modifier.height(16.dp))
                     Text(
-                        text = if (!hasPermission) "Waiting for permissions..." else "Analyzing File System...", 
+                        text = "Analyzing File System...",
                         color = TextSecondary,
                         style = MaterialTheme.typography.bodyMedium
                     )
@@ -223,7 +297,39 @@ fun StorageAnalysisScreen(onBack: () -> Unit) {
                     StorageDonutChart(totalSpace, usedSpace, freeSpace, categories)
                 }
 
-                if (!hasUsageAccess) {
+                if (!hasPermission) {
+                    item {
+                        GlassCard(modifier = Modifier.fillMaxWidth()) {
+                            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.FolderOpen, contentDescription = null, tint = AuraCyan)
+                                Spacer(modifier = Modifier.width(16.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("Media Access Needed", color = TextPrimary, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                                    Text("Grant media permissions to scan Images, Videos, Audio & Docs.", color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Button(
+                                    onClick = {
+                                        val perms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                            arrayOf(
+                                                Manifest.permission.READ_MEDIA_IMAGES,
+                                                Manifest.permission.READ_MEDIA_VIDEO,
+                                                Manifest.permission.READ_MEDIA_AUDIO
+                                            )
+                                        } else {
+                                            arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+                                        }
+                                        permissionLauncher.launch(perms)
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = AuraCyan)
+                                ) {
+                                    Text("Grant", color = Color.Black)
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if (!hasManageStorage && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     item {
                         GlassCard(modifier = Modifier.fillMaxWidth()) {
@@ -231,13 +337,16 @@ fun StorageAnalysisScreen(onBack: () -> Unit) {
                                 Icon(Icons.Default.Settings, contentDescription = null, tint = AuraRose)
                                 Spacer(modifier = Modifier.width(16.dp))
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text("God Mode Storage", color = TextPrimary, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
-                                    Text("Grant full access for Secure Deletion.", color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+                                    Text("All Files Access", color = TextPrimary, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                                    Text("Grant All Files Access for Deep Clean & Secure Wipe.", color = TextSecondary, style = MaterialTheme.typography.bodySmall)
                                 }
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Button(
-                                    onClick = { 
-                                        val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:${context.packageName}"))
+                                    onClick = {
+                                        val intent = Intent(
+                                            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                            Uri.parse("package:${context.packageName}")
+                                        )
                                         manageStorageLauncher.launch(intent)
                                     },
                                     colors = ButtonDefaults.buttonColors(containerColor = AuraRose)
@@ -248,6 +357,8 @@ fun StorageAnalysisScreen(onBack: () -> Unit) {
                         }
                     }
                 }
+
+                if (!hasUsageAccess) {
                     item {
                         GlassCard(modifier = Modifier.fillMaxWidth()) {
                             Row(
@@ -262,7 +373,7 @@ fun StorageAnalysisScreen(onBack: () -> Unit) {
                                 }
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Button(
-                                    onClick = { 
+                                    onClick = {
                                         usageAccessLauncher.launch(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
                                     },
                                     colors = ButtonDefaults.buttonColors(containerColor = AuraOrange)
@@ -278,45 +389,45 @@ fun StorageAnalysisScreen(onBack: () -> Unit) {
                     Text("ADVANCED TOOLS", style = MaterialTheme.typography.labelSmall, color = TextTertiary, letterSpacing = 2.sp)
                     Spacer(modifier = Modifier.height(16.dp))
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        com.example.GlassCard(
+                        GlassCard(
                             modifier = Modifier.weight(1f).clickable {
                                 context.startActivity(Intent(context, DuplicateFinderActivity::class.java))
                             }
                         ) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                                 Icon(Icons.Default.FilterNone, contentDescription = "Duplicate Finder", tint = AuraCyan, modifier = Modifier.size(28.dp))
                                 Spacer(modifier = Modifier.height(12.dp))
                                 Text("Duplicate\nFinder", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp), color = TextPrimary, textAlign = TextAlign.Center)
                             }
                         }
-                        
-                        com.example.GlassCard(
+
+                        GlassCard(
                             modifier = Modifier.weight(1f).clickable {
                                 context.startActivity(Intent(context, DeepCleanActivity::class.java))
                             }
                         ) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                                 Icon(Icons.Default.CleaningServices, contentDescription = "Deep Clean", tint = AuraOrange, modifier = Modifier.size(28.dp))
                                 Spacer(modifier = Modifier.height(12.dp))
                                 Text("Deep\nClean", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp), color = TextPrimary, textAlign = TextAlign.Center)
                             }
                         }
-                        
-                        com.example.GlassCard(
+
+                        GlassCard(
                             modifier = Modifier.weight(1f).clickable {
                                 context.startActivity(Intent(context, VaultActivity::class.java))
                             }
                         ) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                                 Icon(Icons.Default.Lock, contentDescription = "Secure Vault", tint = AuraRose, modifier = Modifier.size(28.dp))
                                 Spacer(modifier = Modifier.height(12.dp))
                                 Text("Secure\nVault", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp), color = TextPrimary, textAlign = TextAlign.Center)
                             }
                         }
                     }
-                    Spacer(modifier = Modifier.height(24.dp))
+                    Spacer(modifier = Modifier.height(16.dp))
                 }
-                
+
                 item {
                     Text("CATEGORIES", style = MaterialTheme.typography.labelSmall, color = TextTertiary, letterSpacing = 2.sp)
                     Spacer(modifier = Modifier.height(8.dp))
@@ -336,25 +447,24 @@ fun StorageAnalysisScreen(onBack: () -> Unit) {
                         }
                     }
                 }
-                
-                item { Spacer(modifier = Modifier.height(32.dp)) }
+
+                item { Spacer(modifier = Modifier.navigationBarsPadding().height(32.dp)) }
             }
         }
     }
 }
 
-private fun getMediaSize(context: Context, uri: android.net.Uri): Long {
+private fun getMediaSize(context: Context, uri: Uri): Long {
     var size = 0L
     try {
         val projection = arrayOf(MediaStore.MediaColumns.SIZE)
         context.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
             val sizeColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
             while (cursor.moveToNext()) {
-                size += cursor.getLong(sizeColumn)
+                size += max(0L, cursor.getLong(sizeColumn))
             }
         }
-    } catch (e: Exception) {
-        e.printStackTrace()
+    } catch (_: Exception) {
     }
     return size
 }
@@ -363,27 +473,37 @@ private fun getDocumentSize(context: Context): Long {
     var size = 0L
     try {
         val uri = MediaStore.Files.getContentUri("external")
-        val projection = arrayOf(MediaStore.MediaColumns.SIZE, MediaStore.MediaColumns.DATA)
+        val projection = arrayOf(
+            MediaStore.MediaColumns.SIZE,
+            MediaStore.MediaColumns.DISPLAY_NAME,
+            MediaStore.MediaColumns.DATA
+        )
         context.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
             val sizeColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
-            val dataColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA)
+            val nameColumn = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
+            val dataColumn = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
             val docExtensions = setOf("pdf", "txt", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "csv", "rtf")
             while (cursor.moveToNext()) {
-                val path = cursor.getString(dataColumn) ?: ""
-                val ext = java.io.File(path).extension.lowercase()
+                val path = if (dataColumn >= 0) cursor.getString(dataColumn) ?: "" else ""
+                val displayName = if (nameColumn >= 0) cursor.getString(nameColumn) ?: "" else ""
+                val candidate = path.ifBlank { displayName }
+                val ext = File(candidate).extension.lowercase()
                 if (ext in docExtensions) {
-                    size += cursor.getLong(sizeColumn)
+                    size += max(0L, cursor.getLong(sizeColumn))
                 }
             }
         }
-    } catch (e: Exception) {
-        e.printStackTrace()
+    } catch (_: Exception) {
     }
     return size
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun StorageDonutChart(total: Long, used: Long, free: Long, categories: List<StorageCategory>) {
+    val safeTotal = max(1L, total)
+    val usedPct = ((used.toFloat() / safeTotal.toFloat()) * 100f).toInt().coerceIn(0, 100)
+
     GlassCard(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.fillMaxWidth(),
@@ -398,25 +518,27 @@ fun StorageDonutChart(total: Long, used: Long, free: Long, categories: List<Stor
                         style = Stroke(width = strokeWidth)
                     )
 
-                    var startAngle = -90f
-                    categories.forEach { cat ->
-                        val sweepAngle = (cat.size.toFloat() / total) * 360f
-                        if (sweepAngle > 1f) {
-                            drawArc(
-                                color = cat.color,
-                                startAngle = startAngle,
-                                sweepAngle = sweepAngle - 2f, // Small gap
-                                useCenter = false,
-                                style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
-                            )
-                            startAngle += sweepAngle
+                    if (total > 0L) {
+                        var startAngle = -90f
+                        categories.forEach { cat ->
+                            val sweepAngle = (cat.size.toFloat() / safeTotal.toFloat()) * 360f
+                            if (sweepAngle > 2.5f) {
+                                drawArc(
+                                    color = cat.color,
+                                    startAngle = startAngle,
+                                    sweepAngle = sweepAngle - 2f,
+                                    useCenter = false,
+                                    style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+                                )
+                                startAngle += sweepAngle
+                            }
                         }
                     }
                 }
-                
+
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(
-                        text = "${((used.toFloat() / total) * 100).toInt()}%",
+                        text = "$usedPct%",
                         style = MaterialTheme.typography.headlineLarge,
                         color = TextPrimary,
                         fontWeight = FontWeight.Bold
@@ -440,13 +562,29 @@ fun StorageDonutChart(total: Long, used: Long, free: Long, categories: List<Stor
                     Text(formatBytes(free), style = MaterialTheme.typography.bodyLarge, color = AuraCyan)
                 }
             }
+
+            Spacer(modifier = Modifier.height(16.dp))
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                categories.filter { it.size > 0 }.forEach { cat ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(cat.color))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(cat.name, style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+                    }
+                }
+            }
         }
     }
 }
 
 @Composable
 fun CategoryItemRow(cat: StorageCategory, totalSpace: Long, onClick: () -> Unit = {}) {
-    val modifier = if (cat.name in listOf("Images", "Videos", "Audio", "Documents", "Apps & Data")) {
+    val isInteractive = cat.name in listOf("Images", "Videos", "Audio", "Documents", "Apps & Data")
+    val safeTotal = max(1L, totalSpace)
+    val modifier = if (isInteractive) {
         Modifier.clickable { onClick() }
     } else {
         Modifier
@@ -472,7 +610,7 @@ fun CategoryItemRow(cat: StorageCategory, totalSpace: Long, onClick: () -> Unit 
             Text(cat.name, style = MaterialTheme.typography.bodyMedium, color = TextPrimary)
             Spacer(modifier = Modifier.height(4.dp))
             LinearProgressIndicator(
-                progress = { (cat.size.toFloat() / totalSpace).coerceIn(0f, 1f) },
+                progress = { (cat.size.toFloat() / safeTotal.toFloat()).coerceIn(0f, 1f) },
                 modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
                 color = cat.color,
                 trackColor = Color.White.copy(alpha = 0.05f),
