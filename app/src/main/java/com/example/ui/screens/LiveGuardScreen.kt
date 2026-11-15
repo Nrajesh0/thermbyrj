@@ -201,6 +201,7 @@ fun LiveGuardScreen() {
     val ignoredPackages by guardMonitor.ignoredPackages.collectAsStateWithLifecycle()
     val rulesConfig by guardMonitor.rulesConfig.collectAsStateWithLifecycle()
     val activeSnoozes by guardMonitor.activeSnoozes.collectAsStateWithLifecycle()
+    val acknowledgedVectors by guardMonitor.acknowledgedVectors.collectAsStateWithLifecycle()
 
     var bgMonitoringEnabled by remember { mutableStateOf(prefs.getBoolean("background_monitoring", true)) }
     var liveGuardAlertsEnabled by remember { mutableStateOf(prefs.getBoolean("live_guard_alerts", true)) }
@@ -210,9 +211,7 @@ fun LiveGuardScreen() {
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         hasNotificationPermission = granted
-        if (granted) {
-            guardMonitor.notifyActiveChecksNow()
-        } else {
+        if (!granted) {
             openAppNotificationSettings(context)
         }
     }
@@ -266,6 +265,7 @@ fun LiveGuardScreen() {
         refreshTrigger,
         globalRefreshVersion,
         ignoredPackages,
+        acknowledgedVectors,
         latestSensorEventId,
         captureState.isScreenRecordingOrCasting,
         captureState.isMicActive,
@@ -274,19 +274,24 @@ fun LiveGuardScreen() {
         captureState.isClipboardAccessedRecently
     ) {
         if (!isScanning) {
-            val (vectors, timeline) = withContext(Dispatchers.IO) {
-                val v = guardMonitor.runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = false)
-                val t = PrivacyAnalyzer.getPermissionAccessTimeline(
-                    context,
-                    includeSystemApps = false,
-                    forceRefresh = true
-                )
-                v to t
-            }
-            auditVectors = vectors
-            accessTimeline = timeline
-            if (selectedVector != null) {
-                selectedVector = vectors.find { it.id == selectedVector?.id }
+            try {
+                val (vectors, timeline) = withContext(Dispatchers.IO) {
+                    val v = guardMonitor.runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = false)
+                    val t = PrivacyAnalyzer.getPermissionAccessTimeline(
+                        context,
+                        includeSystemApps = false,
+                        forceRefresh = true
+                    )
+                    v to t
+                }
+                auditVectors = vectors
+                accessTimeline = timeline
+                if (selectedVector != null) {
+                    selectedVector = vectors.find { it.id == selectedVector?.id }
+                }
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
             }
         }
     }
@@ -307,19 +312,24 @@ fun LiveGuardScreen() {
         if (isScanning) return
         coroutineScope.launch {
             isScanning = true
-            for (step in 1..4) {
-                scanProgress = step * 0.25f
-                delay(180)
+            try {
+                for (step in 1..4) {
+                    scanProgress = step * 0.25f
+                    delay(180)
+                }
+                val (results, timeline) = withContext(Dispatchers.IO) {
+                    val v = guardMonitor.runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = true)
+                    val t = PrivacyAnalyzer.getPermissionAccessTimeline(context, includeSystemApps = false, forceRefresh = true)
+                    v to t
+                }
+                auditVectors = results
+                accessTimeline = timeline
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+            } finally {
+                isScanning = false
             }
-            val (results, timeline) = withContext(Dispatchers.IO) {
-                val v = guardMonitor.runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = true)
-                guardMonitor.notifyActiveChecksNow()
-                val t = PrivacyAnalyzer.getPermissionAccessTimeline(context, includeSystemApps = false, forceRefresh = true)
-                v to t
-            }
-            auditVectors = results
-            accessTimeline = timeline
-            isScanning = false
         }
     }
 
@@ -356,7 +366,16 @@ fun LiveGuardScreen() {
                 },
                 onIgnoreApp = { pkg, appLabel ->
                     guardMonitor.ignorePackage(pkg)
-                    Toast.makeText(context, "Ignored $appLabel in Live Guard", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Trusted $appLabel in Live Guard", Toast.LENGTH_SHORT).show()
+                },
+                onToggleAcknowledge = {
+                    if (vector.isAcknowledged) {
+                        guardMonitor.unacknowledgeVector(vector.id)
+                        Toast.makeText(context, "Restored active check for ${vector.title}", Toast.LENGTH_SHORT).show()
+                    } else {
+                        guardMonitor.acknowledgeVector(vector)
+                        Toast.makeText(context, "Marked ${vector.title} as Expected (Safe)", Toast.LENGTH_SHORT).show()
+                    }
                 },
                 onClose = { selectedVector = null }
             )
@@ -562,7 +581,7 @@ fun LiveGuardScreen() {
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // 3-Way Segmented Switcher: CHECKS | TIMELINE | EVENT LOG
+        // 2-Way Segmented Switcher: SECURITY CHECKS (Posture) | ACTIVITY TIMELINE (Verified History)
         val flaggedCount = auditVectors.count { it.severity != AuditSeverity.SAFE }
         Row(
             modifier = Modifier
@@ -573,9 +592,8 @@ fun LiveGuardScreen() {
                 .padding(3.dp)
         ) {
             val tabs = listOf(
-                Triple("CHECKS", if (flaggedCount == 0) "CHECKS (SAFE)" else "CHECKS ($flaggedCount)", AuraCyan),
-                Triple("TIMELINE", "TIMELINE (${accessTimeline.size})", AuraOrange),
-                Triple("LOG", "EVENT LOG (${events.size})", AuraPurple)
+                Triple("CHECKS", if (flaggedCount == 0) "SECURITY CHECKS (SAFE)" else "SECURITY CHECKS ($flaggedCount)", AuraCyan),
+                Triple("TIMELINE", "ACTIVITY TIMELINE (${accessTimeline.size})", AuraOrange)
             )
             tabs.forEach { (key, label, tint) ->
                 val selected = activeSubTab == key
@@ -666,6 +684,29 @@ fun LiveGuardScreen() {
                     }
 
                     Spacer(modifier = Modifier.width(6.dp))
+                    if (events.size > 1) {
+                        Box(
+                            modifier = Modifier
+                                .heightIn(min = 36.dp)
+                                .clip(RoundedCornerShape(100.dp))
+                                .background(GlassPanel.copy(alpha = 0.7f))
+                                .border(1.dp, GlassBorder, RoundedCornerShape(100.dp))
+                                .clickable {
+                                    guardMonitor.clearEvents()
+                                    Toast.makeText(context, "Timeline history cleared", Toast.LENGTH_SHORT).show()
+                                }
+                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.Default.DeleteSweep,
+                                contentDescription = "Clear History",
+                                tint = TextSecondary,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(4.dp))
+                    }
                     Box(
                         modifier = Modifier
                             .heightIn(min = 36.dp)
@@ -682,7 +723,7 @@ fun LiveGuardScreen() {
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            text = "System Log",
+                            text = "OS Log",
                             color = AuraOrange,
                             style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
                         )
@@ -858,57 +899,6 @@ fun LiveGuardScreen() {
                     }
                 }
             }
-
-            "LOG" -> {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    contentPadding = PaddingValues(bottom = 112.dp)
-                ) {
-                    if (events.isNotEmpty()) {
-                        item {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.End
-                            ) {
-                                TextButton(onClick = { guardMonitor.clearEvents() }) {
-                                    Icon(Icons.Default.DeleteSweep, contentDescription = null, tint = TextSecondary, modifier = Modifier.size(16.dp))
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("Clear Log", color = TextSecondary, style = MaterialTheme.typography.labelSmall)
-                                }
-                            }
-                        }
-                    }
-                    if (events.isEmpty()) {
-                        item {
-                            GlassCard(modifier = Modifier.fillMaxWidth()) {
-                                Text(
-                                    "No background alerts recorded.",
-                                    color = TextSecondary,
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                            }
-                        }
-                    } else {
-                        itemsIndexed(events, key = { index, ev -> "${ev.id}_$index" }) { _, ev ->
-                            val isIgnored = ev.packageName != null && ev.packageName in ignoredPackages
-                            GuardEventRow(
-                                event = ev,
-                                isIgnored = isIgnored,
-                                onToggleIgnore = { pkg ->
-                                    if (isIgnored) {
-                                        guardMonitor.unignorePackage(pkg)
-                                        Toast.makeText(context, "Restored alerts", Toast.LENGTH_SHORT).show()
-                                    } else {
-                                        guardMonitor.ignorePackage(pkg)
-                                        Toast.makeText(context, "Ignored in Live Guard", Toast.LENGTH_SHORT).show()
-                                    }
-                                }
-                            )
-                        }
-                    }
-                }
-            }
         }
     }
 }
@@ -988,11 +978,12 @@ private fun TimelineConnectedSpineRow(
         permissionVisuals(event.permissionInfo, event.category)
     }
 
-    val clockLabel = remember(event.timestamp) {
-        SimpleDateFormat("hh:mm a", Locale.US).format(Date(event.timestamp))
+    val isLiveNow = event.id.startsWith("live_now_")
+    val clockLabel = remember(event.timestamp, isLiveNow) {
+        if (isLiveNow) "ACTIVE" else SimpleDateFormat("hh:mm a", Locale.US).format(Date(event.timestamp))
     }
-    val dateOrRelLabel = remember(event.timestamp) {
-        formatRelativeTimelineTime(event.timestamp)
+    val dateOrRelLabel = remember(event.timestamp, isLiveNow) {
+        if (isLiveNow) "LIVE NOW" else formatRelativeTimelineTime(event.timestamp)
     }
 
     Row(
@@ -1010,15 +1001,15 @@ private fun TimelineConnectedSpineRow(
         ) {
             Text(
                 text = dateOrRelLabel,
-                color = tint,
+                color = if (isLiveNow) AuraRose else tint,
                 style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
                 textAlign = TextAlign.End,
                 maxLines = 1
             )
             Text(
                 text = clockLabel,
-                color = TextTertiary,
-                style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                color = if (isLiveNow) AuraOrange else TextTertiary,
+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = if (isLiveNow) FontWeight.Bold else FontWeight.Normal),
                 textAlign = TextAlign.End,
                 maxLines = 1
             )
@@ -1079,8 +1070,8 @@ private fun TimelineConnectedSpineRow(
                 .weight(1f)
                 .padding(vertical = 4.dp)
                 .clip(RoundedCornerShape(14.dp))
-                .background(GlassPanel.copy(alpha = 0.65f))
-                .border(1.dp, GlassBorder, RoundedCornerShape(14.dp))
+                .background(if (isLiveNow) tint.copy(alpha = 0.14f) else GlassPanel.copy(alpha = 0.65f))
+                .border(1.dp, if (isLiveNow) tint.copy(alpha = 0.65f) else GlassBorder, RoundedCornerShape(14.dp))
                 .clickable { onClick() }
                 .padding(horizontal = 12.dp, vertical = 10.dp)
         ) {
@@ -1486,6 +1477,7 @@ private fun AuditVectorDetailSheet(
     onOpenSettings: (String) -> Unit,
     onInspectApp: (String) -> Unit,
     onIgnoreApp: (packageName: String, appLabel: String) -> Unit,
+    onToggleAcknowledge: () -> Unit,
     onClose: () -> Unit
 ) {
     val sevColor = when (vector.severity) {
@@ -1551,21 +1543,66 @@ private fun AuditVectorDetailSheet(
             }
         }
 
-        if (vector.settingsAction != null) {
+        val canAcknowledge = vector.id != "screen_recording" &&
+            vector.id != "live_mic_cam" &&
+            (vector.severity != AuditSeverity.SAFE || vector.isAcknowledged) &&
+            vector.currentSignature.isNotBlank()
+
+        if (vector.settingsAction != null || canAcknowledge) {
             Spacer(modifier = Modifier.height(12.dp))
-            Button(
-                onClick = { onOpenSettings(vector.settingsAction) },
-                colors = ButtonDefaults.buttonColors(containerColor = AuraCyan),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text(
-                    text = vector.actionButtonLabel.uppercase(),
-                    color = Obsidian,
-                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null, tint = Obsidian, modifier = Modifier.size(14.dp))
+                if (vector.settingsAction != null) {
+                    Button(
+                        onClick = { onOpenSettings(vector.settingsAction) },
+                        colors = ButtonDefaults.buttonColors(containerColor = AuraCyan),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text(
+                            text = vector.actionButtonLabel.uppercase(),
+                            color = Obsidian,
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null, tint = Obsidian, modifier = Modifier.size(14.dp))
+                    }
+                }
+                if (canAcknowledge) {
+                    Button(
+                        onClick = onToggleAcknowledge,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (vector.isAcknowledged) GlassBorder else AuraGreen.copy(alpha = 0.18f)
+                        ),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .border(
+                                1.dp,
+                                if (vector.isAcknowledged) GlassBorder else AuraGreen.copy(alpha = 0.55f),
+                                RoundedCornerShape(14.dp)
+                            )
+                    ) {
+                        Icon(
+                            Icons.Default.CheckCircle,
+                            contentDescription = null,
+                            tint = if (vector.isAcknowledged) TextSecondary else AuraGreen,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = if (vector.isAcknowledged) "UNMARK SAFE" else "MARK AS SAFE",
+                            color = if (vector.isAcknowledged) TextPrimary else AuraGreen,
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
             }
         }
 

@@ -590,42 +590,60 @@ fun AppItemCard(app: AppItem, onClick: () -> Unit) {
     }
 }
 
-private val globalAppIconCache = android.util.LruCache<String, ImageBitmap>(220)
+private val globalAppIconCache = android.util.LruCache<String, ImageBitmap>(240)
 
 internal fun getCachedAppIconBitmap(packageName: String, drawable: Drawable): ImageBitmap {
+    val safeKey = packageName.ifBlank { "default.app.icon" }
     synchronized(globalAppIconCache) {
-        globalAppIconCache.get(packageName)?.let { return it }
+        globalAppIconCache.get(safeKey)?.let { return it }
     }
-    val bmp = drawable.toSafeBitmap(maxSizePx = 96).asImageBitmap()
+    val bmp = try {
+        synchronized(drawable) {
+            drawable.toSafeBitmap(maxSizePx = 96).asImageBitmap()
+        }
+    } catch (_: Throwable) {
+        Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888).asImageBitmap()
+    }
     synchronized(globalAppIconCache) {
-        globalAppIconCache.put(packageName, bmp)
+        globalAppIconCache.put(safeKey, bmp)
     }
     return bmp
 }
 
 internal fun Drawable.toSafeBitmap(maxSizePx: Int = 96): Bitmap {
-    if (this is BitmapDrawable && this.bitmap != null) {
-        val src = this.bitmap
-        if (src.width <= maxSizePx && src.height <= maxSizePx) {
-            return src
+    return try {
+        if (this is BitmapDrawable) {
+            val src = this.bitmap
+            if (src != null && !src.isRecycled) {
+                val softwareSrc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && src.config == Bitmap.Config.HARDWARE) {
+                    src.copy(Bitmap.Config.ARGB_8888, false) ?: src
+                } else {
+                    src
+                }
+                if (softwareSrc.width <= maxSizePx && softwareSrc.height <= maxSizePx) {
+                    return softwareSrc
+                }
+                return Bitmap.createScaledBitmap(softwareSrc, maxSizePx, maxSizePx, true)
+            }
         }
-        return Bitmap.createScaledBitmap(src, maxSizePx, maxSizePx, true)
+        val rawW = if (intrinsicWidth > 0) intrinsicWidth else maxSizePx
+        val rawH = if (intrinsicHeight > 0) intrinsicHeight else maxSizePx
+        val width = rawW.coerceIn(1, maxSizePx)
+        val height = rawH.coerceIn(1, maxSizePx)
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        setBounds(0, 0, canvas.width, canvas.height)
+        draw(canvas)
+        bitmap
+    } catch (_: Throwable) {
+        Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
     }
-    val rawW = if (intrinsicWidth > 0) intrinsicWidth else maxSizePx
-    val rawH = if (intrinsicHeight > 0) intrinsicHeight else maxSizePx
-    val width = rawW.coerceIn(1, maxSizePx)
-    val height = rawH.coerceIn(1, maxSizePx)
-    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-    val canvas = Canvas(bitmap)
-    setBounds(0, 0, canvas.width, canvas.height)
-    draw(canvas)
-    return bitmap
 }
 
 private fun drawableToImageBitmap(packageName: String, drawable: Drawable): ImageBitmap? {
     return try {
         getCachedAppIconBitmap(packageName, drawable)
-    } catch (_: Exception) {
+    } catch (_: Throwable) {
         null
     }
 }

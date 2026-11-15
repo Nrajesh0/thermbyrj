@@ -64,7 +64,9 @@ data class SecurityAuditVector(
     val flaggedApps: List<AppPrivacyReport> = emptyList(),
     val extraDetails: List<String> = emptyList(),
     val settingsAction: String? = null,
-    val actionButtonLabel: String = "Open Settings"
+    val actionButtonLabel: String = "Open Settings",
+    val isAcknowledged: Boolean = false,
+    val currentSignature: String = ""
 )
 
 data class GuardEvent(
@@ -84,7 +86,17 @@ class LiveGuardMonitor private constructor(private val context: Context) {
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     private val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val bgExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val bgExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+        Thread({
+            try {
+                runnable.run()
+            } catch (_: Throwable) {
+            }
+        }, "LiveGuardBgThread").apply {
+            isDaemon = true
+            uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, _ -> }
+        }
+    }
     private val prefs = context.getSharedPreferences("guard_events_prefs", Context.MODE_PRIVATE)
 
     private val _captureState = MutableStateFlow(LiveCaptureState())
@@ -104,6 +116,9 @@ class LiveGuardMonitor private constructor(private val context: Context) {
 
     private val _activeSnoozes = MutableStateFlow<List<SnoozeRule>>(emptyList())
     val activeSnoozes: StateFlow<List<SnoozeRule>> = _activeSnoozes.asStateFlow()
+
+    private val _acknowledgedVectors = MutableStateFlow<Map<String, String>>(emptyMap())
+    val acknowledgedVectors: StateFlow<Map<String, String>> = _acknowledgedVectors.asStateFlow()
 
     @Volatile
     private var cachedAuditVectors: List<SecurityAuditVector>? = null
@@ -125,9 +140,11 @@ class LiveGuardMonitor private constructor(private val context: Context) {
     private var lastCameraLogged = false
     @Volatile
     private var lastCameraAlertDispatched = false
-    private val lastLocationAlertMs = mutableMapOf<String, Long>()
-    private val lastClipboardAlertMs = mutableMapOf<String, Long>()
-    private val notifiedAuditVectorSignatures = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val lastLocationAlertMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val lastClipboardAlertMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val knownVectorItemsMap = java.util.concurrent.ConcurrentHashMap<String, Set<String>>()
+    @Volatile
+    private var vectorBaselineInitialized = false
     @Volatile
     private var osScreenRecordingActive = false
     @Volatile
@@ -140,9 +157,13 @@ class LiveGuardMonitor private constructor(private val context: Context) {
     private var videoObserverRegistered = false
     private var settingsObserverRegistered = false
 
+    @Volatile
     private var pendingMicLogRunnable: Runnable? = null
+    @Volatile
     private var pendingMicAlertRunnable: Runnable? = null
+    @Volatile
     private var pendingCamLogRunnable: Runnable? = null
+    @Volatile
     private var pendingCamAlertRunnable: Runnable? = null
 
     // Bounded label cache & launcher cache to avoid repeated PackageManager binder IPC
@@ -159,7 +180,11 @@ class LiveGuardMonitor private constructor(private val context: Context) {
     private var cachedActiveFgPkg: String? = null
     private var cachedActiveFgClass: String? = null
     private var cachedActiveFgResumeTs: Long = 0L
+    private var cachedLastNonSelfFgPkg: String? = null
+    private var cachedLastNonSelfFgTs: Long = 0L
     private val cachedLastLeftMap = mutableMapOf<String, Long>()
+    private val cachedActiveFgServiceStartMap = mutableMapOf<String, Long>()
+    private val cachedActiveFgServiceStopMap = mutableMapOf<String, Long>()
     private val cachedRecServiceStartMap = mutableMapOf<String, Long>()
     private val cachedRecServiceStopMap = mutableMapOf<String, Long>()
     private val cachedRecLastResumeMap = mutableMapOf<String, Long>()
@@ -419,6 +444,11 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     try {
                         val pkgOps = fetchAllPackageOps()
                         val usageSnapshot = queryCombinedUsageState()
+                        refreshMicAndCallState(
+                            triggerAlertIfNew = true,
+                            preloadedPkgOpsList = pkgOps,
+                            preloadedUsageSnapshot = usageSnapshot
+                        )
                         refreshDisplayCaptureState(
                             triggerAlertIfNew = true,
                             preloadedPkgOpsList = pkgOps,
@@ -430,13 +460,13 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                             preloadedUsageSnapshot = usageSnapshot
                         )
                         val now = System.currentTimeMillis()
-                        if (now - lastPermissionDiffCheckMs >= 20_000L) {
+                        if (now - lastPermissionDiffCheckMs >= 90_000L) {
                             lastPermissionDiffCheckMs = now
                             try {
                                 val summary = PrivacyAnalyzer.analyzeDevicePrivacy(
                                     context,
                                     includeSystemApps = false,
-                                    forceRefresh = true
+                                    forceRefresh = false
                                 )
                                 PrivacyAnalyzer.getPrivacyChanges(
                                     context = context,
@@ -452,8 +482,12 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     }
                 }
             }
-            // Fast 6s cadence while screen is interactive so background Screen Recording, Mirroring & Live Guard checks trigger promptly
-            val nextDelayMs = if (!screenInteractive) 20_000L else 6_000L
+            // Adaptive polling: 3s cadence while app UI is open for instant call/sensor responsiveness; 15s in background
+            val nextDelayMs = when {
+                !screenInteractive -> 20_000L
+                com.example.MainActivity.isUiForeground -> 3_000L
+                else -> 15_000L
+            }
             mainHandler.postDelayed(this, nextDelayMs)
         }
     }
@@ -632,12 +666,109 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         loadRulesConfig()
         loadTrustedRules()
         loadSnoozes()
+        loadAcknowledgedVectors()
+        loadKnownVectorBaseline()
     }
 
     fun reloadPersistedState() {
         loadRulesConfig()
         loadTrustedRules()
         loadSnoozes()
+        loadAcknowledgedVectors()
+        loadKnownVectorBaseline()
+    }
+
+    fun acknowledgeVector(vector: SecurityAuditVector) {
+        val sig = vector.currentSignature.ifBlank {
+            computeVectorSignature(vector.flaggedApps, vector.extraDetails)
+        }
+        if (sig.isBlank()) return
+        val updated = _acknowledgedVectors.value.toMutableMap()
+        updated[vector.id] = sig
+        persistAcknowledgedVectors(updated)
+    }
+
+    fun unacknowledgeVector(vectorId: String) {
+        val updated = _acknowledgedVectors.value.toMutableMap()
+        updated.remove(vectorId)
+        persistAcknowledgedVectors(updated)
+    }
+
+    private fun persistAcknowledgedVectors(map: Map<String, String>) {
+        _acknowledgedVectors.value = map
+        try {
+            val obj = JSONObject()
+            for ((k, v) in map) {
+                obj.put(k, v)
+            }
+            prefs.edit().putString("acknowledged_vectors_json", obj.toString()).apply()
+        } catch (_: Exception) {
+        }
+        cachedAuditVectors = null
+        cachedAuditVectorsTimeMs = 0L
+        PrivacyAnalyzer.invalidateTimelineCache()
+    }
+
+    private fun loadAcknowledgedVectors() {
+        try {
+            val raw = prefs.getString("acknowledged_vectors_json", null) ?: return
+            val obj = JSONObject(raw)
+            val map = mutableMapOf<String, String>()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val v = obj.optString(k, "")
+                if (k.isNotBlank() && v.isNotBlank()) {
+                    map[k] = v
+                }
+            }
+            _acknowledgedVectors.value = map
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun loadKnownVectorBaseline() {
+        try {
+            vectorBaselineInitialized = prefs.getBoolean("vector_baseline_initialized_v2", false)
+            val raw = prefs.getString("known_vector_items_v2_json", null) ?: return
+            val obj = JSONObject(raw)
+            knownVectorItemsMap.clear()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val arr = obj.optJSONArray(k) ?: continue
+                val set = mutableSetOf<String>()
+                for (i in 0 until arr.length()) {
+                    val item = arr.optString(i)
+                    if (item.isNotBlank()) set.add(item)
+                }
+                knownVectorItemsMap[k] = set
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun saveKnownVectorBaseline() {
+        try {
+            val obj = JSONObject()
+            for ((k, set) in knownVectorItemsMap) {
+                obj.put(k, JSONArray(set.toList()))
+            }
+            prefs.edit()
+                .putBoolean("vector_baseline_initialized_v2", vectorBaselineInitialized)
+                .putString("known_vector_items_v2_json", obj.toString())
+                .apply()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun computeVectorSignature(
+        flaggedApps: List<AppPrivacyReport>,
+        extraDetails: List<String>
+    ): String {
+        val pkgs = flaggedApps.map { it.packageName }.sorted()
+        val details = extraDetails.sorted()
+        return (pkgs + details).joinToString("|")
     }
 
     fun isPackageIgnored(packageName: String): Boolean {
@@ -1251,43 +1382,143 @@ class LiveGuardMonitor private constructor(private val context: Context) {
     }
 
     fun refreshAllStates() {
-        val pkgOps = fetchAllPackageOps()
-        val usageSnapshot = queryCombinedUsageState()
-        refreshDisplayCaptureState(
-            triggerAlertIfNew = false,
-            preloadedPkgOpsList = pkgOps,
-            preloadedUsageSnapshot = usageSnapshot
-        )
-        refreshLocationAndClipboardState(
-            triggerAlertIfNew = false,
-            preloadedPkgOpsList = pkgOps,
-            preloadedUsageSnapshot = usageSnapshot
-        )
         try {
-            val configs = audioManager.activeRecordingConfigurations
-            val isMicNow = configs.isNotEmpty()
+            val pkgOps = fetchAllPackageOps()
+            val usageSnapshot = queryCombinedUsageState()
+            refreshMicAndCallState(
+                triggerAlertIfNew = true,
+                preloadedPkgOpsList = pkgOps,
+                preloadedUsageSnapshot = usageSnapshot
+            )
+            refreshDisplayCaptureState(
+                triggerAlertIfNew = false,
+                preloadedPkgOpsList = pkgOps,
+                preloadedUsageSnapshot = usageSnapshot
+            )
+            refreshLocationAndClipboardState(
+                triggerAlertIfNew = false,
+                preloadedPkgOpsList = pkgOps,
+                preloadedUsageSnapshot = usageSnapshot
+            )
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun refreshMicAndCallState(
+        triggerAlertIfNew: Boolean,
+        preloadedPkgOpsList: List<*>? = null,
+        preloadedUsageSnapshot: ForegroundUsageSnapshot? = null
+    ) {
+        try {
+            val configs = try {
+                audioManager.activeRecordingConfigurations.toList()
+            } catch (_: Throwable) {
+                emptyList()
+            }
+            val audioMode = try {
+                audioManager.mode
+            } catch (_: Throwable) {
+                AudioManager.MODE_NORMAL
+            }
+            val isInCallOrComm = audioMode == AudioManager.MODE_IN_CALL ||
+                audioMode == AudioManager.MODE_IN_COMMUNICATION
+            val isMicNow = configs.isNotEmpty() || isInCallOrComm
+
+            val usageSnapshot = preloadedUsageSnapshot ?: queryCombinedUsageState()
             val resolvedMic = if (isMicNow) {
-                resolveActiveSensorApps(
+                val base = resolveActiveSensorApps(
                     targetOpStr = "android:record_audio",
                     requiredPermission = android.Manifest.permission.RECORD_AUDIO,
                     audioConfigs = configs,
-                    preloadedPkgOpsList = pkgOps,
+                    preloadedPkgOpsList = preloadedPkgOpsList,
                     preloadedUsageSnapshot = usageSnapshot
-                )
+                ).toMutableList()
+                if (base.isEmpty() && isInCallOrComm) {
+                    // During cellular or VoIP calls, identify the active dialer / call app immediately
+                    val callCandidates = buildList {
+                        usageSnapshot.activeForegroundPackage?.let { add(it) }
+                        usageSnapshot.lastNonSelfForegroundPackage?.let { add(it) }
+                        addAll(usageSnapshot.activeForegroundServicePackages)
+                    }.distinct()
+                    val pm = context.packageManager
+                    for (cand in callCandidates) {
+                        if (cand == context.packageName || cand in getLauncherPackages()) continue
+                        val hasCallOrMicPerm = pm.checkPermission(android.Manifest.permission.RECORD_AUDIO, cand) == android.content.pm.PackageManager.PERMISSION_GRANTED ||
+                            pm.checkPermission(android.Manifest.permission.READ_PHONE_STATE, cand) == android.content.pm.PackageManager.PERMISSION_GRANTED ||
+                            pm.checkPermission(android.Manifest.permission.CALL_PHONE, cand) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                        if (hasCallOrMicPerm) {
+                            base.add(cand to resolveAppLabel(cand))
+                            break
+                        }
+                    }
+                }
+                base
             } else {
                 emptyList()
             }
+
             val unignoredMic = resolvedMic.filterNot { isSensorTrustedOrSnoozed(it.first, GuardSensorType.MIC) }
             val micSuppressed = (resolvedMic.isNotEmpty() && unignoredMic.isEmpty()) ||
                 (resolvedMic.isEmpty() && isGlobalSensorSnoozed(GuardSensorType.MIC))
+            val effectiveSessions = if (micSuppressed) 0 else maxOf(configs.size, if (isInCallOrComm) 1 else 0)
+
             _captureState.value = _captureState.value.copy(
                 isMicActive = isMicNow && !micSuppressed,
-                activeMicSessions = if (micSuppressed) 0 else configs.size,
+                activeMicSessions = effectiveSessions,
                 activeMicApps = unignoredMic.map { it.second },
                 isVpnOrProxyActive = false,
                 lastUpdatedMs = System.currentTimeMillis()
             )
-        } catch (_: Exception) {
+
+            if (!isMicNow || micSuppressed) {
+                if (!isMicNow) {
+                    lastMicLogged = false
+                    lastMicAlertDispatched = false
+                }
+                return
+            }
+
+            if (!lastMicLogged) {
+                lastMicLogged = true
+                val who = if (unignoredMic.isNotEmpty()) unignoredMic.joinToString(", ") { it.second } else null
+                val primaryPkg = unignoredMic.firstOrNull()?.first
+                val title = when {
+                    isInCallOrComm && who != null -> "Call / Mic Active: $who"
+                    isInCallOrComm -> "Phone Call / Mic Active"
+                    who != null -> "Mic Active: $who"
+                    else -> "Microphone Active"
+                }
+                val desc = when {
+                    isInCallOrComm && who != null -> "$who is actively using call & microphone audio right now."
+                    isInCallOrComm -> "Voice call audio & microphone are active right now."
+                    who != null -> "$who is recording audio ($effectiveSessions active stream${if (effectiveSessions == 1) "" else "s"})."
+                    else -> "$effectiveSessions audio stream(s) recording."
+                }
+                recordEvent(
+                    type = "MIC",
+                    title = title,
+                    description = desc,
+                    severity = AuditSeverity.WARNING,
+                    packageName = primaryPkg
+                )
+            }
+
+            if (triggerAlertIfNew && !lastMicAlertDispatched) {
+                lastMicAlertDispatched = true
+                val who = if (unignoredMic.isNotEmpty()) unignoredMic.joinToString(", ") { it.second } else null
+                val primaryPkg = unignoredMic.firstOrNull()?.first
+                val title = if (who != null) "Mic Active: $who" else "Microphone Active"
+                val desc = if (who != null) {
+                    "$who is actively using the microphone right now."
+                } else {
+                    "Microphone is actively recording audio right now."
+                }
+                maybeDispatchGuardNotification(
+                    payload = GuardAlertPayload(title, desc, primaryPkg, GuardSensorType.MIC),
+                    audioConfigs = configs
+                )
+            }
+        } catch (_: Throwable) {
         }
     }
 
@@ -1548,18 +1779,39 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             }
         }
 
-        // 3. UsageStatsManager strict foreground-only fallback:
-        // Only attribute to the currently RESUMED (not paused/closed) non-launcher foreground app holding the permission.
-        // Never blame background foreground-services or recently closed apps (prevents false positives on WhatsApp etc.).
+        // 3. UsageStatsManager fallback:
+        // Attribute to the currently RESUMED foreground app, OR if the user just switched to `dot` (or home screen)
+        // while a call/recording is ongoing, check active foreground services and the just-active app!
         if (foundPackages.isEmpty()) {
             val fgSnapshot = preloadedUsageSnapshot ?: queryCombinedUsageState()
+            val launchers = getLauncherPackages()
             val fgPkg = fgSnapshot.activeForegroundPackage
             if (fgPkg != null &&
                 fgPkg != context.packageName &&
-                fgPkg !in getLauncherPackages() &&
+                fgPkg !in launchers &&
                 pm.checkPermission(requiredPermission, fgPkg) == android.content.pm.PackageManager.PERMISSION_GRANTED
             ) {
                 foundPackages.add(fgPkg)
+            } else {
+                // User is likely viewing `dot` while another app is recording in a foreground service or call
+                for (srvPkg in fgSnapshot.activeForegroundServicePackages) {
+                    if (srvPkg != context.packageName &&
+                        srvPkg !in launchers &&
+                        pm.checkPermission(requiredPermission, srvPkg) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                    ) {
+                        foundPackages.add(srvPkg)
+                    }
+                }
+                if (foundPackages.isEmpty()) {
+                    val recentFg = fgSnapshot.lastNonSelfForegroundPackage
+                    if (recentFg != null &&
+                        recentFg != context.packageName &&
+                        recentFg !in launchers &&
+                        pm.checkPermission(requiredPermission, recentFg) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                    ) {
+                        foundPackages.add(recentFg)
+                    }
+                }
             }
         }
 
@@ -1572,6 +1824,8 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         val usageAccessGranted: Boolean,
         val activeForegroundPackage: String?,
         val lastLeftForegroundMs: Map<String, Long>,
+        val lastNonSelfForegroundPackage: String? = null,
+        val activeForegroundServicePackages: List<String> = emptyList(),
         val recorderServiceStarts: Map<String, Long> = emptyMap(),
         val recorderServiceStops: Map<String, Long> = emptyMap(),
         val recorderLastResumes: Map<String, Long> = emptyMap()
@@ -1612,12 +1866,17 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         return try {
             val now = System.currentTimeMillis()
             val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+            val launchers = getLauncherPackages()
             synchronized(usageStatsLock) {
                 val queryStart = if (lastUsageQueryEndMs == 0L || now < lastUsageQueryEndMs || (now - lastUsageQueryEndMs) > 10L * 60_000L) {
                     cachedActiveFgPkg = null
                     cachedActiveFgClass = null
                     cachedActiveFgResumeTs = 0L
+                    cachedLastNonSelfFgPkg = null
+                    cachedLastNonSelfFgTs = 0L
                     cachedLastLeftMap.clear()
+                    cachedActiveFgServiceStartMap.clear()
+                    cachedActiveFgServiceStopMap.clear()
                     cachedRecServiceStartMap.clear()
                     cachedRecServiceStopMap.clear()
                     cachedRecLastResumeMap.clear()
@@ -1633,11 +1892,12 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     events.getNextEvent(ev)
                     val pkg = ev.packageName ?: continue
                     val clsLower = ev.className?.lowercase().orEmpty()
+                    // Strictly match explicit screen recording / projection components only (never generic "recordingservice" which matches call recorders like Truecaller!)
                     val isCaptureComponent = clsLower.contains("screenrecord") ||
                         clsLower.contains("screen_record") ||
                         clsLower.contains("screencapture") ||
+                        clsLower.contains("screen_capture") ||
                         clsLower.contains("mediaprojection") ||
-                        clsLower.contains("recordingservice") ||
                         clsLower.contains("smartmirroring") ||
                         clsLower.contains("casttile")
                     val isRecorderPkg = isScreenRecorderPackage(pkg) || isCaptureComponent
@@ -1647,6 +1907,10 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                                 cachedActiveFgResumeTs = ev.timeStamp
                                 cachedActiveFgPkg = pkg
                                 cachedActiveFgClass = ev.className
+                            }
+                            if (pkg != context.packageName && pkg !in launchers && ev.timeStamp >= cachedLastNonSelfFgTs) {
+                                cachedLastNonSelfFgTs = ev.timeStamp
+                                cachedLastNonSelfFgPkg = pkg
                             }
                             if (isRecorderPkg) {
                                 cachedRecLastResumeMap[pkg] = maxOf(cachedRecLastResumeMap[pkg] ?: 0L, ev.timeStamp)
@@ -1669,11 +1933,17 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                             }
                         }
                         UsageEvents.Event.FOREGROUND_SERVICE_START -> {
+                            if (pkg != context.packageName) {
+                                cachedActiveFgServiceStartMap[pkg] = maxOf(cachedActiveFgServiceStartMap[pkg] ?: 0L, ev.timeStamp)
+                            }
                             if (isRecorderPkg) {
                                 cachedRecServiceStartMap[pkg] = maxOf(cachedRecServiceStartMap[pkg] ?: 0L, ev.timeStamp)
                             }
                         }
                         UsageEvents.Event.FOREGROUND_SERVICE_STOP -> {
+                            if (pkg in cachedActiveFgServiceStartMap) {
+                                cachedActiveFgServiceStopMap[pkg] = maxOf(cachedActiveFgServiceStopMap[pkg] ?: 0L, ev.timeStamp)
+                            }
                             if (isRecorderPkg || pkg in cachedRecServiceStartMap) {
                                 cachedRecServiceStopMap[pkg] = maxOf(cachedRecServiceStopMap[pkg] ?: 0L, ev.timeStamp)
                             }
@@ -1685,16 +1955,30 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 if (now - lastUsagePruneMs > 5L * 60_000L) {
                     val staleCutoff = now - 35L * 60_000L
                     cachedLastLeftMap.entries.removeAll { it.value < staleCutoff }
+                    cachedActiveFgServiceStartMap.entries.removeAll { it.value < staleCutoff }
+                    cachedActiveFgServiceStopMap.entries.removeAll { it.value < staleCutoff }
                     cachedRecServiceStartMap.entries.removeAll { it.value < staleCutoff }
                     cachedRecServiceStopMap.entries.removeAll { it.value < staleCutoff }
                     cachedRecLastResumeMap.entries.removeAll { it.value < staleCutoff }
                     lastUsagePruneMs = now
                 }
 
+                val activeFgServices = cachedActiveFgServiceStartMap.entries
+                    .filter { (pkg, startTs) ->
+                        val stopTs = cachedActiveFgServiceStopMap[pkg] ?: 0L
+                        startTs > stopTs && (now - startTs) < 30L * 60_000L
+                    }
+                    .sortedByDescending { it.value }
+                    .map { it.key }
+
+                val recentNonSelfFg = cachedLastNonSelfFgPkg?.takeIf { (now - cachedLastNonSelfFgTs) < 10L * 60_000L }
+
                 ForegroundUsageSnapshot(
                     usageAccessGranted = true,
                     activeForegroundPackage = cachedActiveFgPkg,
                     lastLeftForegroundMs = HashMap(cachedLastLeftMap),
+                    lastNonSelfForegroundPackage = recentNonSelfFg,
+                    activeForegroundServicePackages = activeFgServices,
                     recorderServiceStarts = HashMap(cachedRecServiceStartMap),
                     recorderServiceStops = HashMap(cachedRecServiceStopMap),
                     recorderLastResumes = HashMap(cachedRecLastResumeMap)
@@ -1914,29 +2198,31 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 }
             }
 
-            // 1b. MediaRouter active Live Video / Wireless Display / Screen Mirroring route check
-            try {
-                val mediaRouter = context.getSystemService(Context.MEDIA_ROUTER_SERVICE) as? android.media.MediaRouter
-                val liveVideoRoute = mediaRouter?.getSelectedRoute(android.media.MediaRouter.ROUTE_TYPE_LIVE_VIDEO)
-                if (liveVideoRoute != null) {
-                    val presDisplay = liveVideoRoute.presentationDisplay
-                    val routeName = liveVideoRoute.name?.toString().orEmpty()
-                    val isNonDefaultVideoRoute = presDisplay != null ||
-                        (liveVideoRoute != mediaRouter.defaultRoute &&
-                            (routeName.contains("cast", ignoreCase = true) ||
-                                routeName.contains("mirror", ignoreCase = true) ||
-                                routeName.contains("tv", ignoreCase = true) ||
-                                routeName.contains("display", ignoreCase = true) ||
-                                routeName.contains("wireless", ignoreCase = true)))
-                    if (isNonDefaultVideoRoute) {
-                        hasMirrorOrCastDisplay = true
-                        val indicator = if (routeName.isNotBlank()) "Screen Mirroring ($routeName)" else "Screen Mirroring Route"
-                        if (captureIndicators.none { it.equals(indicator, ignoreCase = true) }) {
-                            captureIndicators.add(indicator)
+            // 1b. MediaRouter active Live Video / Wireless Display / Screen Mirroring route check (only if thread has a Looper)
+            if (Looper.myLooper() != null) {
+                try {
+                    val mediaRouter = context.getSystemService(Context.MEDIA_ROUTER_SERVICE) as? android.media.MediaRouter
+                    val liveVideoRoute = mediaRouter?.getSelectedRoute(android.media.MediaRouter.ROUTE_TYPE_LIVE_VIDEO)
+                    if (liveVideoRoute != null) {
+                        val presDisplay = liveVideoRoute.presentationDisplay
+                        val routeName = liveVideoRoute.name?.toString().orEmpty()
+                        val isNonDefaultVideoRoute = presDisplay != null ||
+                            (liveVideoRoute != mediaRouter.defaultRoute &&
+                                (routeName.contains("cast", ignoreCase = true) ||
+                                    routeName.contains("mirror", ignoreCase = true) ||
+                                    routeName.contains("tv", ignoreCase = true) ||
+                                    routeName.contains("display", ignoreCase = true) ||
+                                    routeName.contains("wireless", ignoreCase = true)))
+                        if (isNonDefaultVideoRoute) {
+                            hasMirrorOrCastDisplay = true
+                            val indicator = if (routeName.isNotBlank()) "Screen Mirroring ($routeName)" else "Screen Mirroring Route"
+                            if (captureIndicators.none { it.equals(indicator, ignoreCase = true) }) {
+                                captureIndicators.add(indicator)
+                            }
                         }
                     }
+                } catch (_: Throwable) {
                 }
-            } catch (_: Throwable) {
             }
 
             // 2. Internal Audio Loopback (REMOTE_SUBMIX = 8) & client UID attribution
@@ -1995,8 +2281,10 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             )
             allCandidatePackages.addAll(activeRecorderPkgs)
 
-            // 5. Legacy running services check
-            allCandidatePackages.addAll(detectRunningCapturePackages())
+            // 5. Legacy running services check ONLY when a hardware/display/file signal is already present
+            if (hasHardwareOrFileSignal) {
+                allCandidatePackages.addAll(detectRunningCapturePackages())
+            }
 
             val unignoredPackages = allCandidatePackages
                 .filterNot { isSensorTrustedOrSnoozed(it, GuardSensorType.SCREEN) }
@@ -2262,7 +2550,12 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 val cls = srv.service.className.lowercase()
                 val pkg = srv.service.packageName
                 if (pkg != context.packageName &&
-                    (cls.contains("record") || cls.contains("projection") || cls.contains("capture") || cls.contains("cast") || isScreenRecorderPackage(pkg))
+                    (cls.contains("screenrecord") ||
+                        cls.contains("screen_record") ||
+                        cls.contains("screencapture") ||
+                        cls.contains("screen_capture") ||
+                        cls.contains("mediaprojection") ||
+                        isScreenRecorderPackage(pkg))
                 ) {
                     pkg
                 } else {
@@ -2326,10 +2619,15 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             }
         }
         val pkgOps = fetchAllPackageOps(forceFresh = logAuditEvent)
-        if (logAuditEvent || (nowMs - _captureState.value.lastUpdatedMs) > 5_000L) {
+        if (logAuditEvent || (!isMonitoring && (nowMs - _captureState.value.lastUpdatedMs) > 5_000L)) {
             val usageSnap = queryCombinedUsageState()
+            refreshMicAndCallState(
+                triggerAlertIfNew = logAuditEvent,
+                preloadedPkgOpsList = pkgOps,
+                preloadedUsageSnapshot = usageSnap
+            )
             refreshDisplayCaptureState(
-                triggerAlertIfNew = true,
+                triggerAlertIfNew = logAuditEvent,
                 preloadedPkgOpsList = pkgOps,
                 preloadedUsageSnapshot = usageSnap
             )
@@ -2570,7 +2868,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             actionButtonLabel = "Developer Options"
         )
 
-        val allVectors = listOf(
+        val rawVectors = listOf(
             screenVector,
             micCamVector,
             bgLocationVector,
@@ -2583,6 +2881,29 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             sideloadVector
         )
 
+        val ackMap = _acknowledgedVectors.value
+        val allVectors = rawVectors.map { vec ->
+            val sig = computeVectorSignature(vec.flaggedApps, vec.extraDetails)
+            val isLiveVector = vec.id == "screen_recording" ||
+                vec.id == "live_mic_cam" ||
+                (vec.id == "bg_location" && live.isBackgroundLocationActive) ||
+                (vec.id == "clipboard_access" && live.isClipboardAccessedRecently)
+            if (!isLiveVector && vec.severity != AuditSeverity.SAFE && sig.isNotEmpty() && ackMap[vec.id] == sig) {
+                vec.copy(
+                    severity = AuditSeverity.SAFE,
+                    statusBadge = "EXPECTED",
+                    plainSummary = "Marked as expected • ${vec.plainSummary}",
+                    isAcknowledged = true,
+                    currentSignature = sig
+                )
+            } else {
+                vec.copy(
+                    isAcknowledged = false,
+                    currentSignature = sig
+                )
+            }
+        }
+
         cachedAuditVectors = allVectors
         cachedAuditVectorsTimeMs = System.currentTimeMillis()
         cachedAuditIncludeSystem = includeSystemApps
@@ -2594,17 +2915,18 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 description = "${allVectors.count { it.severity != AuditSeverity.SAFE }} item(s) flagged for review.",
                 severity = AuditSeverity.SAFE
             )
-            evaluateAndNotifyLiveGuardChecks(allVectors, forceNotifyActive = true)
-        } else {
-            evaluateAndNotifyLiveGuardChecks(allVectors, forceNotifyActive = false)
         }
+        evaluateAndNotifyLiveGuardChecks(allVectors, forceNotifyActive = false)
 
         return allVectors
     }
 
     /**
-     * Evaluates all 10 Live Guard security checks and dispatches real-time notifications
-     * and Event Log / Timeline entries whenever a risk is active or newly enabled.
+     * Evaluates all 10 Live Guard security checks using persisted baseline diffing.
+     * Fires push notifications and records Timeline events ONLY when:
+     * 1. A live threat is active or newly triggered, OR
+     * 2. A new app/setting item is added to a check vector after the baseline was initialized, OR
+     * 3. forceNotifyActive is explicitly requested (e.g., user tapped Test Alert).
      */
     fun evaluateAndNotifyLiveGuardChecks(
         vectors: List<SecurityAuditVector>,
@@ -2637,29 +2959,56 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 val settingsAction: String?
             )
 
+            val isFirstBaselineRun = !vectorBaselineInitialized
+            var baselineDirty = false
             val pendingAlerts = mutableListOf<PendingCheckAlert>()
 
             for (vector in vectors) {
-                if (vector.severity == AuditSeverity.SAFE) {
-                    notifiedAuditVectorSignatures.remove(vector.id)
+                val currentItems: Set<String> = buildSet {
+                    vector.flaggedApps.forEach { add("app:${it.packageName}") }
+                    vector.extraDetails.forEach { add("detail:$it") }
+                    if (isEmpty() && vector.severity != AuditSeverity.SAFE) {
+                        add("state:${vector.statusBadge}")
+                    }
+                }
+
+                if (vector.severity == AuditSeverity.SAFE && !vector.isAcknowledged) {
+                    if (knownVectorItemsMap.remove(vector.id) != null) {
+                        baselineDirty = true
+                    }
                     continue
                 }
 
-                val appPkgs = vector.flaggedApps.map { it.packageName }.sorted()
+                if (vector.isAcknowledged) {
+                    if (knownVectorItemsMap[vector.id] != currentItems) {
+                        knownVectorItemsMap[vector.id] = currentItems
+                        baselineDirty = true
+                    }
+                    continue
+                }
+
+                val isLiveCaptureOrSensor = vector.id == "screen_recording" || vector.id == "live_mic_cam"
+                val previousItems = knownVectorItemsMap[vector.id] ?: emptySet()
+                val newlyAddedItems = currentItems - previousItems
+
+                // On first launch, seed static posture checks into the baseline silently without blasting notifications
+                if (isFirstBaselineRun && !isLiveCaptureOrSensor && !forceNotifyActive) {
+                    knownVectorItemsMap[vector.id] = currentItems
+                    baselineDirty = true
+                    continue
+                }
+
+                if (!forceNotifyActive && newlyAddedItems.isEmpty()) {
+                    continue
+                }
+
+                if (canPostNotifications) {
+                    knownVectorItemsMap[vector.id] = currentItems
+                    baselineDirty = true
+                }
+
                 val appNames = vector.flaggedApps.map { it.appName }.distinct()
                 val details = vector.extraDetails.sorted()
-                val currentSignature = "${vector.severity.name}|${vector.statusBadge}|${appPkgs.joinToString(",")}|${details.joinToString(",")}"
-                val previousSignature = notifiedAuditVectorSignatures[vector.id]
-
-                if (!forceNotifyActive && previousSignature == currentSignature) {
-                    continue
-                }
-
-                // Only mark as notified if Android notification permission is granted so we re-fire immediately once granted
-                if (canPostNotifications) {
-                    notifiedAuditVectorSignatures[vector.id] = currentSignature
-                }
-
                 val primaryPkg = vector.flaggedApps.firstOrNull()?.packageName
                 val whoSummary = when {
                     appNames.isNotEmpty() -> appNames.take(3).joinToString(", ") +
@@ -2682,7 +3031,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     "accessibility_monitors" -> PendingCheckAlert(
                         notifId = 2101,
                         eventType = "ACCESSIBILITY",
-                        title = "Screen Reader Active: ${appNames.firstOrNull() ?: "Accessibility"}",
+                        title = "Screen Reader Enabled: ${appNames.firstOrNull() ?: "Accessibility"}",
                         message = "${vector.plainSummary} ($whoSummary). Screen readers can read all on-screen text and passwords.",
                         severity = vector.severity,
                         primaryPkg = primaryPkg,
@@ -2692,7 +3041,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     "notification_listeners" -> PendingCheckAlert(
                         notifId = 2102,
                         eventType = "NOTIFICATION_LISTENER",
-                        title = "Notification Reader Active: ${appNames.firstOrNull() ?: "Listener"}",
+                        title = "Notification Reader Enabled: ${appNames.firstOrNull() ?: "Listener"}",
                         message = "${vector.plainSummary} ($whoSummary). Notification listeners can read incoming chats and 2FA codes.",
                         severity = vector.severity,
                         primaryPkg = primaryPkg,
@@ -2702,7 +3051,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     "screen_overlays" -> PendingCheckAlert(
                         notifId = 2103,
                         eventType = "OVERLAY",
-                        title = "Screen Overlays Enabled (${vector.flaggedApps.size} App${if (vector.flaggedApps.size == 1) "" else "s"})",
+                        title = "Screen Overlay Enabled (${vector.flaggedApps.size} App${if (vector.flaggedApps.size == 1) "" else "s"})",
                         message = "Apps allowed to draw over your screen: $whoSummary.",
                         severity = vector.severity,
                         primaryPkg = primaryPkg,
@@ -2712,7 +3061,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     "device_admins" -> PendingCheckAlert(
                         notifId = 2104,
                         eventType = "DEVICE_ADMIN",
-                        title = "Device Admin Active: ${appNames.firstOrNull() ?: "Admin"}",
+                        title = "Device Admin Enabled: ${appNames.firstOrNull() ?: "Admin"}",
                         message = "${vector.plainSummary} ($whoSummary).",
                         severity = vector.severity,
                         primaryPkg = primaryPkg,
@@ -2722,7 +3071,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     "keyboards_vpn" -> PendingCheckAlert(
                         notifId = 2105,
                         eventType = "KEYBOARD",
-                        title = "Custom Keyboard Active",
+                        title = "Custom Keyboard Enabled",
                         message = "${vector.plainSummary} ($whoSummary). Third-party keyboards can log keystrokes.",
                         severity = vector.severity,
                         primaryPkg = primaryPkg,
@@ -2732,7 +3081,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     "sideload_adb" -> PendingCheckAlert(
                         notifId = 2106,
                         eventType = "USB_ADB",
-                        title = if (details.any { it.contains("ADB", ignoreCase = true) }) "USB Debugging (ADB) Enabled" else "Sideloaded Apps Detected",
+                        title = if (details.any { it.contains("ADB", ignoreCase = true) }) "USB Debugging (ADB) Turned ON" else "New Sideloaded App Detected",
                         message = "${vector.plainSummary}${if (appNames.isNotEmpty()) " ($whoSummary)" else ""}.",
                         severity = vector.severity,
                         primaryPkg = primaryPkg,
@@ -2742,7 +3091,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     "bg_location" -> PendingCheckAlert(
                         notifId = 2107,
                         eventType = "LOCATION",
-                        title = "Background Location Risk (${vector.statusBadge})",
+                        title = "Background Location Granted (${vector.statusBadge})",
                         message = "${vector.plainSummary} ($whoSummary).",
                         severity = vector.severity,
                         primaryPkg = primaryPkg,
@@ -2795,6 +3144,14 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     )
                 }
                 pendingAlerts.add(alertSpec)
+            }
+
+            if (isFirstBaselineRun) {
+                vectorBaselineInitialized = true
+                baselineDirty = true
+            }
+            if (baselineDirty) {
+                saveKnownVectorBaseline()
             }
 
             if (pendingAlerts.isEmpty() || !canPostNotifications) return
@@ -2957,15 +3314,29 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 while (!usedIds.add(candidateId)) {
                     candidateId++
                 }
+                val evType = obj.optString("type", "AUDIT")
+                val evPkg = obj.optString("packageName").takeIf { it.isNotBlank() }
+                val evDesc = obj.optString("description", "")
+                // Clean up any historical false-positive Screen Recording events that blamed non-screen-recorder apps (e.g., Truecaller call service)
+                if (evType == "SCREEN" &&
+                    evPkg != null &&
+                    !isScreenRecorderPackage(evPkg) &&
+                    evPkg != "com.android.systemui" &&
+                    !evDesc.contains("OS Screen Recording", ignoreCase = true) &&
+                    !evDesc.contains("Virtual Display", ignoreCase = true) &&
+                    !evDesc.contains("File:", ignoreCase = true)
+                ) {
+                    continue
+                }
                 loaded.add(
                     GuardEvent(
                         id = candidateId,
                         timestamp = obj.optLong("timestamp", candidateId),
-                        type = obj.optString("type", "AUDIT"),
+                        type = evType,
                         title = obj.optString("title", "Guard Event"),
-                        description = obj.optString("description", ""),
+                        description = evDesc,
                         severity = sev,
-                        packageName = obj.optString("packageName").takeIf { it.isNotBlank() }
+                        packageName = evPkg
                     )
                 )
             }

@@ -902,6 +902,56 @@ fun VaultScreen(onBack: () -> Unit) {
             Toast.makeText(context, "Vault locked out for ${remainingLockoutSec}s", Toast.LENGTH_SHORT).show()
             return
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                val cancellationSignal = android.os.CancellationSignal()
+                val builder = android.hardware.biometrics.BiometricPrompt.Builder(context)
+                    .setTitle("Unlock Secure Vault")
+                    .setSubtitle("Use fingerprint, face, or device credential")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    builder.setAllowedAuthenticators(
+                        android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_STRONG or
+                            android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_WEAK or
+                            android.hardware.biometrics.BiometricManager.Authenticators.DEVICE_CREDENTIAL
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    builder.setDeviceCredentialAllowed(true)
+                }
+                val prompt = builder.build()
+                isLaunchingSystemDialog = true
+                prompt.authenticate(
+                    cancellationSignal,
+                    context.mainExecutor,
+                    object : android.hardware.biometrics.BiometricPrompt.AuthenticationCallback() {
+                        override fun onAuthenticationSucceeded(result: android.hardware.biometrics.BiometricPrompt.AuthenticationResult?) {
+                            super.onAuthenticationSucceeded(result)
+                            isLaunchingSystemDialog = false
+                            resetFailedPinAttempts(context)
+                            failedAttempts = 0
+                            lockoutUntilMs = 0L
+                            isUnlocked = true
+                            refreshVault()
+                            if (isLegacy4DigitPin(context)) {
+                                promptLegacyUpgrade = true
+                            }
+                        }
+
+                        override fun onAuthenticationError(errorCode: Int, errString: CharSequence?) {
+                            super.onAuthenticationError(errorCode, errString)
+                            isLaunchingSystemDialog = false
+                        }
+
+                        override fun onAuthenticationFailed() {
+                            super.onAuthenticationFailed()
+                        }
+                    }
+                )
+                return
+            } catch (_: Throwable) {
+                isLaunchingSystemDialog = false
+            }
+        }
         try {
             val km = context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
             if (km != null && km.isKeyguardSecure) {

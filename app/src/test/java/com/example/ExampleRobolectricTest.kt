@@ -559,6 +559,38 @@ class ExampleRobolectricTest {
         }
         assertTrue(com.example.service.AppRefreshCoordinator.refreshVersion.value > beforeVersion)
     }
+
+    @Test
+    fun `security checks support mark as safe acknowledgement and re-arm if items change`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        LiveGuardMonitor.resetInstanceForTests()
+        val monitor = LiveGuardMonitor.getInstance(context)
+
+        val sampleVec = com.example.service.SecurityAuditVector(
+            id = "sideload_adb",
+            title = "Sideloads & USB Debug",
+            plainSummary = "USB Debugging (ADB) is ON",
+            detailedAdvice = "Turn off USB Debugging when not needed.",
+            severity = AuditSeverity.DANGER,
+            statusBadge = "REVIEW",
+            extraDetails = listOf("USB Debugging (ADB) is ON"),
+            currentSignature = "USB Debugging (ADB) is ON"
+        )
+
+        monitor.acknowledgeVector(sampleVec)
+        assertEquals("USB Debugging (ADB) is ON", monitor.acknowledgedVectors.value["sideload_adb"])
+
+        // Export and re-import via PreferencesBackupManager preserves acknowledged state
+        val exported = com.example.service.PreferencesBackupManager.exportToJson(context)
+        assertTrue(exported.contains("acknowledged_vectors_json"))
+
+        monitor.unacknowledgeVector("sideload_adb")
+        assertFalse(monitor.acknowledgedVectors.value.containsKey("sideload_adb"))
+
+        assertTrue(com.example.service.PreferencesBackupManager.importFromJson(context, exported))
+        assertEquals("USB Debugging (ADB) is ON", monitor.acknowledgedVectors.value["sideload_adb"])
+        monitor.unacknowledgeVector("sideload_adb")
+    }
 }
 
 

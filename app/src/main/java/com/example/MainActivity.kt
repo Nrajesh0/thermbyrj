@@ -163,10 +163,7 @@ class MainActivity : ComponentActivity() {
     private var activityScreenRecordingConsumer: java.util.function.Consumer<Int>? = null
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) {
-            LiveGuardMonitor.getInstance(applicationContext).notifyActiveChecksNow()
-        }
+    ) { _ ->
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -486,46 +483,6 @@ fun MainScreen(viewModel: ThermalViewModel) {
                     1 -> PrivacyShieldScreen()
                     2 -> LiveGuardScreen()
                     3 -> VitalsScreen(viewModel, warningTemp)
-                }
-            }
-
-            // Floating Refresh Button positioned above the footbar
-            Box(
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .navigationBarsPadding()
-                    .padding(end = 20.dp, bottom = 76.dp)
-                    .size(48.dp)
-                    .testTag("bottom_refresh_button")
-                    .clip(CircleShape)
-                    .background(GlassPanel.copy(alpha = 0.92f))
-                    .border(
-                        1.dp,
-                        if (isRefreshingAll) AuraCyan else GlassBorder,
-                        CircleShape
-                    )
-                    .clickable(enabled = !isRefreshingAll) {
-                        if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        coroutineScope.launch {
-                            AppRefreshCoordinator.triggerRefreshAll(context)
-                            Toast.makeText(context, "Refreshed", Toast.LENGTH_SHORT).show()
-                        }
-                    },
-                contentAlignment = Alignment.Center
-            ) {
-                if (isRefreshingAll) {
-                    CircularProgressIndicator(
-                        color = AuraCyan,
-                        strokeWidth = 2.dp,
-                        modifier = Modifier.size(18.dp)
-                    )
-                } else {
-                    Icon(
-                        imageVector = Icons.Filled.Refresh,
-                        contentDescription = "Refresh",
-                        tint = AuraCyan,
-                        modifier = Modifier.size(20.dp)
-                    )
                 }
             }
 

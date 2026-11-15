@@ -55,6 +55,7 @@ object PreferencesBackupManager {
             put("rules_quiet_fg", guard.getBoolean("rules_quiet_fg", true))
             put("rules_pause_screen_off", guard.getBoolean("rules_pause_screen_off", true))
             guard.getString("trusted_rules_json", null)?.let { put("trusted_rules_json", it) }
+            guard.getString("acknowledged_vectors_json", null)?.let { put("acknowledged_vectors_json", it) }
             val legacyIgnored = guard.getStringSet("ignored_packages", emptySet()) ?: emptySet()
             put("ignored_packages", JSONArray(legacyIgnored.toList()))
         }
@@ -104,6 +105,10 @@ object PreferencesBackupManager {
                 val trustedJson = guardObj.optString("trusted_rules_json", "")
                 if (trustedJson.isNotBlank()) {
                     gEdit.putString("trusted_rules_json", trustedJson)
+                }
+                val ackJson = guardObj.optString("acknowledged_vectors_json", "")
+                if (ackJson.isNotBlank()) {
+                    gEdit.putString("acknowledged_vectors_json", ackJson)
                 }
                 val ignoredArr = guardObj.optJSONArray("ignored_packages")
                 if (ignoredArr != null) {

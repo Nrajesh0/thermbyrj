@@ -3,6 +3,7 @@ package com.example.service
 import android.Manifest
 import android.app.AppOpsManager
 import android.app.admin.DevicePolicyManager
+import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
@@ -1236,18 +1237,135 @@ object PrivacyAnalyzer {
                 return cached
             }
         }
-        val summary = analyzeDevicePrivacy(context, includeSystemApps = includeSystemApps, forceRefresh = forceRefresh)
+        val hasCachedSummary = peekCachedPrivacySummary(includeSystemApps) != null
+        val summary = analyzeDevicePrivacy(
+            context,
+            includeSystemApps = includeSystemApps,
+            forceRefresh = forceRefresh && !hasCachedSummary
+        )
         val reportsByPkg = summary.appReports.associateBy { it.packageName }
         val appOpsTimes = queryAppOpsLastAccessMap(context)
         val pm = context.packageManager
         val guardMonitor = LiveGuardMonitor.getInstance(context)
         val ignored = guardMonitor.ignoredPackages.value
+        val liveCapture = guardMonitor.captureState.value
         val now = System.currentTimeMillis()
         val defaultSysIcon: Drawable = context.applicationInfo.loadIcon(pm)
 
         val timeline = mutableListOf<PermissionAccessEvent>()
 
-        // 1. Verified OS AppOps last-access timestamps
+        fun resolvePkgMeta(pkg: String?): Triple<String, String, Drawable> {
+            if (pkg.isNullOrBlank() || pkg == "system.sensor") {
+                return Triple("system.sensor", "System Hardware", defaultSysIcon)
+            }
+            val cachedReport = reportsByPkg[pkg]
+            if (cachedReport != null) {
+                return Triple(pkg, cachedReport.appName, cachedReport.icon)
+            }
+            val appInfo = try {
+                pm.getApplicationInfo(pkg, 0)
+            } catch (_: Exception) {
+                null
+            }
+            if (appInfo != null) {
+                val label = try {
+                    pm.getApplicationLabel(appInfo).toString()
+                } catch (_: Exception) {
+                    pkg
+                }
+                val icon = try {
+                    pm.getApplicationIcon(appInfo)
+                } catch (_: Exception) {
+                    defaultSysIcon
+                }
+                return Triple(pkg, label, icon)
+            }
+            return Triple(pkg, pkg, defaultSysIcon)
+        }
+
+        // 0. Live Ongoing Hardware Sessions ("LIVE NOW") — ensures active calls, mic, camera, or screen recording show immediately while happening
+        if (liveCapture.isScreenRecordingOrCasting) {
+            val recPkg = liveCapture.suspectedRecorderPackages.firstOrNull { it !in ignored }
+            val (rPkg, rName, rIcon) = resolvePkgMeta(recPkg)
+            val isMirror = liveCapture.activeCaptureDisplays.any {
+                it.contains("Mirror", ignoreCase = true) || it.contains("Cast", ignoreCase = true)
+            }
+            val pInfo = if (isMirror) screenMirrorTimelineInfo else screenCaptureTimelineInfo
+            val displaySummary = liveCapture.activeCaptureDisplays.firstOrNull() ?: pInfo.friendlyTitle
+            timeline.add(
+                PermissionAccessEvent(
+                    id = "live_now_screen",
+                    packageName = rPkg,
+                    appName = if (rPkg == "system.sensor") "Screen Capture" else rName,
+                    icon = rIcon,
+                    permissionTitle = displaySummary,
+                    shortTag = "LIVE NOW",
+                    category = pInfo.category,
+                    riskLevel = PermissionRiskLevel.CRITICAL,
+                    timestamp = now + 3L,
+                    accessContext = "LIVE NOW • Active Capture",
+                    permissionInfo = pInfo
+                )
+            )
+        }
+
+        if (liveCapture.isMicActive) {
+            val micLabel = liveCapture.activeMicApps.firstOrNull()
+            val matchedApp = summary.appReports.firstOrNull {
+                it.appName.equals(micLabel, ignoreCase = true) || it.packageName == micLabel
+            }
+            val rPkg = matchedApp?.packageName ?: "system.sensor"
+            if (rPkg !in ignored) {
+                val rName = matchedApp?.appName ?: micLabel ?: "Call / Microphone"
+                val rIcon = matchedApp?.icon ?: defaultSysIcon
+                val pInfo = permissionCatalog[Manifest.permission.RECORD_AUDIO] ?: clipboardTimelineInfo
+                timeline.add(
+                    PermissionAccessEvent(
+                        id = "live_now_mic",
+                        packageName = rPkg,
+                        appName = rName,
+                        icon = rIcon,
+                        permissionTitle = "Call / Microphone Active Right Now",
+                        shortTag = "LIVE NOW",
+                        category = PermissionCategory.CAMERA_MIC,
+                        riskLevel = PermissionRiskLevel.CRITICAL,
+                        timestamp = now + 2L,
+                        accessContext = "LIVE NOW • Active Audio",
+                        permissionInfo = pInfo
+                    )
+                )
+            }
+        }
+
+        if (liveCapture.isCameraActive) {
+            val camLabel = liveCapture.activeCameraApps.firstOrNull()
+            val matchedApp = summary.appReports.firstOrNull {
+                it.appName.equals(camLabel, ignoreCase = true) || it.packageName == camLabel
+            }
+            val rPkg = matchedApp?.packageName ?: "system.sensor"
+            if (rPkg !in ignored) {
+                val rName = matchedApp?.appName ?: camLabel ?: "Camera Sensor"
+                val rIcon = matchedApp?.icon ?: defaultSysIcon
+                val pInfo = permissionCatalog[Manifest.permission.CAMERA] ?: clipboardTimelineInfo
+                timeline.add(
+                    PermissionAccessEvent(
+                        id = "live_now_camera",
+                        packageName = rPkg,
+                        appName = rName,
+                        icon = rIcon,
+                        permissionTitle = "Camera Active Right Now",
+                        shortTag = "LIVE NOW",
+                        category = PermissionCategory.CAMERA_MIC,
+                        riskLevel = PermissionRiskLevel.CRITICAL,
+                        timestamp = now + 1L,
+                        accessContext = "LIVE NOW • Active Camera",
+                        permissionInfo = pInfo
+                    )
+                )
+            }
+        }
+
+        // 1. Verified OS AppOps last-access timestamps (only real per-permission timestamps, never fabricated from app launch times)
         for (app in summary.appReports) {
             if (app.packageName in ignored) continue
             val pkgOps = appOpsTimes[app.packageName]
@@ -1278,31 +1396,33 @@ object PrivacyAnalyzer {
                         )
                     }
                 }
-            } else if (app.lastTimeUsedMs in 1L..now && app.grantedPermissions.isNotEmpty()) {
-                // When OS blocks third-party GET_APP_OPS_STATS, surface active apps' granted permissions at their verified UsageStats timestamp
-                for (perm in app.grantedPermissions) {
-                    timeline.add(
-                        PermissionAccessEvent(
-                            id = "usage_${app.packageName}_${perm.permissionName}_${app.lastTimeUsedMs}",
-                            packageName = app.packageName,
-                            appName = app.appName,
-                            icon = app.icon,
-                            permissionTitle = perm.friendlyTitle,
-                            shortTag = perm.shortTag,
-                            category = perm.category,
-                            riskLevel = perm.riskLevel,
-                            timestamp = app.lastTimeUsedMs,
-                            accessContext = "Active App Session",
-                            permissionInfo = perm
-                        )
-                    )
-                }
             }
         }
 
-        // 2. Real-time hardware & Live Guard check events observed by LiveGuardMonitor
+        // 2. Real-time hardware & state-transition events observed by LiveGuardMonitor (unified Event Log + Timeline)
         val sensorEvents = guardMonitor.events.value.filter { ev ->
-            !ev.title.contains("Guard Test", ignoreCase = true)
+            if (ev.type == "AUDIT" || ev.title.contains("Guard Test", ignoreCase = true)) return@filter false
+            // Guard against any historical false-positive SCREEN event on non-screen-recorder apps
+            if (ev.type == "SCREEN" && !ev.packageName.isNullOrBlank()) {
+                val pLower = ev.packageName.lowercase()
+                val isDedicatedScreenApp = pLower.contains("screenrecord") ||
+                    pLower.contains("screencast") ||
+                    pLower.contains("azscreen") ||
+                    pLower.contains("du.recorder") ||
+                    pLower.contains("mobizen") ||
+                    pLower.contains("xrecorder")
+                val hasHardCaptureEvidence = ev.description.contains("Display:", ignoreCase = true) ||
+                    ev.description.contains("OS ScreenRecordingCallback", ignoreCase = true) ||
+                    ev.description.contains("File:", ignoreCase = true) ||
+                    ev.description.contains("AppOps:", ignoreCase = true) ||
+                    ev.description.contains("Route:", ignoreCase = true) ||
+                    ev.description.contains("OS Screen Recording", ignoreCase = true) ||
+                    ev.description.contains("Virtual Display", ignoreCase = true)
+                if (!isDedicatedScreenApp && !hasHardCaptureEvidence) {
+                    return@filter false
+                }
+            }
+            true
         }
 
         for (ev in sensorEvents) {
@@ -1337,54 +1457,36 @@ object PrivacyAnalyzer {
                 else -> null
             } ?: continue
 
-            var resolvedPkg = "system.sensor"
-            var resolvedName = when (ev.type) {
-                "MIC" -> "Microphone Hardware"
-                "CAMERA" -> "Camera Hardware"
-                "SCREEN" -> if (isMirrorEvent) "Screen Mirroring / Cast" else "Screen Recording"
-                "ACCESSIBILITY" -> "Screen Reader Service"
-                "NOTIFICATION_LISTENER" -> "Notification Reader"
-                "OVERLAY" -> "Screen Overlay"
-                "DEVICE_ADMIN" -> "Device Admin App"
-                "KEYBOARD" -> "Custom Keyboard"
-                "USB_ADB" -> "USB Debug / Sideload Check"
-                else -> ev.title
-            }
-            var resolvedIcon: Drawable = defaultSysIcon
-
-            if (!pkg.isNullOrBlank()) {
-                val cachedReport = reportsByPkg[pkg]
-                if (cachedReport != null) {
-                    resolvedPkg = pkg
-                    resolvedName = cachedReport.appName
-                    resolvedIcon = cachedReport.icon
-                } else {
-                    val appInfo = try {
-                        pm.getApplicationInfo(pkg, 0)
-                    } catch (_: Exception) {
-                        null
-                    }
-                    if (appInfo != null) {
-                        resolvedPkg = pkg
-                        resolvedName = try {
-                            pm.getApplicationLabel(appInfo).toString()
-                        } catch (_: Exception) {
-                            pkg
-                        }
-                        resolvedIcon = try {
-                            pm.getApplicationIcon(appInfo)
-                        } catch (_: Exception) {
-                            defaultSysIcon
-                        }
-                    }
+            val (resolvedPkg, baseName, resolvedIcon) = resolvePkgMeta(pkg)
+            val resolvedName = if (resolvedPkg != "system.sensor") {
+                baseName
+            } else {
+                when (ev.type) {
+                    "MIC" -> "Microphone / Call Audio"
+                    "CAMERA" -> "Camera Sensor"
+                    "SCREEN" -> if (isMirrorEvent) "Screen Mirroring / Cast" else "Screen Recording"
+                    "ACCESSIBILITY" -> "Screen Reader Service"
+                    "NOTIFICATION_LISTENER" -> "Notification Reader"
+                    "OVERLAY" -> "Screen Overlay"
+                    "DEVICE_ADMIN" -> "Device Admin"
+                    "KEYBOARD" -> "Custom Keyboard"
+                    "USB_ADB" -> "Developer / Sideload Check"
+                    else -> ev.title
                 }
             }
 
-            // Avoid duplicate entry if the exact same event id or same app + permission + second was already added
+            // Preserve the specific event title & description from LiveGuardMonitor
+            val richTitle = if (ev.description.isNotBlank() && !ev.description.equals(ev.title, ignoreCase = true)) {
+                "${ev.title} — ${ev.description}"
+            } else {
+                ev.title.ifBlank { permInfo.friendlyTitle }
+            }
+
             val duplicateNearby = timeline.any { existing ->
                 existing.packageName == resolvedPkg &&
                     existing.permissionInfo.permissionName == permInfo.permissionName &&
-                    kotlin.math.abs(existing.timestamp - ev.timestamp) < 5_000L
+                    kotlin.math.abs(existing.timestamp - ev.timestamp) < 5_000L &&
+                    !existing.id.startsWith("live_now_")
             }
             if (!duplicateNearby) {
                 timeline.add(
@@ -1393,165 +1495,60 @@ object PrivacyAnalyzer {
                         packageName = resolvedPkg,
                         appName = resolvedName,
                         icon = resolvedIcon,
-                        permissionTitle = permInfo.friendlyTitle,
+                        permissionTitle = richTitle,
                         shortTag = permInfo.shortTag,
                         category = permInfo.category,
                         riskLevel = permInfo.riskLevel,
                         timestamp = ev.timestamp,
-                        accessContext = if (resolvedPkg == "system.sensor") "Live Guard Alert" else "Live Guard",
+                        accessContext = when (ev.type) {
+                            "MIC", "CAMERA", "SCREEN", "CLIPBOARD", "LOCATION" -> "Hardware / Sensor Event"
+                            else -> "State Change Alert"
+                        },
                         permissionInfo = permInfo
                     )
                 )
             }
         }
 
-        // 3. Active & Flagged Live Guard Security Checks (ensures everything shown in CHECKS is also represented in TIMELINE)
-        val auditVectors = try {
-            guardMonitor.peekCachedAuditVectors()
-                ?: guardMonitor.runDeepSecurityAudit(includeSystemApps = includeSystemApps, logAuditEvent = false)
-        } catch (_: Throwable) {
-            emptyList()
-        }
-
-        for (vec in auditVectors) {
-            if (vec.severity == AuditSeverity.SAFE && vec.flaggedApps.isEmpty() && vec.extraDetails.isEmpty()) continue
-
-            val vecPermInfo: PlainPermissionInfo = when (vec.id) {
-                "screen_recording" -> {
-                    val isMirror = vec.plainSummary.contains("Mirror", ignoreCase = true) ||
-                        vec.extraDetails.any { it.contains("Mirror", ignoreCase = true) || it.contains("Cast", ignoreCase = true) }
-                    if (isMirror) screenMirrorTimelineInfo else screenCaptureTimelineInfo
-                }
-                "live_mic_cam" -> {
-                    if (guardMonitor.captureState.value.isCameraActive && !guardMonitor.captureState.value.isMicActive) {
-                        permissionCatalog[Manifest.permission.CAMERA]
-                    } else {
-                        permissionCatalog[Manifest.permission.RECORD_AUDIO]
-                    }
-                }
-                "bg_location" -> permissionCatalog[Manifest.permission.ACCESS_BACKGROUND_LOCATION]
-                "clipboard_access" -> clipboardTimelineInfo
-                "screen_overlays" -> permissionCatalog[Manifest.permission.SYSTEM_ALERT_WINDOW]
-                "accessibility_monitors" -> permissionCatalog["SPECIAL_ACCESSIBILITY_SERVICE"]
-                "notification_listeners" -> permissionCatalog["SPECIAL_NOTIFICATION_LISTENER"]
-                "device_admins" -> permissionCatalog["SPECIAL_DEVICE_ADMIN"]
-                "keyboards_vpn" -> customKeyboardTimelineInfo
-                "sideload_adb" -> {
-                    if (vec.extraDetails.any { it.contains("USB Debugging", ignoreCase = true) } && vec.flaggedApps.isEmpty()) {
-                        usbDebuggingTimelineInfo
-                    } else {
-                        sideloadTimelineInfo
-                    }
-                }
-                else -> null
-            } ?: continue
-
-            val contextBadge = when (vec.severity) {
-                AuditSeverity.DANGER -> "Live Guard • Critical"
-                AuditSeverity.WARNING -> "Live Guard • Active Check"
-                AuditSeverity.SAFE -> "Live Guard • Checked"
+        // 3. Verified App Install & Permission Change Events (from PrivacyChanges)
+        val recentChanges = peekCachedChanges()
+            ?: getPrivacyChanges(context, summary.appReports, dispatchNotifications = false)
+        for (chg in recentChanges.take(30)) {
+            if (chg.packageName in ignored) continue
+            if (chg.changeType != PrivacyChangeType.NEW_APP && chg.changeType != PrivacyChangeType.PERM_ADDED) continue
+            val (cPkg, cName, cIcon) = resolvePkgMeta(chg.packageName)
+            val permInfo = if (chg.changeType == PrivacyChangeType.NEW_APP) {
+                sideloadTimelineInfo
+            } else {
+                permissionCatalog.values.firstOrNull {
+                    it.friendlyTitle.equals(chg.permissionTitle, ignoreCase = true) ||
+                        it.shortTag.equals(chg.permissionTitle, ignoreCase = true)
+                } ?: sideloadTimelineInfo
             }
-
-            // Add each flagged app in this Live Guard check to the Timeline
-            for (flaggedApp in vec.flaggedApps) {
-                if (flaggedApp.packageName in ignored) continue
-                val appTimestamp = when {
-                    vec.id == "screen_recording" || vec.id == "live_mic_cam" -> now
-                    flaggedApp.lastTimeUsedMs in 1L..now -> flaggedApp.lastTimeUsedMs
-                    flaggedApp.lastUpdateTimeMs in 1L..now -> flaggedApp.lastUpdateTimeMs
-                    flaggedApp.firstInstallTimeMs in 1L..now -> flaggedApp.firstInstallTimeMs
-                    else -> now - 60_000L
-                }
-
-                val alreadyInTimeline = timeline.any { existing ->
-                    existing.packageName == flaggedApp.packageName &&
-                        existing.permissionInfo.permissionName == vecPermInfo.permissionName
-                }
-                if (!alreadyInTimeline) {
-                    timeline.add(
-                        PermissionAccessEvent(
-                            id = "check_${vec.id}_${flaggedApp.packageName}",
-                            packageName = flaggedApp.packageName,
-                            appName = flaggedApp.appName,
-                            icon = flaggedApp.icon,
-                            permissionTitle = "${vecPermInfo.friendlyTitle} (${vec.title})",
-                            shortTag = vecPermInfo.shortTag,
-                            category = vecPermInfo.category,
-                            riskLevel = vecPermInfo.riskLevel,
-                            timestamp = appTimestamp,
-                            accessContext = contextBadge,
-                            permissionInfo = vecPermInfo
-                        )
+            val duplicate = timeline.any { existing ->
+                existing.packageName == cPkg &&
+                    kotlin.math.abs(existing.timestamp - chg.timestamp) < 10_000L
+            }
+            if (!duplicate) {
+                timeline.add(
+                    PermissionAccessEvent(
+                        id = "change_${chg.id}",
+                        packageName = cPkg,
+                        appName = cName.ifBlank { chg.appName },
+                        icon = cIcon,
+                        permissionTitle = if (chg.changeType == PrivacyChangeType.NEW_APP) {
+                            "New App Installed (${chg.permissionTitle})"
+                        } else {
+                            "Permission Granted: ${chg.permissionTitle}"
+                        },
+                        shortTag = if (chg.changeType == PrivacyChangeType.NEW_APP) "New App" else permInfo.shortTag,
+                        category = permInfo.category,
+                        riskLevel = permInfo.riskLevel,
+                        timestamp = chg.timestamp,
+                        accessContext = "Package / Permission Change",
+                        permissionInfo = permInfo
                     )
-                }
-            }
-
-            // If a check is flagged via system service/settings (e.g. USB Debugging, Accessibility service, Screen Mirroring display, Custom Keyboard) without a matched user AppPrivacyReport
-            if (vec.severity != AuditSeverity.SAFE && (vec.flaggedApps.isEmpty() || vec.extraDetails.isNotEmpty())) {
-                for ((idx, detail) in vec.extraDetails.withIndex()) {
-                    val detailPerm = if (vec.id == "sideload_adb" && detail.contains("USB Debugging", ignoreCase = true)) {
-                        usbDebuggingTimelineInfo
-                    } else if (vec.id == "screen_recording" && (detail.contains("Mirror", ignoreCase = true) || detail.contains("Cast", ignoreCase = true))) {
-                        screenMirrorTimelineInfo
-                    } else {
-                        vecPermInfo
-                    }
-                    // Try to extract package name if detail has "pkg/service" format
-                    val candidatePkg = detail.substringBefore('/').substringAfterLast(' ').trim()
-                        .takeIf { it.contains('.') && !it.contains(' ') }
-                    if (candidatePkg != null && candidatePkg in ignored) continue
-
-                    val matchedReport = candidatePkg?.let { reportsByPkg[it] }
-                    val itemPkg = matchedReport?.packageName ?: candidatePkg ?: "system.sensor"
-                    val itemName = matchedReport?.appName ?: detail.removePrefix("• ").trim()
-                    val itemIcon = matchedReport?.icon ?: defaultSysIcon
-
-                    val alreadyPresent = timeline.any { existing ->
-                        (existing.packageName == itemPkg && existing.permissionInfo.permissionName == detailPerm.permissionName) ||
-                            existing.appName == itemName
-                    }
-                    if (!alreadyPresent) {
-                        timeline.add(
-                            PermissionAccessEvent(
-                                id = "check_detail_${vec.id}_$idx",
-                                packageName = itemPkg,
-                                appName = itemName,
-                                icon = itemIcon,
-                                permissionTitle = detailPerm.friendlyTitle,
-                                shortTag = detailPerm.shortTag,
-                                category = detailPerm.category,
-                                riskLevel = detailPerm.riskLevel,
-                                timestamp = now - (idx * 1_000L),
-                                accessContext = contextBadge,
-                                permissionInfo = detailPerm
-                            )
-                        )
-                    }
-                }
-
-                // Fallback when a check is non-SAFE with neither flaggedApps nor extraDetails
-                if (vec.flaggedApps.isEmpty() && vec.extraDetails.isEmpty()) {
-                    val alreadyPresent = timeline.any { existing ->
-                        existing.permissionInfo.permissionName == vecPermInfo.permissionName
-                    }
-                    if (!alreadyPresent) {
-                        timeline.add(
-                            PermissionAccessEvent(
-                                id = "check_state_${vec.id}",
-                                packageName = "system.sensor",
-                                appName = vec.title,
-                                icon = defaultSysIcon,
-                                permissionTitle = vec.plainSummary,
-                                shortTag = vecPermInfo.shortTag,
-                                category = vecPermInfo.category,
-                                riskLevel = vecPermInfo.riskLevel,
-                                timestamp = now,
-                                accessContext = contextBadge,
-                                permissionInfo = vecPermInfo
-                            )
-                        )
-                    }
-                }
+                )
             }
         }
 
@@ -1566,6 +1563,42 @@ object PrivacyAnalyzer {
         }
         cachedTimelineTimeMs = System.currentTimeMillis()
         return sortedTimeline
+    }
+
+    /**
+     * Queries real-time UsageEvents over the last 15 minutes so apps that are currently
+     * in an active phone call, foreground session, or running a foreground service
+     * appear in the Timeline immediately while the activity/service is ongoing
+     * (without waiting for the activity to pause/finish).
+     */
+    private fun queryLiveUsageEventsTimestamps(context: Context): Map<String, Long> {
+        if (!hasUsageStatsPermission(context)) return emptyMap()
+        val result = HashMap<String, Long>()
+        try {
+            val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
+                ?: return emptyMap()
+            val now = System.currentTimeMillis()
+            val events = usm.queryEvents(now - 15 * 60_000L, now) ?: return emptyMap()
+            val ev = UsageEvents.Event()
+            val selfPkg = context.packageName
+            while (events.hasNextEvent()) {
+                events.getNextEvent(ev)
+                val pkg = ev.packageName ?: continue
+                if (pkg == selfPkg || pkg == "android") continue
+                val isLiveEvent = ev.eventType == UsageEvents.Event.ACTIVITY_RESUMED ||
+                    (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                        ev.eventType == UsageEvents.Event.FOREGROUND_SERVICE_START)
+                if (isLiveEvent && ev.timeStamp in 1L..now) {
+                    val prev = result[pkg] ?: 0L
+                    if (ev.timeStamp > prev) {
+                        result[pkg] = ev.timeStamp
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+            // Ignore
+        }
+        return result
     }
 
     @Volatile
