@@ -168,6 +168,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        isUiForeground = true
 
         PreferencesBackupManager.autoRestoreIfCleared(this)
         com.example.service.NotificationChannels.ensureCreated(this)
@@ -177,7 +178,8 @@ class MainActivity : ComponentActivity() {
             startTrackingServiceSafely(this)
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+        if (savedInstanceState == null &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             try {
@@ -258,20 +260,23 @@ class MainActivity : ComponentActivity() {
 
 fun startTrackingServiceSafely(context: Context) {
     try {
-        val serviceIntent = Intent(context, ThermalTrackerService::class.java)
+        if (ThermalTrackerService.isServiceRunning) return
+        val appCtx = context.applicationContext
+        val serviceIntent = Intent(appCtx, ThermalTrackerService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(serviceIntent)
+            appCtx.startForegroundService(serviceIntent)
         } else {
-            context.startService(serviceIntent)
+            appCtx.startService(serviceIntent)
         }
-    } catch (_: Exception) {
+    } catch (_: Throwable) {
     }
 }
 
 fun stopTrackingServiceSafely(context: Context) {
     try {
-        context.stopService(Intent(context, ThermalTrackerService::class.java))
-    } catch (_: Exception) {
+        ThermalTrackerService.isServiceRunning = false
+        context.applicationContext.stopService(Intent(context.applicationContext, ThermalTrackerService::class.java))
+    } catch (_: Throwable) {
     }
 }
 
@@ -330,17 +335,8 @@ fun MainScreen(viewModel: ThermalViewModel) {
         }
     }
 
-    val notificationPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { _ -> }
-
     LaunchedEffect(Unit) {
         LiveGuardMonitor.getInstance(context).startMonitoring()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && bgMonitoringEnabled) {
-            if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-            }
-        }
     }
 
     val pagerState = rememberPagerState(pageCount = { 4 })
@@ -382,25 +378,32 @@ fun MainScreen(viewModel: ThermalViewModel) {
 
         if (ThemeState.showAmbientGlow) {
             Canvas(modifier = Modifier.fillMaxSize()) {
+                if (size.width <= 1f || size.height <= 1f) return@Canvas
+                val r1 = (size.width * 0.7f).coerceAtLeast(1f)
+                val r2 = (size.width * 0.8f).coerceAtLeast(1f)
                 drawCircle(
                     brush = Brush.radialGradient(
                         colors = listOf(ambientColor.copy(alpha = 0.14f), Color.Transparent),
                         center = Offset(size.width * 0.8f, size.height * 0.1f),
-                        radius = size.width * 0.7f
-                    )
+                        radius = r1
+                    ),
+                    radius = r1,
+                    center = Offset(size.width * 0.8f, size.height * 0.1f)
                 )
                 drawCircle(
                     brush = Brush.radialGradient(
                         colors = listOf(ambientColor.copy(alpha = 0.07f), Color.Transparent),
                         center = Offset(size.width * 0.2f, size.height * 0.6f),
-                        radius = size.width * 0.8f
-                    )
+                        radius = r2
+                    ),
+                    radius = r2,
+                    center = Offset(size.width * 0.2f, size.height * 0.6f)
                 )
             }
         }
 
-        if (isExpandedScreen) {
-            Row(modifier = Modifier.fillMaxSize()) {
+        Row(modifier = Modifier.fillMaxSize()) {
+            if (isExpandedScreen) {
                 NavigationRail(
                     modifier = Modifier.fillMaxHeight().width(92.dp).statusBarsPadding(),
                     containerColor = GlassPanel.copy(alpha = 0.8f)
@@ -460,23 +463,11 @@ fun MainScreen(viewModel: ThermalViewModel) {
                     )
                     Spacer(Modifier.height(16.dp))
                 }
-
-                HorizontalPager(
-                    state = pagerState,
-                    modifier = Modifier.fillMaxSize().weight(1f)
-                ) { page ->
-                    when (page) {
-                        0 -> FilesScreen()
-                        1 -> PrivacyShieldScreen()
-                        2 -> LiveGuardScreen()
-                        3 -> VitalsScreen(viewModel, warningTemp)
-                    }
-                }
             }
-        } else {
+
             HorizontalPager(
                 state = pagerState,
-                modifier = Modifier.fillMaxSize()
+                modifier = Modifier.fillMaxSize().weight(1f)
             ) { page ->
                 when (page) {
                     0 -> FilesScreen()
@@ -485,6 +476,9 @@ fun MainScreen(viewModel: ThermalViewModel) {
                     3 -> VitalsScreen(viewModel, warningTemp)
                 }
             }
+        }
+
+        if (!isExpandedScreen) {
 
             Box(
                 modifier = Modifier
@@ -763,6 +757,7 @@ fun MorphingSettingsOrb(
                     rotationZ = rotation
                 }
             ) {
+                if (size.width <= 1f || size.height <= 1f) return@Canvas
                 drawArc(
                     color = AuraCyan.copy(alpha = 0.85f),
                     startAngle = 0f,
@@ -770,13 +765,15 @@ fun MorphingSettingsOrb(
                     useCenter = false,
                     style = Stroke(width = 2.5.dp.toPx(), cap = StrokeCap.Round)
                 )
+                val innerW = (size.width - 7.dp.toPx()).coerceAtLeast(1f)
+                val innerH = (size.height - 7.dp.toPx()).coerceAtLeast(1f)
                 drawArc(
                     color = AuraRose.copy(alpha = 0.85f),
                     startAngle = 90f,
                     sweepAngle = 180f,
                     useCenter = false,
                     topLeft = Offset(3.5.dp.toPx(), 3.5.dp.toPx()),
-                    size = Size(size.width - 7.dp.toPx(), size.height - 7.dp.toPx()),
+                    size = Size(innerW, innerH),
                     style = Stroke(width = 1.8.dp.toPx(), cap = StrokeCap.Round)
                 )
             }
@@ -1001,7 +998,10 @@ fun MorphingSettingsOrb(
                             .clickable {
                                 if (hapticEnabled) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                 isExpanded = false
-                                context.startActivity(Intent(context, GuardRulesActivity::class.java))
+                                try {
+                                    context.startActivity(Intent(context, GuardRulesActivity::class.java))
+                                } catch (_: Throwable) {
+                                }
                             }
                             .padding(vertical = 10.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,

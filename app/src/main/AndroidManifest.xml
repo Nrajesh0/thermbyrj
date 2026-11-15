@@ -26,6 +26,7 @@
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
+        android:resizeableActivity="true"
         android:supportsRtl="true"
         android:usesCleartextTraffic="false"
         android:theme="@style/Theme.MyApplication">
@@ -56,6 +57,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|uiMode|keyboard|keyboardHidden|density"
             android:label="@string/app_name"
             android:theme="@style/Theme.MyApplication">
             <intent-filter>
@@ -63,13 +65,41 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <activity android:name=".ui.screens.FileCategoryActivity" android:exported="false" android:theme="@style/Theme.MyApplication" />
-        <activity android:name=".ui.screens.AppListActivity" android:exported="false" android:theme="@style/Theme.MyApplication" />
-        <activity android:name=".ui.screens.DuplicateFinderActivity" android:exported="false" android:theme="@style/Theme.MyApplication" />
-        <activity android:name=".ui.screens.DeepCleanActivity" android:exported="false" android:theme="@style/Theme.MyApplication" />
-        <activity android:name=".ui.screens.VaultActivity" android:exported="false" android:theme="@style/Theme.MyApplication" />
-        <activity android:name=".ui.screens.DataTelemetryActivity" android:exported="false" android:theme="@style/Theme.MyApplication" />
-        <activity android:name=".ui.screens.GuardRulesActivity" android:exported="false" android:theme="@style/Theme.MyApplication" />
+        <activity
+            android:name=".ui.screens.FileCategoryActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|uiMode|keyboard|keyboardHidden|density"
+            android:theme="@style/Theme.MyApplication" />
+        <activity
+            android:name=".ui.screens.AppListActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|uiMode|keyboard|keyboardHidden|density"
+            android:theme="@style/Theme.MyApplication" />
+        <activity
+            android:name=".ui.screens.DuplicateFinderActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|uiMode|keyboard|keyboardHidden|density"
+            android:theme="@style/Theme.MyApplication" />
+        <activity
+            android:name=".ui.screens.DeepCleanActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|uiMode|keyboard|keyboardHidden|density"
+            android:theme="@style/Theme.MyApplication" />
+        <activity
+            android:name=".ui.screens.VaultActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|uiMode|keyboard|keyboardHidden|density"
+            android:theme="@style/Theme.MyApplication" />
+        <activity
+            android:name=".ui.screens.DataTelemetryActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|uiMode|keyboard|keyboardHidden|density"
+            android:theme="@style/Theme.MyApplication" />
+        <activity
+            android:name=".ui.screens.GuardRulesActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|uiMode|keyboard|keyboardHidden|density"
+            android:theme="@style/Theme.MyApplication" />
         <receiver android:name=".service.GuardAlertActionReceiver" android:exported="false" />
         <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.fileprovider" android:exported="false" android:grantUriPermissions="true">
             <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />

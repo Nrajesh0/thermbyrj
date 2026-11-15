@@ -31,6 +31,11 @@ import java.util.Locale
 
 class ThermalTrackerService : Service() {
 
+    companion object {
+        @Volatile
+        var isServiceRunning: Boolean = false
+    }
+
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
     private lateinit var thermalMonitor: ThermalMonitor
@@ -49,6 +54,7 @@ class ThermalTrackerService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        isServiceRunning = true
 
         thermalMonitor = ThermalMonitor.getInstance(this)
         thermalMonitor.startMonitoring()
@@ -76,17 +82,29 @@ class ThermalTrackerService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        isServiceRunning = true
         val notification = createNotification("Monitoring device thermals & privacy guard...")
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            ServiceCompat.startForeground(
-                this,
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (_: Throwable) {
+            // If the OS rejects foreground promotion during a Smart Sidebar / multi-window focus transition,
+            // keep monitoring in-process without crashing and stop the foreground service request cleanly.
+            isServiceRunning = false
+            try {
+                stopSelf()
+            } catch (_: Throwable) {
+            }
+            return START_NOT_STICKY
         }
 
         startTrackingLoop()
@@ -232,6 +250,7 @@ class ThermalTrackerService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        isServiceRunning = false
         super.onDestroy()
         serviceJob.cancel()
         if (::liveGuardMonitor.isInitialized) {

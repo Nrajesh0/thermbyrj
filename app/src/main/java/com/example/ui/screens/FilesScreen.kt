@@ -1378,7 +1378,10 @@ fun FilesScreen() {
                                 tint = AuraCyan,
                                 tag = "tool_duplicates"
                             ) {
-                                context.startActivity(Intent(context, DuplicateFinderActivity::class.java))
+                                try {
+                                    context.startActivity(Intent(context, DuplicateFinderActivity::class.java))
+                                } catch (_: Throwable) {
+                                }
                             }
                             QuickToolCard(
                                 modifier = Modifier.weight(1f),
@@ -1387,7 +1390,10 @@ fun FilesScreen() {
                                 tint = AuraOrange,
                                 tag = "tool_deep_clean"
                             ) {
-                                context.startActivity(Intent(context, DeepCleanActivity::class.java))
+                                try {
+                                    context.startActivity(Intent(context, DeepCleanActivity::class.java))
+                                } catch (_: Throwable) {
+                                }
                             }
                             QuickToolCard(
                                 modifier = Modifier.weight(1f),
@@ -1396,7 +1402,10 @@ fun FilesScreen() {
                                 tint = AuraRose,
                                 tag = "tool_vault"
                             ) {
-                                context.startActivity(Intent(context, VaultActivity::class.java))
+                                try {
+                                    context.startActivity(Intent(context, VaultActivity::class.java))
+                                } catch (_: Throwable) {
+                                }
                             }
                             QuickToolCard(
                                 modifier = Modifier.weight(1f),
@@ -1405,7 +1414,10 @@ fun FilesScreen() {
                                 tint = AuraPurple,
                                 tag = "tool_apps"
                             ) {
-                                context.startActivity(Intent(context, AppListActivity::class.java))
+                                try {
+                                    context.startActivity(Intent(context, AppListActivity::class.java))
+                                } catch (_: Throwable) {
+                                }
                             }
                         }
                     }
@@ -1460,16 +1472,19 @@ fun FilesScreen() {
                         )
                     }
 
-                    items(categories) { cat ->
+                    items(categories, key = { it.name }) { cat ->
                         GlassCard(modifier = Modifier.fillMaxWidth()) {
                             CategoryItemRow(cat, totalSpace) {
-                                if (cat.name in listOf("Images", "Videos", "Audio", "Documents", "Downloads", "APKs")) {
-                                    val intent = Intent(context, FileCategoryActivity::class.java).apply {
-                                        putExtra("CATEGORY_NAME", cat.name)
+                                try {
+                                    if (cat.name in listOf("Images", "Videos", "Audio", "Documents", "Downloads", "APKs")) {
+                                        val intent = Intent(context, FileCategoryActivity::class.java).apply {
+                                            putExtra("CATEGORY_NAME", cat.name)
+                                        }
+                                        context.startActivity(intent)
+                                    } else if (cat.name == "Apps & Data") {
+                                        context.startActivity(Intent(context, AppListActivity::class.java))
                                     }
-                                    context.startActivity(intent)
-                                } else if (cat.name == "Apps & Data") {
-                                    context.startActivity(Intent(context, AppListActivity::class.java))
+                                } catch (_: Throwable) {
                                 }
                             }
                         }

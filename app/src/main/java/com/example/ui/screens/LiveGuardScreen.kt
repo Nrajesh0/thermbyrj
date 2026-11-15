@@ -435,7 +435,10 @@ fun LiveGuardScreen() {
                         .background(if (activeRuleCount > 0) modeTint.copy(alpha = 0.14f) else GlassPanel.copy(alpha = 0.7f))
                         .border(1.dp, if (activeRuleCount > 0) modeTint.copy(alpha = 0.4f) else GlassBorder, RoundedCornerShape(12.dp))
                         .clickable {
-                            context.startActivity(Intent(context, GuardRulesActivity::class.java))
+                            try {
+                                context.startActivity(Intent(context, GuardRulesActivity::class.java))
+                            } catch (_: Throwable) {
+                            }
                         }
                         .padding(horizontal = 10.dp),
                     contentAlignment = Alignment.Center
@@ -559,7 +562,10 @@ fun LiveGuardScreen() {
             isScanning = isScanning,
             scanProgress = scanProgress,
             onScreenClick = {
-                context.startActivity(Intent(context, GuardRulesActivity::class.java))
+                try {
+                    context.startActivity(Intent(context, GuardRulesActivity::class.java))
+                } catch (_: Throwable) {
+                }
             },
             onMicClick = {
                 activeSubTab = "TIMELINE"
@@ -1025,6 +1031,7 @@ private fun TimelineConnectedSpineRow(
             contentAlignment = Alignment.Center
         ) {
             Canvas(modifier = Modifier.fillMaxSize()) {
+                if (size.width <= 1f || size.height <= 1f) return@Canvas
                 val cx = size.width / 2f
                 val cy = size.height / 2f
                 val lineColor = tint.copy(alpha = 0.35f)

@@ -94,7 +94,7 @@ fun ThermalChart(
             .padding(top = 8.dp, bottom = 8.dp, start = 4.dp, end = 4.dp)
     ) {
         Canvas(modifier = Modifier.fillMaxSize()) {
-            if (sortedRecords.isEmpty()) return@Canvas
+            if (sortedRecords.isEmpty() || size.width <= 1f || size.height <= 1f) return@Canvas
 
             val topPadding = 12.dp.toPx()
             val bottomLabelHeight = 24.dp.toPx()

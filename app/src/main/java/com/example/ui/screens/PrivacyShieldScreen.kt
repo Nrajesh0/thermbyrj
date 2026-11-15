@@ -292,9 +292,12 @@ fun PrivacyShieldScreen() {
                     PrivacyAnalyzer.openSpecificPermissionSettings(context, app.packageName, perm)
                 },
                 onUninstallClick = {
-                    context.startActivity(
-                        Intent(Intent.ACTION_DELETE, Uri.fromParts("package", app.packageName, null))
-                    )
+                    try {
+                        context.startActivity(
+                            Intent(Intent.ACTION_DELETE, Uri.fromParts("package", app.packageName, null))
+                        )
+                    } catch (_: Throwable) {
+                    }
                 },
                 onClose = { selectedAppForModal = null }
             )
@@ -327,12 +330,15 @@ fun PrivacyShieldScreen() {
                         }
                         context.startActivity(intent)
                     } catch (_: Exception) {
-                        context.startActivity(
-                            Intent(
-                                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                Uri.fromParts("package", app.packageName, null)
+                        try {
+                            context.startActivity(
+                                Intent(
+                                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                    Uri.fromParts("package", app.packageName, null)
+                                )
                             )
-                        )
+                        } catch (_: Throwable) {
+                        }
                     }
                 },
                 onClose = { selectedTrackerApp = null }
@@ -782,7 +788,10 @@ fun PrivacyShieldScreen() {
                                     .fillMaxWidth()
                                     .testTag("open_data_telemetry_button")
                                     .clickable {
-                                        context.startActivity(Intent(context, DataTelemetryActivity::class.java))
+                                        try {
+                                            context.startActivity(Intent(context, DataTelemetryActivity::class.java))
+                                        } catch (_: Throwable) {
+                                        }
                                     }
                             ) {
                                 Row(

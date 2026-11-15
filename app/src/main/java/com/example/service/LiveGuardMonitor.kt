@@ -2194,29 +2194,44 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 display.displayId != Display.DEFAULT_DISPLAY && display.state != Display.STATE_OFF
             }.forEach { display ->
                 val dispName = display.name ?: "Virtual Display #${display.displayId}"
+                val dispLower = dispName.lowercase()
                 val isPresentation = (display.flags and Display.FLAG_PRESENTATION) != 0
                 val ownerPkg = try {
                     displayGetOwnerPkgMethod?.invoke(display) as? String
                 } catch (_: Throwable) {
                     null
                 }
-                val isCaptureOrMirrorDisplay = isPresentation ||
-                    dispName.contains("mirror", ignoreCase = true) ||
-                    dispName.contains("cast", ignoreCase = true) ||
-                    dispName.contains("wireless", ignoreCase = true) ||
-                    dispName.contains("smart view", ignoreCase = true) ||
-                    dispName.contains("screenrecord", ignoreCase = true) ||
-                    dispName.contains("screencapture", ignoreCase = true) ||
-                    dispName.contains("wfd", ignoreCase = true) ||
-                    dispName.contains("scrcpy", ignoreCase = true) ||
-                    (ownerPkg != null && isScreenRecorderPackage(ownerPkg))
+                val ownerLower = ownerPkg?.lowercase().orEmpty()
+                val isOemFreeformOrSidebarDisplay = dispLower.contains("freeform") ||
+                    dispLower.contains("miniwindow") ||
+                    dispLower.contains("multiwindow") ||
+                    dispLower.contains("smartsidebar") ||
+                    dispLower.contains("sidebar") ||
+                    dispLower.contains("edgepanel") ||
+                    dispLower.contains("pip") ||
+                    ownerLower.contains("freeform") ||
+                    ownerLower.contains("smartsidebar") ||
+                    ownerLower.contains("cocktailbar") ||
+                    ownerLower.contains("multiwindow")
+                val isCaptureOrMirrorDisplay = !isOemFreeformOrSidebarDisplay && (
+                    isPresentation ||
+                        dispLower.contains("mirror") ||
+                        dispLower.contains("cast") ||
+                        dispLower.contains("wireless") ||
+                        dispLower.contains("smart view") ||
+                        dispLower.contains("screenrecord") ||
+                        dispLower.contains("screencapture") ||
+                        dispLower.contains("wfd") ||
+                        dispLower.contains("scrcpy") ||
+                        (ownerPkg != null && isScreenRecorderPackage(ownerPkg))
+                    )
                 if (isCaptureOrMirrorDisplay) {
                     if (isPresentation ||
-                        dispName.contains("mirror", ignoreCase = true) ||
-                        dispName.contains("cast", ignoreCase = true) ||
-                        dispName.contains("wireless", ignoreCase = true) ||
-                        dispName.contains("smart view", ignoreCase = true) ||
-                        dispName.contains("wfd", ignoreCase = true)
+                        dispLower.contains("mirror") ||
+                        dispLower.contains("cast") ||
+                        dispLower.contains("wireless") ||
+                        dispLower.contains("smart view") ||
+                        dispLower.contains("wfd")
                     ) {
                         hasMirrorOrCastDisplay = true
                     }

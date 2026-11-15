@@ -330,7 +330,10 @@ fun AppListScreen(onBack: () -> Unit) {
                             val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
                                 data = Uri.parse("package:$pkg")
                             }
-                            context.startActivity(intent)
+                            try {
+                                context.startActivity(intent)
+                            } catch (_: Throwable) {
+                            }
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = AuraCyan)
                     ) {
@@ -626,14 +629,19 @@ internal fun Drawable.toSafeBitmap(maxSizePx: Int = 96): Bitmap {
                 return Bitmap.createScaledBitmap(softwareSrc, maxSizePx, maxSizePx, true)
             }
         }
-        val rawW = if (intrinsicWidth > 0) intrinsicWidth else maxSizePx
-        val rawH = if (intrinsicHeight > 0) intrinsicHeight else maxSizePx
+        val safeDrawable = try {
+            constantState?.newDrawable()?.mutate() ?: this
+        } catch (_: Throwable) {
+            this
+        }
+        val rawW = if (safeDrawable.intrinsicWidth > 0) safeDrawable.intrinsicWidth else maxSizePx
+        val rawH = if (safeDrawable.intrinsicHeight > 0) safeDrawable.intrinsicHeight else maxSizePx
         val width = rawW.coerceIn(1, maxSizePx)
         val height = rawH.coerceIn(1, maxSizePx)
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
-        setBounds(0, 0, canvas.width, canvas.height)
-        draw(canvas)
+        safeDrawable.setBounds(0, 0, canvas.width, canvas.height)
+        safeDrawable.draw(canvas)
         bitmap
     } catch (_: Throwable) {
         Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
