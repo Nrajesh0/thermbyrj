@@ -413,48 +413,47 @@ class LiveGuardMonitor private constructor(private val context: Context) {
     private val periodicMonitorRunnable = object : Runnable {
         override fun run() {
             if (!isMonitoring) return
-            if (_rulesConfig.value.pausePollingScreenOff && !isDeviceScreenInteractive()) {
-                return
-            }
-            bgExecutor.execute {
-                try {
-                    val pkgOps = fetchAllPackageOps()
-                    val usageSnapshot = queryCombinedUsageState()
-                    refreshDisplayCaptureState(
-                        triggerAlertIfNew = true,
-                        preloadedPkgOpsList = pkgOps,
-                        preloadedUsageSnapshot = usageSnapshot
-                    )
-                    refreshLocationAndClipboardState(
-                        triggerAlertIfNew = true,
-                        preloadedPkgOpsList = pkgOps,
-                        preloadedUsageSnapshot = usageSnapshot
-                    )
-                    val now = System.currentTimeMillis()
-                    if (now - lastPermissionDiffCheckMs >= 30_000L) {
-                        lastPermissionDiffCheckMs = now
-                        try {
-                            val summary = PrivacyAnalyzer.analyzeDevicePrivacy(
-                                context,
-                                includeSystemApps = false,
-                                forceRefresh = true
-                            )
-                            PrivacyAnalyzer.getPrivacyChanges(
-                                context = context,
-                                currentReports = summary.appReports,
-                                dispatchNotifications = true
-                            )
-                            val vectors = runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = false)
-                            evaluateAndNotifyLiveGuardChecks(vectors)
-                        } catch (_: Throwable) {
+            val screenInteractive = isDeviceScreenInteractive()
+            if (!_rulesConfig.value.pausePollingScreenOff || screenInteractive) {
+                bgExecutor.execute {
+                    try {
+                        val pkgOps = fetchAllPackageOps()
+                        val usageSnapshot = queryCombinedUsageState()
+                        refreshDisplayCaptureState(
+                            triggerAlertIfNew = true,
+                            preloadedPkgOpsList = pkgOps,
+                            preloadedUsageSnapshot = usageSnapshot
+                        )
+                        refreshLocationAndClipboardState(
+                            triggerAlertIfNew = true,
+                            preloadedPkgOpsList = pkgOps,
+                            preloadedUsageSnapshot = usageSnapshot
+                        )
+                        val now = System.currentTimeMillis()
+                        if (now - lastPermissionDiffCheckMs >= 20_000L) {
+                            lastPermissionDiffCheckMs = now
+                            try {
+                                val summary = PrivacyAnalyzer.analyzeDevicePrivacy(
+                                    context,
+                                    includeSystemApps = false,
+                                    forceRefresh = true
+                                )
+                                PrivacyAnalyzer.getPrivacyChanges(
+                                    context = context,
+                                    currentReports = summary.appReports,
+                                    dispatchNotifications = true
+                                )
+                                val vectors = runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = false)
+                                evaluateAndNotifyLiveGuardChecks(vectors)
+                            } catch (_: Throwable) {
+                            }
                         }
+                    } catch (_: Throwable) {
                     }
-                } catch (_: Throwable) {
                 }
             }
-            // Adaptive cadence: 10s when app UI is open in foreground, 30s in background
-            // (Mic, Camera, Screen, and Clipboard already have 0ms OS event callbacks)
-            val nextDelayMs = if (com.example.MainActivity.isUiForeground) 10_000L else 30_000L
+            // Fast 6s cadence while screen is interactive so background Screen Recording, Mirroring & Live Guard checks trigger promptly
+            val nextDelayMs = if (!screenInteractive) 20_000L else 6_000L
             mainHandler.postDelayed(this, nextDelayMs)
         }
     }
@@ -633,7 +632,6 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         loadRulesConfig()
         loadTrustedRules()
         loadSnoozes()
-        loadNotifiedAuditSignatures()
     }
 
     fun reloadPersistedState() {
@@ -1634,7 +1632,15 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 while (events != null && events.hasNextEvent()) {
                     events.getNextEvent(ev)
                     val pkg = ev.packageName ?: continue
-                    val isRecorderPkg = isScreenRecorderPackage(pkg)
+                    val clsLower = ev.className?.lowercase().orEmpty()
+                    val isCaptureComponent = clsLower.contains("screenrecord") ||
+                        clsLower.contains("screen_record") ||
+                        clsLower.contains("screencapture") ||
+                        clsLower.contains("mediaprojection") ||
+                        clsLower.contains("recordingservice") ||
+                        clsLower.contains("smartmirroring") ||
+                        clsLower.contains("casttile")
+                    val isRecorderPkg = isScreenRecorderPackage(pkg) || isCaptureComponent
                     when (ev.eventType) {
                         UsageEvents.Event.ACTIVITY_RESUMED -> {
                             if (ev.timeStamp >= cachedActiveFgResumeTs) {
@@ -1668,7 +1674,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                             }
                         }
                         UsageEvents.Event.FOREGROUND_SERVICE_STOP -> {
-                            if (isRecorderPkg) {
+                            if (isRecorderPkg || pkg in cachedRecServiceStartMap) {
                                 cachedRecServiceStopMap[pkg] = maxOf(cachedRecServiceStopMap[pkg] ?: 0L, ev.timeStamp)
                             }
                         }
@@ -2192,7 +2198,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     MediaStore.Video.Media.OWNER_PACKAGE_NAME,
                     MediaStore.Video.Media.DATE_MODIFIED
                 )
-                val cutoffSec = (now - 8_000L) / 1000L
+                val cutoffSec = (now - 25_000L) / 1000L
                 context.contentResolver.query(
                     MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
                     projection,
@@ -2234,8 +2240,8 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     if (!f.isFile) continue
                     val ageMs = now - f.lastModified()
                     val nameLower = f.name.lowercase()
-                    if ((nameLower.endsWith(".tmp") && ageMs in 0..120_000L) ||
-                        ((nameLower.endsWith(".mp4") || nameLower.endsWith(".mkv")) && ageMs in 0..6_000L)
+                    if ((nameLower.endsWith(".tmp") && ageMs in 0..180_000L) ||
+                        ((nameLower.endsWith(".mp4") || nameLower.endsWith(".mkv")) && ageMs in 0..25_000L)
                     ) {
                         return ScreenRecordingFileHit(fileName = f.name, ownerPackage = null)
                     }
@@ -2285,6 +2291,17 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             sendGuardNotificationDirect(payload)
         }
         onHighPriorityAlert?.invoke(title, desc)
+        notifyActiveChecksNow()
+    }
+
+    fun notifyActiveChecksNow() {
+        bgExecutor.execute {
+            try {
+                val vectors = runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = false)
+                evaluateAndNotifyLiveGuardChecks(vectors, forceNotifyActive = true)
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     @Volatile
@@ -2304,6 +2321,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 (nowMs - cachedAuditVectorsTimeMs) in 0L..15_000L &&
                 (nowMs - _captureState.value.lastUpdatedMs) in 0L..10_000L
             ) {
+                evaluateAndNotifyLiveGuardChecks(existing, forceNotifyActive = false)
                 return existing
             }
         }
@@ -2585,9 +2603,8 @@ class LiveGuardMonitor private constructor(private val context: Context) {
     }
 
     /**
-     * Evaluates Live Guard security checks (Screen Readers / Accessibility, Notification Readers,
-     * Screen Overlays, Device Admins, Custom Keyboards, and USB Debugging / Sideloads) and dispatches
-     * real-time notifications whenever a risk is active or newly enabled.
+     * Evaluates all 10 Live Guard security checks and dispatches real-time notifications
+     * and Event Log / Timeline entries whenever a risk is active or newly enabled.
      */
     fun evaluateAndNotifyLiveGuardChecks(
         vectors: List<SecurityAuditVector>,
@@ -2600,37 +2617,48 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             if (!thermalPrefs.getBoolean("live_guard_alerts", true)) return
             if (isGlobalSensorSnoozed(GuardSensorType.SCREEN)) return
 
-            val checkTargetIds = setOf(
-                "accessibility_monitors",
-                "notification_listeners",
-                "screen_overlays",
-                "device_admins",
-                "keyboards_vpn",
-                "sideload_adb"
+            val canPostNotifications = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                ContextCompat.checkSelfPermission(
+                    context,
+                    android.Manifest.permission.POST_NOTIFICATIONS
+                ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            } else {
+                true
+            }
+
+            data class PendingCheckAlert(
+                val notifId: Int,
+                val eventType: String,
+                val title: String,
+                val message: String,
+                val severity: AuditSeverity,
+                val primaryPkg: String?,
+                val sensorType: GuardSensorType,
+                val settingsAction: String?
             )
-            var signaturesChanged = false
+
+            val pendingAlerts = mutableListOf<PendingCheckAlert>()
 
             for (vector in vectors) {
-                if (vector.id !in checkTargetIds) continue
                 if (vector.severity == AuditSeverity.SAFE) {
-                    if (notifiedAuditVectorSignatures.remove(vector.id) != null) {
-                        signaturesChanged = true
-                    }
+                    notifiedAuditVectorSignatures.remove(vector.id)
                     continue
                 }
 
                 val appPkgs = vector.flaggedApps.map { it.packageName }.sorted()
                 val appNames = vector.flaggedApps.map { it.appName }.distinct()
                 val details = vector.extraDetails.sorted()
-                val currentSignature = "${vector.severity.name}|${appPkgs.joinToString(",")}|${details.joinToString(",")}"
+                val currentSignature = "${vector.severity.name}|${vector.statusBadge}|${appPkgs.joinToString(",")}|${details.joinToString(",")}"
                 val previousSignature = notifiedAuditVectorSignatures[vector.id]
 
                 if (!forceNotifyActive && previousSignature == currentSignature) {
                     continue
                 }
 
-                notifiedAuditVectorSignatures[vector.id] = currentSignature
-                signaturesChanged = true
+                // Only mark as notified if Android notification permission is granted so we re-fire immediately once granted
+                if (canPostNotifications) {
+                    notifiedAuditVectorSignatures[vector.id] = currentSignature
+                }
 
                 val primaryPkg = vector.flaggedApps.firstOrNull()?.packageName
                 val whoSummary = when {
@@ -2640,90 +2668,183 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     else -> vector.plainSummary
                 }
 
-                val (notifId, alertTitle, alertMsg) = when (vector.id) {
-                    "accessibility_monitors" -> Triple(
-                        2101,
-                        "Screen Reader Active: ${appNames.firstOrNull() ?: "Accessibility"}",
-                        "${vector.plainSummary} ($whoSummary). Screen readers can read all on-screen text and passwords."
+                val alertSpec: PendingCheckAlert = when (vector.id) {
+                    "screen_recording" -> PendingCheckAlert(
+                        notifId = 2100,
+                        eventType = "SCREEN",
+                        title = "Screen Recording / Mirroring Active",
+                        message = "${vector.plainSummary} ($whoSummary).",
+                        severity = vector.severity,
+                        primaryPkg = primaryPkg,
+                        sensorType = GuardSensorType.SCREEN,
+                        settingsAction = vector.settingsAction
                     )
-                    "notification_listeners" -> Triple(
-                        2102,
-                        "Notification Reader Active: ${appNames.firstOrNull() ?: "Listener"}",
-                        "${vector.plainSummary} ($whoSummary). Notification listeners can read incoming chats and 2FA codes."
+                    "accessibility_monitors" -> PendingCheckAlert(
+                        notifId = 2101,
+                        eventType = "ACCESSIBILITY",
+                        title = "Screen Reader Active: ${appNames.firstOrNull() ?: "Accessibility"}",
+                        message = "${vector.plainSummary} ($whoSummary). Screen readers can read all on-screen text and passwords.",
+                        severity = vector.severity,
+                        primaryPkg = primaryPkg,
+                        sensorType = GuardSensorType.SCREEN,
+                        settingsAction = vector.settingsAction
                     )
-                    "screen_overlays" -> Triple(
-                        2103,
-                        "Screen Overlay Risk (${vector.flaggedApps.size} App${if (vector.flaggedApps.size == 1) "" else "s"})",
-                        "Apps allowed to draw over your screen: $whoSummary."
+                    "notification_listeners" -> PendingCheckAlert(
+                        notifId = 2102,
+                        eventType = "NOTIFICATION_LISTENER",
+                        title = "Notification Reader Active: ${appNames.firstOrNull() ?: "Listener"}",
+                        message = "${vector.plainSummary} ($whoSummary). Notification listeners can read incoming chats and 2FA codes.",
+                        severity = vector.severity,
+                        primaryPkg = primaryPkg,
+                        sensorType = GuardSensorType.SCREEN,
+                        settingsAction = vector.settingsAction
                     )
-                    "device_admins" -> Triple(
-                        2104,
-                        "Device Admin Active: ${appNames.firstOrNull() ?: "Admin"}",
-                        "${vector.plainSummary} ($whoSummary)."
+                    "screen_overlays" -> PendingCheckAlert(
+                        notifId = 2103,
+                        eventType = "OVERLAY",
+                        title = "Screen Overlays Enabled (${vector.flaggedApps.size} App${if (vector.flaggedApps.size == 1) "" else "s"})",
+                        message = "Apps allowed to draw over your screen: $whoSummary.",
+                        severity = vector.severity,
+                        primaryPkg = primaryPkg,
+                        sensorType = GuardSensorType.SCREEN,
+                        settingsAction = vector.settingsAction
                     )
-                    "keyboards_vpn" -> Triple(
-                        2105,
-                        "Custom Keyboard Active",
-                        "${vector.plainSummary} ($whoSummary). Third-party keyboards can log keystrokes."
+                    "device_admins" -> PendingCheckAlert(
+                        notifId = 2104,
+                        eventType = "DEVICE_ADMIN",
+                        title = "Device Admin Active: ${appNames.firstOrNull() ?: "Admin"}",
+                        message = "${vector.plainSummary} ($whoSummary).",
+                        severity = vector.severity,
+                        primaryPkg = primaryPkg,
+                        sensorType = GuardSensorType.SCREEN,
+                        settingsAction = vector.settingsAction
                     )
-                    "sideload_adb" -> Triple(
-                        2106,
-                        if (details.any { it.contains("ADB", ignoreCase = true) }) "USB Debugging (ADB) Enabled" else "Sideloaded Apps Detected",
-                        "${vector.plainSummary}${if (appNames.isNotEmpty()) " ($whoSummary)" else ""}."
+                    "keyboards_vpn" -> PendingCheckAlert(
+                        notifId = 2105,
+                        eventType = "KEYBOARD",
+                        title = "Custom Keyboard Active",
+                        message = "${vector.plainSummary} ($whoSummary). Third-party keyboards can log keystrokes.",
+                        severity = vector.severity,
+                        primaryPkg = primaryPkg,
+                        sensorType = GuardSensorType.SCREEN,
+                        settingsAction = vector.settingsAction
                     )
-                    else -> Triple(2109, vector.title, vector.plainSummary)
+                    "sideload_adb" -> PendingCheckAlert(
+                        notifId = 2106,
+                        eventType = "USB_ADB",
+                        title = if (details.any { it.contains("ADB", ignoreCase = true) }) "USB Debugging (ADB) Enabled" else "Sideloaded Apps Detected",
+                        message = "${vector.plainSummary}${if (appNames.isNotEmpty()) " ($whoSummary)" else ""}.",
+                        severity = vector.severity,
+                        primaryPkg = primaryPkg,
+                        sensorType = GuardSensorType.SCREEN,
+                        settingsAction = vector.settingsAction
+                    )
+                    "bg_location" -> PendingCheckAlert(
+                        notifId = 2107,
+                        eventType = "LOCATION",
+                        title = "Background Location Risk (${vector.statusBadge})",
+                        message = "${vector.plainSummary} ($whoSummary).",
+                        severity = vector.severity,
+                        primaryPkg = primaryPkg,
+                        sensorType = GuardSensorType.LOCATION,
+                        settingsAction = vector.settingsAction
+                    )
+                    "clipboard_access" -> PendingCheckAlert(
+                        notifId = 2108,
+                        eventType = "CLIPBOARD",
+                        title = "Clipboard Access Detected",
+                        message = "${vector.plainSummary} ($whoSummary).",
+                        severity = vector.severity,
+                        primaryPkg = primaryPkg,
+                        sensorType = GuardSensorType.CLIPBOARD,
+                        settingsAction = vector.settingsAction
+                    )
+                    "live_mic_cam" -> PendingCheckAlert(
+                        notifId = 2109,
+                        eventType = if (_captureState.value.isCameraActive) "CAMERA" else "MIC",
+                        title = "Mic / Camera Active Now",
+                        message = "${vector.plainSummary}.",
+                        severity = vector.severity,
+                        primaryPkg = primaryPkg,
+                        sensorType = if (_captureState.value.isCameraActive) GuardSensorType.CAMERA else GuardSensorType.MIC,
+                        settingsAction = vector.settingsAction
+                    )
+                    else -> PendingCheckAlert(
+                        notifId = 2110,
+                        eventType = "SCREEN",
+                        title = vector.title,
+                        message = vector.plainSummary,
+                        severity = vector.severity,
+                        primaryPkg = primaryPkg,
+                        sensorType = GuardSensorType.SCREEN,
+                        settingsAction = vector.settingsAction
+                    )
                 }
 
-                recordEvent(
-                    type = "SCREEN",
-                    title = alertTitle,
-                    description = alertMsg,
-                    severity = vector.severity,
-                    packageName = primaryPkg
-                )
+                // Deduplicate in _events if the exact same title was logged within the last 60s
+                val alreadyInEvents = _events.value.any { ev ->
+                    ev.title == alertSpec.title && (System.currentTimeMillis() - ev.timestamp) < 60_000L
+                }
+                if (!alreadyInEvents) {
+                    recordEvent(
+                        type = alertSpec.eventType,
+                        title = alertSpec.title,
+                        description = alertSpec.message,
+                        severity = alertSpec.severity,
+                        packageName = alertSpec.primaryPkg
+                    )
+                }
+                pendingAlerts.add(alertSpec)
+            }
 
+            if (pendingAlerts.isEmpty() || !canPostNotifications) return
+
+            // If multiple checks are flagged at once, post a high-priority summary notification first
+            // so Android's per-package burst rate limiter never drops any flagged check!
+            if (pendingAlerts.size > 1) {
+                val summaryLines = pendingAlerts.map { "• ${it.title}" }
+                val summaryBody = summaryLines.joinToString("\n")
                 sendGuardNotificationDirect(
                     payload = GuardAlertPayload(
-                        title = alertTitle,
-                        message = alertMsg,
-                        packageName = primaryPkg,
+                        title = "Live Guard: ${pendingAlerts.size} Checks Flagged",
+                        message = summaryBody,
+                        packageName = null,
                         sensorType = GuardSensorType.SCREEN
                     ),
-                    customNotificationId = notifId,
-                    settingsAction = vector.settingsAction
+                    customNotificationId = 2099,
+                    settingsAction = null
                 )
             }
 
-            if (signaturesChanged) {
-                saveNotifiedAuditSignatures()
-            }
-        } catch (_: Throwable) {
-        }
-    }
-
-    private fun loadNotifiedAuditSignatures() {
-        try {
-            val raw = prefs.getString("notified_vector_signatures_v1", null) ?: return
-            val obj = JSONObject(raw)
-            val keys = obj.keys()
-            while (keys.hasNext()) {
-                val k = keys.next()
-                val v = obj.optString(k, "")
-                if (k.isNotBlank() && v.isNotBlank()) {
-                    notifiedAuditVectorSignatures[k] = v
+            // Stagger individual check notifications by 220ms so Android NotificationManagerService displays all of them
+            pendingAlerts.forEachIndexed { idx, alert ->
+                val delayMs = idx * 220L
+                if (delayMs == 0L) {
+                    sendGuardNotificationDirect(
+                        payload = GuardAlertPayload(
+                            title = alert.title,
+                            message = alert.message,
+                            packageName = alert.primaryPkg,
+                            sensorType = alert.sensorType
+                        ),
+                        customNotificationId = alert.notifId,
+                        settingsAction = alert.settingsAction
+                    )
+                } else {
+                    mainHandler.postDelayed({
+                        sendGuardNotificationDirect(
+                            payload = GuardAlertPayload(
+                                title = alert.title,
+                                message = alert.message,
+                                packageName = alert.primaryPkg,
+                                sensorType = alert.sensorType
+                            ),
+                            customNotificationId = alert.notifId,
+                            settingsAction = alert.settingsAction
+                        )
+                    }, delayMs)
                 }
             }
-        } catch (_: Throwable) {
-        }
-    }
-
-    private fun saveNotifiedAuditSignatures() {
-        try {
-            val obj = JSONObject()
-            for ((k, v) in notifiedAuditVectorSignatures) {
-                obj.put(k, v)
-            }
-            prefs.edit().putString("notified_vector_signatures_v1", obj.toString()).apply()
         } catch (_: Throwable) {
         }
     }
@@ -2776,7 +2897,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         val trimmed = current.take(40)
         _events.value = trimmed
         saveEvents(trimmed)
-        if (type in setOf("MIC", "CAMERA", "LOCATION", "CLIPBOARD", "SCREEN")) {
+        if (type != "AUDIT") {
             PrivacyAnalyzer.invalidateTimelineCache()
         }
     }

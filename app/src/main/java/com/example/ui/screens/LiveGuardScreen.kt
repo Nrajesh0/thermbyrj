@@ -210,7 +210,9 @@ fun LiveGuardScreen() {
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         hasNotificationPermission = granted
-        if (!granted) {
+        if (granted) {
+            guardMonitor.notifyActiveChecksNow()
+        } else {
             openAppNotificationSettings(context)
         }
     }
@@ -277,7 +279,7 @@ fun LiveGuardScreen() {
                 val t = PrivacyAnalyzer.getPermissionAccessTimeline(
                     context,
                     includeSystemApps = false,
-                    forceRefresh = globalRefreshVersion > 0
+                    forceRefresh = true
                 )
                 v to t
             }
@@ -311,6 +313,7 @@ fun LiveGuardScreen() {
             }
             val (results, timeline) = withContext(Dispatchers.IO) {
                 val v = guardMonitor.runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = true)
+                guardMonitor.notifyActiveChecksNow()
                 val t = PrivacyAnalyzer.getPermissionAccessTimeline(context, includeSystemApps = false, forceRefresh = true)
                 v to t
             }
@@ -657,7 +660,7 @@ fun LiveGuardScreen() {
                         GuardFilterPill("Files ($fileCount)", activeTimelineFilter == "STORAGE_MEDIA", AuraGreen) {
                             activeTimelineFilter = "STORAGE_MEDIA"
                         }
-                        GuardFilterPill("Overlays ($specCount)", activeTimelineFilter == "SPECIAL_ACCESS", AuraRose) {
+                        GuardFilterPill("Special / Screen ($specCount)", activeTimelineFilter == "SPECIAL_ACCESS", AuraRose) {
                             activeTimelineFilter = "SPECIAL_ACCESS"
                         }
                     }
@@ -959,6 +962,10 @@ private fun permissionVisuals(perm: PlainPermissionInfo, cat: PermissionCategory
         android.Manifest.permission.PACKAGE_USAGE_STATS -> Color(0xFF0EA5E9) to Icons.Default.QueryStats
         "SPECIAL_CLIPBOARD_READ" -> Color(0xFFA855F7) to Icons.Default.ContentPaste
         "SPECIAL_SCREEN_CAPTURE" -> Color(0xFFFF3B5C) to Icons.AutoMirrored.Filled.ScreenShare
+        "SPECIAL_SCREEN_MIRROR" -> Color(0xFFFF6D00) to Icons.AutoMirrored.Filled.ScreenShare
+        "SPECIAL_CUSTOM_KEYBOARD" -> Color(0xFFF59E0B) to Icons.Default.Tune
+        "SPECIAL_USB_DEBUGGING" -> Color(0xFFEC4899) to Icons.Default.Security
+        "SPECIAL_SIDELOADED_APP" -> Color(0xFFF97316) to Icons.Default.SystemUpdate
         else -> when (cat) {
             PermissionCategory.LOCATION -> AuraCyan to Icons.Default.LocationOn
             PermissionCategory.CAMERA_MIC -> AuraOrange to Icons.Default.Mic

@@ -161,6 +161,13 @@ class MainActivity : ComponentActivity() {
 
     private val viewModel: ThermalViewModel by viewModels()
     private var activityScreenRecordingConsumer: java.util.function.Consumer<Int>? = null
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            LiveGuardMonitor.getInstance(applicationContext).notifyActiveChecksNow()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -171,6 +178,15 @@ class MainActivity : ComponentActivity() {
         ThemeState.loadFromPrefs(this)
         if (prefs.getBoolean("background_monitoring", true)) {
             startTrackingServiceSafely(this)
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            try {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            } catch (_: Throwable) {
+            }
         }
 
         // Staggered, low-impact background pre-warm after initial UI and storage scan settle
@@ -185,13 +201,9 @@ class MainActivity : ComponentActivity() {
                 }
                 delay(300L)
                 val guard = LiveGuardMonitor.getInstance(applicationContext)
-                if (guard.peekCachedAuditVectors() == null) {
-                    guard.runDeepSecurityAudit(includeSystemApps = false)
-                }
+                guard.runDeepSecurityAudit(includeSystemApps = false)
                 delay(300L)
-                if (PrivacyAnalyzer.peekCachedTimeline(false) == null) {
-                    PrivacyAnalyzer.getPermissionAccessTimeline(applicationContext, includeSystemApps = false)
-                }
+                PrivacyAnalyzer.getPermissionAccessTimeline(applicationContext, includeSystemApps = false, forceRefresh = true)
             } catch (_: Throwable) {
             }
         }
