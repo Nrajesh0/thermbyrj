@@ -196,6 +196,7 @@ fun PrivacyShieldScreen() {
         val byFilter = when (activeAppFilter) {
             "ALL" -> list
             "HIGH_RISK" -> list.filter { it.riskScore >= 35 }
+            "THREATS" -> list.filter { it.threatSignals.isNotEmpty() || it.isHiddenStealthApp || it.isImpersonatingSystemOrBrand || it.hasUntrustedOrDebugCert }
             "SIDELOADED" -> list.filter { it.isSideloaded }
             else -> {
                 val cat = PermissionCategory.entries.find { it.name == activeAppFilter }
@@ -209,6 +210,8 @@ fun PrivacyShieldScreen() {
             byFilter.filter {
                 it.appName.contains(q, ignoreCase = true) ||
                     it.packageName.contains(q, ignoreCase = true) ||
+                    it.certSha256.contains(q, ignoreCase = true) ||
+                    it.threatSignals.any { s -> s.title.contains(q, ignoreCase = true) || s.description.contains(q, ignoreCase = true) } ||
                     it.grantedPermissions.any { p -> p.shortTag.contains(q, ignoreCase = true) || p.friendlyTitle.contains(q, ignoreCase = true) }
             }
         }
@@ -557,22 +560,10 @@ fun PrivacyShieldScreen() {
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         val sideloadCount = currentSummary.appReports.count { it.isSideloaded }
-                        FilterPill(
-                            label = when (appSortOption) {
-                                "NEW_TO_OLD" -> "Sort: Newest"
-                                "OLD_TO_NEW" -> "Sort: Oldest"
-                                "NAME" -> "Sort: Name"
-                                else -> "Sort: Risk"
-                            },
-                            selected = appSortOption != "RISK",
-                            tint = AuraCyan,
-                            onClick = {
-                                appSortOption = if (appSortOption == "NEW_TO_OLD") "RISK" else "NEW_TO_OLD"
-                            }
-                        )
                         val pills = listOf(
                             Triple("ALL", "All (${currentSummary.appReports.size})", AuraGreen),
                             Triple("HIGH_RISK", "High Risk (${currentSummary.highRiskAppCount})", AuraRose),
+                            Triple("THREATS", "Threats (${currentSummary.threatFlaggedAppCount})", AuraRose),
                             Triple("SIDELOADED", "Sideloaded ($sideloadCount)", AuraOrange),
                             Triple(PermissionCategory.CAMERA_MIC.name, "Cam & Mic (${currentSummary.categoryCounts[PermissionCategory.CAMERA_MIC] ?: 0})", AuraOrange),
                             Triple(PermissionCategory.LOCATION.name, "Location (${currentSummary.categoryCounts[PermissionCategory.LOCATION] ?: 0})", AuraCyan),
@@ -596,11 +587,11 @@ fun PrivacyShieldScreen() {
                         )
                     }
 
-                    Spacer(modifier = Modifier.height(10.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
 
                     LazyColumn(
                         modifier = Modifier.fillMaxSize(),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(7.dp),
                         contentPadding = PaddingValues(bottom = 112.dp)
                     ) {
                         if (filteredApps.isEmpty()) {
@@ -676,11 +667,11 @@ fun PrivacyShieldScreen() {
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(10.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
 
                     LazyColumn(
                         modifier = Modifier.fillMaxSize(),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(7.dp),
                         contentPadding = PaddingValues(bottom = 112.dp)
                     ) {
                         if (filteredChanges.isEmpty()) {
@@ -778,11 +769,11 @@ fun PrivacyShieldScreen() {
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(10.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
 
                     LazyColumn(
                         modifier = Modifier.fillMaxSize(),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(7.dp),
                         contentPadding = PaddingValues(bottom = 112.dp)
                     ) {
                         item(key = "telemetry_radar_banner") {
@@ -800,7 +791,7 @@ fun PrivacyShieldScreen() {
                                 ) {
                                     Box(
                                         modifier = Modifier
-                                            .size(36.dp)
+                                            .size(34.dp)
                                             .clip(CircleShape)
                                             .background(AuraOrange.copy(alpha = 0.15f)),
                                         contentAlignment = Alignment.Center
@@ -809,10 +800,10 @@ fun PrivacyShieldScreen() {
                                             Icons.Default.DataUsage,
                                             contentDescription = "Data Usage & Telemetry Radar",
                                             tint = AuraOrange,
-                                            modifier = Modifier.size(18.dp)
+                                            modifier = Modifier.size(17.dp)
                                         )
                                     }
-                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Spacer(modifier = Modifier.width(10.dp))
                                     Column(modifier = Modifier.weight(1f)) {
                                         Text(
                                             text = "Full Data & Tracker Breakdown",
@@ -883,7 +874,6 @@ private fun FilterPill(
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun AppPermissionChipCard(
     app: AppPrivacyReport,
@@ -897,10 +887,20 @@ private fun AppPermissionChipCard(
         else -> AuraGreen
     }
 
-    GlassCard(
+    val hasChips = app.threatSignals.isNotEmpty() || app.grantedPermissions.isNotEmpty()
+
+    Column(
         modifier = Modifier
             .fillMaxWidth()
+            .clip(RoundedCornerShape(13.dp))
+            .background(GlassPanel.copy(alpha = 0.62f))
+            .border(
+                1.dp,
+                if (app.threatSignals.any { it.isCritical }) AuraRose.copy(alpha = 0.45f) else GlassBorder,
+                RoundedCornerShape(13.dp)
+            )
             .clickable { onCardClick() }
+            .padding(horizontal = 12.dp, vertical = 9.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -911,11 +911,11 @@ private fun AppPermissionChipCard(
                 bitmap = bmp,
                 contentDescription = app.appName,
                 modifier = Modifier
-                    .size(38.dp)
-                    .clip(RoundedCornerShape(10.dp))
+                    .size(32.dp)
+                    .clip(RoundedCornerShape(8.dp))
             )
 
-            Spacer(modifier = Modifier.width(12.dp))
+            Spacer(modifier = Modifier.width(10.dp))
 
             Column(modifier = Modifier.weight(1f)) {
                 Text(
@@ -929,7 +929,7 @@ private fun AppPermissionChipCard(
                 val subtitleText = buildString {
                     append(app.installerName)
                     if (installTime > 0L) {
-                        append(" • Installed ")
+                        append(" • ")
                         append(formatRelativeShortTime(installTime))
                     } else if (app.lastTimeUsedMs > 0L) {
                         append(" • Used ")
@@ -957,21 +957,46 @@ private fun AppPermissionChipCard(
                 Text(
                     text = app.riskBadge,
                     color = badgeColor,
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.5.sp, fontWeight = FontWeight.Bold)
                 )
             }
         }
 
-        if (app.grantedPermissions.isNotEmpty()) {
-            Spacer(modifier = Modifier.height(8.dp))
-            val maxVisiblePerms = 4
-            val visiblePerms = app.grantedPermissions.take(maxVisiblePerms)
-            val remainingCount = (app.grantedPermissions.size - maxVisiblePerms).coerceAtLeast(0)
-            FlowRow(
+        if (hasChips) {
+            Spacer(modifier = Modifier.height(6.dp))
+            val maxTotalChips = if (app.threatSignals.isNotEmpty()) 3 else 4
+            val shownThreats = app.threatSignals.take(1)
+            val remainingSlots = (maxTotalChips - shownThreats.size).coerceAtLeast(1)
+            val shownPerms = app.grantedPermissions.take(remainingSlots)
+            val hiddenCount = (app.threatSignals.size - shownThreats.size) +
+                (app.grantedPermissions.size - shownPerms.size)
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                visiblePerms.forEach { perm ->
+                shownThreats.forEach { sig ->
+                    val sigColor = if (sig.isCritical) AuraRose else AuraOrange
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(sigColor.copy(alpha = 0.16f))
+                            .border(1.dp, sigColor.copy(alpha = 0.45f), RoundedCornerShape(6.dp))
+                            .clickable { onCardClick() }
+                            .padding(horizontal = 8.dp, vertical = 3.dp)
+                    ) {
+                        Text(
+                            text = "⚠ ${sig.shortChip}",
+                            color = sigColor,
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp, fontWeight = FontWeight.Bold),
+                            maxLines = 1
+                        )
+                    }
+                }
+                shownPerms.forEach { perm ->
                     val pColor = when (perm.riskLevel) {
                         PermissionRiskLevel.CRITICAL -> AuraRose
                         PermissionRiskLevel.HIGH -> AuraOrange
@@ -980,32 +1005,34 @@ private fun AppPermissionChipCard(
                     }
                     Box(
                         modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(pColor.copy(alpha = 0.12f))
-                            .border(1.dp, pColor.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(pColor.copy(alpha = 0.11f))
+                            .border(1.dp, pColor.copy(alpha = 0.28f), RoundedCornerShape(6.dp))
                             .clickable { onPermissionChipClick(perm) }
                             .padding(horizontal = 8.dp, vertical = 3.dp)
                     ) {
                         Text(
                             text = perm.shortTag,
                             color = pColor,
-                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp, fontWeight = FontWeight.Bold),
+                            maxLines = 1
                         )
                     }
                 }
-                if (remainingCount > 0) {
+                if (hiddenCount > 0) {
                     Box(
                         modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
+                            .clip(RoundedCornerShape(6.dp))
                             .background(GlassBorder.copy(alpha = 0.35f))
-                            .border(1.dp, GlassBorder, RoundedCornerShape(8.dp))
+                            .border(1.dp, GlassBorder, RoundedCornerShape(6.dp))
                             .clickable { onCardClick() }
-                            .padding(horizontal = 8.dp, vertical = 3.dp)
+                            .padding(horizontal = 7.dp, vertical = 3.dp)
                     ) {
                         Text(
-                            text = "+$remainingCount more",
+                            text = "+$hiddenCount",
                             color = TextSecondary,
-                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold),
+                            maxLines = 1
                         )
                     }
                 }
@@ -1028,67 +1055,67 @@ private fun MinimalChangeEventRow(
 
     val timeLabel = remember(event.timestamp) { formatRelativeShortTime(event.timestamp) }
 
-    GlassCard(
+    Row(
         modifier = Modifier
             .fillMaxWidth()
+            .clip(RoundedCornerShape(13.dp))
+            .background(GlassPanel.copy(alpha = 0.62f))
+            .border(1.dp, GlassBorder, RoundedCornerShape(13.dp))
             .clickable { onClick() }
+            .padding(horizontal = 12.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
+        Box(
+            modifier = Modifier
+                .size(32.dp)
+                .clip(CircleShape)
+                .background(tint.copy(alpha = 0.14f)),
+            contentAlignment = Alignment.Center
         ) {
-            Box(
-                modifier = Modifier
-                    .size(34.dp)
-                    .clip(CircleShape)
-                    .background(tint.copy(alpha = 0.14f)),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(18.dp))
-            }
+            Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(16.dp))
+        }
 
-            Spacer(modifier = Modifier.width(12.dp))
+        Spacer(modifier = Modifier.width(10.dp))
 
-            Column(modifier = Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = event.appName,
-                        color = TextPrimary,
-                        style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f, fill = false)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "• $timeLabel",
-                        color = TextTertiary,
-                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp)
-                    )
-                }
+        Column(modifier = Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = "${event.permissionTitle} (${event.detail})",
-                    color = TextSecondary,
-                    style = MaterialTheme.typography.labelSmall,
+                    text = event.appName,
+                    color = TextPrimary,
+                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false)
                 )
-            }
-
-            Spacer(modifier = Modifier.width(8.dp))
-
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(tint.copy(alpha = 0.14f))
-                    .padding(horizontal = 7.dp, vertical = 3.dp)
-            ) {
+                Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = badgeText,
-                    color = tint,
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                    text = "• $timeLabel",
+                    color = TextTertiary,
+                    style = MaterialTheme.typography.labelSmall
                 )
             }
+            Text(
+                text = "${event.permissionTitle} (${event.detail})",
+                color = TextSecondary,
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        Spacer(modifier = Modifier.width(8.dp))
+
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(6.dp))
+                .background(tint.copy(alpha = 0.14f))
+                .padding(horizontal = 7.dp, vertical = 3.dp)
+        ) {
+            Text(
+                text = badgeText,
+                color = tint,
+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.5.sp, fontWeight = FontWeight.Bold)
+            )
         }
     }
 }
@@ -1119,57 +1146,57 @@ private fun MinimalTrackerAppRow(
         if (parts.isEmpty()) "0 known trackers" else parts.joinToString(" • ")
     }
 
-    GlassCard(
+    Row(
         modifier = Modifier
             .fillMaxWidth()
+            .clip(RoundedCornerShape(13.dp))
+            .background(GlassPanel.copy(alpha = 0.62f))
+            .border(1.dp, GlassBorder, RoundedCornerShape(13.dp))
             .clickable { onClick() }
+            .padding(horizontal = 12.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            val bmp = remember(report.packageName) { getCachedAppIconBitmap(report.packageName, report.icon) }
-            Image(
-                bitmap = bmp,
-                contentDescription = report.appName,
-                modifier = Modifier
-                    .size(36.dp)
-                    .clip(RoundedCornerShape(10.dp))
+        val bmp = remember(report.packageName) { getCachedAppIconBitmap(report.packageName, report.icon) }
+        Image(
+            bitmap = bmp,
+            contentDescription = report.appName,
+            modifier = Modifier
+                .size(32.dp)
+                .clip(RoundedCornerShape(8.dp))
+        )
+
+        Spacer(modifier = Modifier.width(10.dp))
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = report.appName,
+                color = TextPrimary,
+                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
+            Text(
+                text = subtitle,
+                color = TextSecondary,
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
 
-            Spacer(modifier = Modifier.width(12.dp))
+        Spacer(modifier = Modifier.width(8.dp))
 
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = report.appName,
-                    color = TextPrimary,
-                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Text(
-                    text = subtitle,
-                    color = TextSecondary,
-                    style = MaterialTheme.typography.labelSmall,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-
-            Spacer(modifier = Modifier.width(8.dp))
-
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(badgeColor.copy(alpha = 0.14f))
-                    .padding(horizontal = 7.dp, vertical = 3.dp)
-            ) {
-                Text(
-                    text = if (totalTrackers > 0) "$totalTrackers SDKs" else "CLEAN",
-                    color = badgeColor,
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                )
-            }
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(6.dp))
+                .background(badgeColor.copy(alpha = 0.14f))
+                .padding(horizontal = 7.dp, vertical = 3.dp)
+        ) {
+            Text(
+                text = if (totalTrackers > 0) "$totalTrackers SDKs" else "CLEAN",
+                color = badgeColor,
+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
+            )
         }
     }
 }
@@ -1250,6 +1277,125 @@ private fun MinimalAppPermissionSheet(
         }
 
         Spacer(modifier = Modifier.height(16.dp))
+
+        if (app.threatSignals.isNotEmpty()) {
+            Text(
+                text = "OFFLINE THREAT & STALKERWARE SIGNALS (${app.threatSignals.size})",
+                color = AuraRose,
+                style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 1.5.sp, fontWeight = FontWeight.Bold)
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            app.threatSignals.forEach { sig ->
+                val sigColor = if (sig.isCritical) AuraRose else AuraOrange
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(sigColor.copy(alpha = 0.12f))
+                        .border(1.dp, sigColor.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+                        .padding(horizontal = 14.dp, vertical = 10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = sig.title,
+                            color = sigColor,
+                            style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
+                            modifier = Modifier.weight(1f)
+                        )
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(sigColor.copy(alpha = 0.2f))
+                                .padding(horizontal = 7.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = sig.category.label,
+                                color = sigColor,
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(3.dp))
+                    Text(
+                        text = sig.description,
+                        color = TextPrimary,
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(14.dp))
+        }
+
+        if (app.certSha256.isNotBlank()) {
+            val clipContext = LocalContext.current
+            val certTint = if (app.hasUntrustedOrDebugCert || app.isDebuggableApk) AuraOrange else AuraCyan
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Obsidian.copy(alpha = 0.45f))
+                    .border(1.dp, GlassBorder, RoundedCornerShape(12.dp))
+                    .clickable {
+                        try {
+                            val cm = clipContext.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                            cm?.setPrimaryClip(
+                                android.content.ClipData.newPlainText(
+                                    "APK SHA-256",
+                                    "${app.packageName}\nSHA-256: ${app.certSha256}"
+                                )
+                            )
+                            android.widget.Toast.makeText(
+                                clipContext,
+                                "Copied APK SHA-256 fingerprint",
+                                android.widget.Toast.LENGTH_SHORT
+                            ).show()
+                        } catch (_: Exception) {
+                        }
+                    }
+                    .padding(horizontal = 14.dp, vertical = 10.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "APK SIGNING CERTIFICATE (TAP TO COPY)",
+                        color = certTint,
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, letterSpacing = 1.2.sp, fontWeight = FontWeight.Bold)
+                    )
+                    Text(
+                        text = when {
+                            app.hasUntrustedOrDebugCert -> "TEST / DEBUG KEY"
+                            app.isDebuggableApk -> "DEBUGGABLE APK"
+                            else -> "PRODUCTION CERT"
+                        },
+                        color = if (app.hasUntrustedOrDebugCert || app.isDebuggableApk) AuraOrange else AuraGreen,
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                    )
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Signer: ${app.certSignerSummary.ifBlank { "Standard X.509" }} • Entry Point: ${if (app.hasLauncherIcon) "Visible" else "Hidden (Headless)"}",
+                    color = TextSecondary,
+                    style = MaterialTheme.typography.labelSmall
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = "SHA-256: ${app.certSha256}",
+                    color = TextTertiary,
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Spacer(modifier = Modifier.height(14.dp))
+        }
 
         if (app.grantedPermissions.isEmpty()) {
             GlassCard(modifier = Modifier.fillMaxWidth()) {

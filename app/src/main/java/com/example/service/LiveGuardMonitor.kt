@@ -204,6 +204,8 @@ class LiveGuardMonitor private constructor(private val context: Context) {
     @Volatile
     private var opEntryGetOpStrMethod: java.lang.reflect.Method? = null
     @Volatile
+    private var opEntryGetModeMethod: java.lang.reflect.Method? = null
+    @Volatile
     private var opEntryIsRunningMethod: java.lang.reflect.Method? = null
     @Volatile
     private var opEntryGetLastAccessTimeMethod: java.lang.reflect.Method? = null
@@ -460,7 +462,10 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                             preloadedUsageSnapshot = usageSnapshot
                         )
                         val now = System.currentTimeMillis()
-                        if (now - lastPermissionDiffCheckMs >= 90_000L) {
+                        // Package installs/removals and system settings changes are already handled
+                        // in real time by packageChangeReceiver and settingsSecurityObserver;
+                        // only run the fallback background diff check every 15 minutes.
+                        if (now - lastPermissionDiffCheckMs >= 15 * 60_000L) {
                             lastPermissionDiffCheckMs = now
                             try {
                                 val summary = PrivacyAnalyzer.analyzeDevicePrivacy(
@@ -482,11 +487,12 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     }
                 }
             }
-            // Adaptive polling: 3s cadence while app UI is open for instant call/sensor responsiveness; 15s in background
+            // Adaptive polling: Mic, Camera, Screen & Clipboard are instant via OS callbacks;
+            // polling only supplements background GPS & AppOps fallback (8s foreground, 25s background).
             val nextDelayMs = when {
-                !screenInteractive -> 20_000L
-                com.example.MainActivity.isUiForeground -> 3_000L
-                else -> 15_000L
+                !screenInteractive -> 30_000L
+                com.example.MainActivity.isUiForeground -> 8_000L
+                else -> 25_000L
             }
             mainHandler.postDelayed(this, nextDelayMs)
         }
@@ -729,8 +735,8 @@ class LiveGuardMonitor private constructor(private val context: Context) {
 
     private fun loadKnownVectorBaseline() {
         try {
-            vectorBaselineInitialized = prefs.getBoolean("vector_baseline_initialized_v2", false)
-            val raw = prefs.getString("known_vector_items_v2_json", null) ?: return
+            vectorBaselineInitialized = prefs.getBoolean("vector_baseline_initialized_v3", false)
+            val raw = prefs.getString("known_vector_items_v3_json", null) ?: return
             val obj = JSONObject(raw)
             knownVectorItemsMap.clear()
             val keys = obj.keys()
@@ -755,8 +761,8 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 obj.put(k, JSONArray(set.toList()))
             }
             prefs.edit()
-                .putBoolean("vector_baseline_initialized_v2", vectorBaselineInitialized)
-                .putString("known_vector_items_v2_json", obj.toString())
+                .putBoolean("vector_baseline_initialized_v3", vectorBaselineInitialized)
+                .putString("known_vector_items_v3_json", obj.toString())
                 .apply()
         } catch (_: Exception) {
         }
@@ -1711,6 +1717,17 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         }
     }
 
+    private fun extractOpMode(opEntry: Any): Int {
+        return try {
+            val m = opEntryGetModeMethod ?: opEntry.javaClass.getMethod("getMode").also {
+                opEntryGetModeMethod = it
+            }
+            (m.invoke(opEntry) as? Int) ?: AppOpsManager.MODE_ALLOWED
+        } catch (_: Exception) {
+            AppOpsManager.MODE_ALLOWED
+        }
+    }
+
     private fun extractOpLastAccessTime(opEntry: Any): Long {
         return try {
             val m = opEntryGetLastAccessTimeMethod ?: opEntry.javaClass.getMethod(
@@ -1719,7 +1736,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             ).also {
                 opEntryGetLastAccessTimeMethod = it
             }
-            (m.invoke(opEntry, 0x1f) as? Long) ?: 0L
+            (m.invoke(opEntry, 0x15) as? Long) ?: 0L
         } catch (_: Exception) {
             0L
         }
@@ -2029,12 +2046,18 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 for (opEntry in ops) {
                     if (opEntry == null) continue
                     val opStr = extractOpStr(opEntry) ?: continue
+                    val opMode = extractOpMode(opEntry)
+                    if (opMode != AppOpsManager.MODE_ALLOWED && opMode != 4 /* MODE_FOREGROUND */) {
+                        continue
+                    }
 
                     val isRunning = extractOpIsRunning(opEntry)
                     val lastTime = extractOpLastAccessTime(opEntry)
 
                     // Ensure the access actually happened while out of foreground (not right before closing the app)
                     val happenedAfterLeavingFg = lastLeftFg == 0L || lastTime > (lastLeftFg + 2_500L)
+                    // For clipboard, strictly require verified prior foreground exit (> 5s ago) so normal user pastes are never flagged
+                    val verifiedBackgroundClipboardRead = lastLeftFg > 0L && lastTime > (lastLeftFg + 5_000L)
 
                     val isBgLocationOp = opStr == "android:fine_location" ||
                         opStr == "android:coarse_location" ||
@@ -2056,7 +2079,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     if (opStr == "android:read_clipboard" &&
                         !isSensorTrustedOrSnoozed(pkgName, GuardSensorType.CLIPBOARD) &&
                         (now - lastTime) in 0L..8_000L &&
-                        happenedAfterLeavingFg &&
+                        verifiedBackgroundClipboardRead &&
                         !PrivacyAnalyzer.isBrandOrOemPackage(pkgName) &&
                         pkgName != "com.android.systemui"
                     ) {
@@ -2172,29 +2195,35 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             }.forEach { display ->
                 val dispName = display.name ?: "Virtual Display #${display.displayId}"
                 val isPresentation = (display.flags and Display.FLAG_PRESENTATION) != 0
-                if (isPresentation ||
+                val ownerPkg = try {
+                    displayGetOwnerPkgMethod?.invoke(display) as? String
+                } catch (_: Throwable) {
+                    null
+                }
+                val isCaptureOrMirrorDisplay = isPresentation ||
                     dispName.contains("mirror", ignoreCase = true) ||
                     dispName.contains("cast", ignoreCase = true) ||
-                    dispName.contains("wifi", ignoreCase = true) ||
                     dispName.contains("wireless", ignoreCase = true) ||
-                    dispName.contains(" overlay", ignoreCase = true).not()
-                ) {
+                    dispName.contains("smart view", ignoreCase = true) ||
+                    dispName.contains("screenrecord", ignoreCase = true) ||
+                    dispName.contains("screencapture", ignoreCase = true) ||
+                    dispName.contains("wfd", ignoreCase = true) ||
+                    dispName.contains("scrcpy", ignoreCase = true) ||
+                    (ownerPkg != null && isScreenRecorderPackage(ownerPkg))
+                if (isCaptureOrMirrorDisplay) {
                     if (isPresentation ||
                         dispName.contains("mirror", ignoreCase = true) ||
                         dispName.contains("cast", ignoreCase = true) ||
                         dispName.contains("wireless", ignoreCase = true) ||
-                        dispName.contains("smart view", ignoreCase = true)
+                        dispName.contains("smart view", ignoreCase = true) ||
+                        dispName.contains("wfd", ignoreCase = true)
                     ) {
                         hasMirrorOrCastDisplay = true
                     }
                     captureIndicators.add(dispName)
-                }
-                try {
-                    val ownerPkg = displayGetOwnerPkgMethod?.invoke(display) as? String
                     if (!ownerPkg.isNullOrBlank() && ownerPkg != context.packageName) {
                         allCandidatePackages.add(ownerPkg)
                     }
-                } catch (_: Throwable) {
                 }
             }
 
@@ -2844,23 +2873,25 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             actionButtonLabel = "Keyboard Settings"
         )
 
-        // 10. Sideloaded Apps & USB Debugging (excludes MIUI / HyperOS / Brand apps)
+        // 10. Sideloaded Apps, Package Verifier & USB Debugging (excludes MIUI / HyperOS / Brand apps)
         val sideloadedApps = allApps.filter { it.isSideloaded && !PrivacyAnalyzer.isBrandOrOemPackage(it.packageName) }
         val adbEnabled = try {
             Settings.Global.getInt(context.contentResolver, Settings.Global.ADB_ENABLED, 0) == 1
         } catch (_: Exception) {
             false
         }
+        val verifierEnabled = OfflineThreatScanner.isPackageVerifierEnabled(context)
         val sysFlags = buildList {
             if (adbEnabled) add("USB Debugging (ADB) is ON")
+            if (!verifierEnabled) add("OS Package Verifier is OFF")
             if (sideloadedApps.isNotEmpty()) add("${sideloadedApps.size} sideloaded APK(s)")
         }
         val sideloadVector = SecurityAuditVector(
             id = "sideload_adb",
             title = "Sideloads & USB Debug",
-            plainSummary = if (sysFlags.isEmpty()) "Verified store/brand apps & ADB off" else sysFlags.joinToString(" • "),
-            detailedAdvice = "Turn off USB Debugging when not needed and review third-party APKs installed outside official stores.",
-            severity = if (adbEnabled) AuditSeverity.DANGER else if (sideloadedApps.isNotEmpty()) AuditSeverity.WARNING else AuditSeverity.SAFE,
+            plainSummary = if (sysFlags.isEmpty()) "Verified store/brand apps, Verifier ON & ADB off" else sysFlags.joinToString(" • "),
+            detailedAdvice = "Turn off USB Debugging when not needed, keep OS Package Verification on, and review third-party APKs installed outside official stores.",
+            severity = if (adbEnabled || !verifierEnabled) AuditSeverity.DANGER else if (sideloadedApps.isNotEmpty()) AuditSeverity.WARNING else AuditSeverity.SAFE,
             statusBadge = if (sysFlags.isEmpty()) "SAFE" else "REVIEW",
             flaggedApps = sideloadedApps,
             extraDetails = sysFlags,
@@ -2868,9 +2899,91 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             actionButtonLabel = "Developer Options"
         )
 
+        // 11. Offline Stalkerware, Ghost Apps & System Impersonation
+        val stealthAndImpersonatingApps = allApps.filter { app ->
+            !app.isSystem && (
+                app.isHiddenStealthApp ||
+                    app.isImpersonatingSystemOrBrand ||
+                    app.threatSignals.any {
+                        it.category == ThreatSignalCategory.STEALTH_STALKERWARE ||
+                            it.category == ThreatSignalCategory.IMPERSONATION
+                    }
+                )
+        }
+        val stealthExtraDetails = stealthAndImpersonatingApps.flatMap { app ->
+            app.threatSignals
+                .filter {
+                    it.category == ThreatSignalCategory.STEALTH_STALKERWARE ||
+                        it.category == ThreatSignalCategory.IMPERSONATION
+                }
+                .map { "${app.appName}: ${it.title} — ${it.description}" }
+        }
+        val stealthVector = SecurityAuditVector(
+            id = "stealth_stalkerware",
+            title = "Stealth & Stalkerware Check",
+            plainSummary = if (stealthAndImpersonatingApps.isEmpty()) {
+                "No hidden-icon ghost apps or system impersonators"
+            } else {
+                "${stealthAndImpersonatingApps.size} app(s) exhibit stealth or impersonation behavior"
+            },
+            detailedAdvice = "Scans 100% offline for non-system apps that hide their launcher icon (Ghost Apps), use blank/invisible names, masquerade as OS utilities, or combine Accessibility/Notification spying with background persistence.",
+            severity = when {
+                stealthAndImpersonatingApps.any { app -> app.threatSignals.any { it.isCritical } } -> AuditSeverity.DANGER
+                stealthAndImpersonatingApps.isNotEmpty() -> AuditSeverity.WARNING
+                else -> AuditSeverity.SAFE
+            },
+            statusBadge = if (stealthAndImpersonatingApps.isEmpty()) "SAFE" else "${stealthAndImpersonatingApps.size} FLAGGED",
+            flaggedApps = stealthAndImpersonatingApps,
+            extraDetails = stealthExtraDetails,
+            settingsAction = Settings.ACTION_MANAGE_ALL_APPLICATIONS_SETTINGS,
+            actionButtonLabel = "Manage Apps"
+        )
+
+        // 12. Offline APK Certificate, Debug Key & Banking Trojan / Dropper Heuristics
+        val certAndTrojanApps = allApps.filter { app ->
+            !app.isSystem && (
+                app.hasUntrustedOrDebugCert ||
+                    app.isDebuggableApk ||
+                    app.threatSignals.any {
+                        it.category == ThreatSignalCategory.CERT_ANOMALY ||
+                            it.category == ThreatSignalCategory.TROJAN_DROPPER
+                    }
+                )
+        }
+        val certTrojanDetails = certAndTrojanApps.flatMap { app ->
+            app.threatSignals
+                .filter {
+                    it.category == ThreatSignalCategory.CERT_ANOMALY ||
+                        it.category == ThreatSignalCategory.TROJAN_DROPPER
+                }
+                .map { "${app.appName}: ${it.title} (${app.certSignerSummary.ifBlank { "Unverified Signer" }})" }
+        }
+        val certTrojanVector = SecurityAuditVector(
+            id = "apk_cert_trojan",
+            title = "APK Signatures & Trojan Combos",
+            plainSummary = if (certAndTrojanApps.isEmpty()) {
+                "All user APKs have production certs & no trojan combos"
+            } else {
+                "${certAndTrojanApps.size} APK(s) flagged for cert anomaly or trojan/dropper combo"
+            },
+            detailedAdvice = "Inspects X.509 signing certificates (SHA-256) offline for public AOSP test/debug keys, debuggable builds, Overlay + OTP interception (banking trojan pattern), and Accessibility + APK auto-installer droppers.",
+            severity = when {
+                certAndTrojanApps.any { app -> app.threatSignals.any { it.isCritical } } -> AuditSeverity.DANGER
+                certAndTrojanApps.isNotEmpty() -> AuditSeverity.WARNING
+                else -> AuditSeverity.SAFE
+            },
+            statusBadge = if (certAndTrojanApps.isEmpty()) "VERIFIED" else "${certAndTrojanApps.size} REVIEW",
+            flaggedApps = certAndTrojanApps,
+            extraDetails = certTrojanDetails,
+            settingsAction = Settings.ACTION_MANAGE_ALL_APPLICATIONS_SETTINGS,
+            actionButtonLabel = "Inspect Apps"
+        )
+
         val rawVectors = listOf(
             screenVector,
             micCamVector,
+            stealthVector,
+            certTrojanVector,
             bgLocationVector,
             clipboardVector,
             overlayVector,
@@ -2912,7 +3025,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             recordEvent(
                 type = "AUDIT",
                 title = "Security Scan Finished",
-                description = "${allVectors.count { it.severity != AuditSeverity.SAFE }} item(s) flagged for review.",
+                description = "${allVectors.count { it.severity != AuditSeverity.SAFE }} item(s) flagged across 12 offline checks.",
                 severity = AuditSeverity.SAFE
             )
         }
@@ -2922,7 +3035,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
     }
 
     /**
-     * Evaluates all 10 Live Guard security checks using persisted baseline diffing.
+     * Evaluates all 12 Live Guard security checks using persisted baseline diffing.
      * Fires push notifications and records Timeline events ONLY when:
      * 1. A live threat is active or newly triggered, OR
      * 2. A new app/setting item is added to a check vector after the baseline was initialized, OR
@@ -3118,6 +3231,26 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                         sensorType = if (_captureState.value.isCameraActive) GuardSensorType.CAMERA else GuardSensorType.MIC,
                         settingsAction = vector.settingsAction
                     )
+                    "stealth_stalkerware" -> PendingCheckAlert(
+                        notifId = 2111,
+                        eventType = "STEALTH_STALKERWARE",
+                        title = "Stealth / Impersonation Risk: ${appNames.firstOrNull() ?: "Flagged App"}",
+                        message = "${vector.plainSummary} ($whoSummary).",
+                        severity = vector.severity,
+                        primaryPkg = primaryPkg,
+                        sensorType = GuardSensorType.SCREEN,
+                        settingsAction = vector.settingsAction
+                    )
+                    "apk_cert_trojan" -> PendingCheckAlert(
+                        notifId = 2112,
+                        eventType = "APK_CERT_TROJAN",
+                        title = "APK Signature / Trojan Risk: ${appNames.firstOrNull() ?: "Flagged APK"}",
+                        message = "${vector.plainSummary} ($whoSummary).",
+                        severity = vector.severity,
+                        primaryPkg = primaryPkg,
+                        sensorType = GuardSensorType.SCREEN,
+                        settingsAction = vector.settingsAction
+                    )
                     else -> PendingCheckAlert(
                         notifId = 2110,
                         eventType = "SCREEN",
@@ -3211,22 +3344,13 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         preloadedPkgOpsList: List<*>? = null
     ): List<AppPrivacyReport> {
         val now = System.currentTimeMillis()
-        val pkgOpsList = preloadedPkgOpsList ?: fetchAllPackageOps() ?: return emptyList()
-        val recentPkgs = mutableSetOf<String>()
-        for (pkgOps in pkgOpsList) {
-            if (pkgOps == null) continue
-            val (pkgName, ops) = extractPkgOpsNameAndOps(pkgOps) ?: continue
-            for (opEntry in ops) {
-                if (opEntry == null) continue
-                val opStr = extractOpStr(opEntry) ?: continue
-                if (opStr != "android:read_clipboard") continue
-                val lastTime = extractOpLastAccessTime(opEntry)
-                if (lastTime > 0L && (now - lastTime) in 0L..86_400_000L) {
-                    recentPkgs.add(pkgName)
-                }
-            }
-        }
-        return apps.filter { it.packageName in recentPkgs && !PrivacyAnalyzer.isBrandOrOemPackage(it.packageName) }
+        // Only flag apps that were verified to read the clipboard in the background (never normal foreground user pastes)
+        val verifiedBgClipPkgs = _events.value
+            .asSequence()
+            .filter { it.type == "CLIPBOARD" && !it.packageName.isNullOrBlank() && (now - it.timestamp) in 0L..86_400_000L }
+            .mapNotNull { it.packageName }
+            .toSet()
+        return apps.filter { it.packageName in verifiedBgClipPkgs && !PrivacyAnalyzer.isBrandOrOemPackage(it.packageName) }
     }
 
     @Synchronized
@@ -3261,7 +3385,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
 
     fun clearEvents() {
         _events.value = emptyList()
-        prefs.edit().remove("saved_events_json").apply()
+        prefs.edit().remove("saved_events_v3_json").remove("saved_events_json").apply()
         PrivacyAnalyzer.invalidateTimelineCache()
     }
 
@@ -3280,14 +3404,14 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 }
                 arr.put(obj)
             }
-            prefs.edit().putString("saved_events_json", arr.toString()).apply()
+            prefs.edit().putString("saved_events_v3_json", arr.toString()).apply()
         } catch (_: Exception) {
         }
     }
 
     private fun loadSavedEvents() {
         try {
-            val raw = prefs.getString("saved_events_json", null)
+            val raw = prefs.getString("saved_events_v3_json", null)
             if (raw.isNullOrBlank()) {
                 val initial = GuardEvent(
                     id = System.currentTimeMillis(),
@@ -3317,7 +3441,10 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 val evType = obj.optString("type", "AUDIT")
                 val evPkg = obj.optString("packageName").takeIf { it.isNotBlank() }
                 val evDesc = obj.optString("description", "")
-                // Clean up any historical false-positive Screen Recording events that blamed non-screen-recorder apps (e.g., Truecaller call service)
+                // Clean up any historical false-positive Screen Recording, Install, or Permission events
+                if (evType == "INSTALL" || evType == "PERMISSION") {
+                    continue
+                }
                 if (evType == "SCREEN" &&
                     evPkg != null &&
                     !isScreenRecorderPackage(evPkg) &&

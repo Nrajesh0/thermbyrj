@@ -956,6 +956,8 @@ private fun permissionVisuals(perm: PlainPermissionInfo, cat: PermissionCategory
         "SPECIAL_CUSTOM_KEYBOARD" -> Color(0xFFF59E0B) to Icons.Default.Tune
         "SPECIAL_USB_DEBUGGING" -> Color(0xFFEC4899) to Icons.Default.Security
         "SPECIAL_SIDELOADED_APP" -> Color(0xFFF97316) to Icons.Default.SystemUpdate
+        "SPECIAL_STEALTH_STALKERWARE" -> Color(0xFFFF3B5C) to Icons.Default.Warning
+        "SPECIAL_APK_CERT_TROJAN" -> Color(0xFFA855F7) to Icons.Default.Shield
         else -> when (cat) {
             PermissionCategory.LOCATION -> AuraCyan to Icons.Default.LocationOn
             PermissionCategory.CAMERA_MIC -> AuraOrange to Icons.Default.Mic
@@ -1421,29 +1423,31 @@ private fun MinimalAuditRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(18.dp))
+            .clip(RoundedCornerShape(13.dp))
             .background(GlassPanel.copy(alpha = 0.58f))
             .border(
                 1.dp,
                 if (vector.severity != AuditSeverity.SAFE) sevColor.copy(alpha = 0.4f) else GlassBorder,
-                RoundedCornerShape(18.dp)
+                RoundedCornerShape(13.dp)
             )
             .clickable { onClick() }
-            .padding(horizontal = 16.dp, vertical = 14.dp),
+            .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(
             imageVector = if (vector.severity == AuditSeverity.SAFE) Icons.Default.CheckCircle else Icons.Default.Warning,
             contentDescription = null,
             tint = sevColor,
-            modifier = Modifier.size(20.dp)
+            modifier = Modifier.size(19.dp)
         )
-        Spacer(modifier = Modifier.width(12.dp))
+        Spacer(modifier = Modifier.width(10.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = vector.title,
                 color = TextPrimary,
-                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold)
+                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
             Text(
                 text = vector.plainSummary,
@@ -1456,9 +1460,9 @@ private fun MinimalAuditRow(
         Spacer(modifier = Modifier.width(8.dp))
         Box(
             modifier = Modifier
-                .clip(RoundedCornerShape(100.dp))
+                .clip(RoundedCornerShape(6.dp))
                 .background(sevColor.copy(alpha = 0.14f))
-                .padding(horizontal = 8.dp, vertical = 4.dp)
+                .padding(horizontal = 7.dp, vertical = 3.dp)
         ) {
             Text(
                 text = vector.statusBadge,

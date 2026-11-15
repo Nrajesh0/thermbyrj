@@ -63,7 +63,17 @@ data class AppPrivacyReport(
     val hasNotificationListener: Boolean,
     val isDeviceAdmin: Boolean,
     val firstInstallTimeMs: Long = 0L,
-    val lastUpdateTimeMs: Long = 0L
+    val lastUpdateTimeMs: Long = 0L,
+    val hasLauncherIcon: Boolean = true,
+    val isHiddenStealthApp: Boolean = false,
+    val isImpersonatingSystemOrBrand: Boolean = false,
+    val impersonationReason: String? = null,
+    val certSha256: String = "",
+    val certSignerSummary: String = "",
+    val hasUntrustedOrDebugCert: Boolean = false,
+    val isDebuggableApk: Boolean = false,
+    val threatSignals: List<ThreatHeuristicSignal> = emptyList(),
+    val threatScore: Int = 0
 )
 
 data class DevicePrivacySummary(
@@ -77,6 +87,7 @@ data class DevicePrivacySummary(
     val safeAppCount: Int,
     val unusedRiskyAppCount: Int,
     val dataExfiltrationRiskCount: Int,
+    val threatFlaggedAppCount: Int = 0,
     val categoryCounts: Map<PermissionCategory, Int>,
     val topActionTips: List<String>,
     val appReports: List<AppPrivacyReport>
@@ -485,6 +496,8 @@ object PrivacyAnalyzer {
     @Volatile
     private var cachedChangeEvents: List<PrivacyChangeEvent>? = null
 
+    private val appIconDrawableCache = java.util.concurrent.ConcurrentHashMap<String, Drawable>()
+
     fun peekCachedPrivacySummary(includeSystemApps: Boolean = false): DevicePrivacySummary? =
         if (includeSystemApps) cachedPrivacySystem else cachedPrivacyUser
 
@@ -523,7 +536,7 @@ object PrivacyAnalyzer {
         if (!forceRefresh) {
             val cached = if (includeSystemApps) cachedPrivacySystem else cachedPrivacyUser
             val cachedTs = if (includeSystemApps) cachedPrivacySystemTimeMs else cachedPrivacyUserTimeMs
-            if (cached != null && (nowCheck - cachedTs) < 25_000L) {
+            if (cached != null && (nowCheck - cachedTs) < 60_000L) {
                 return cached
             }
         }
@@ -540,32 +553,26 @@ object PrivacyAnalyzer {
         }
 
         val usageMap = getRecentUsageMap(context)
-        val packages = try {
-            pm.getInstalledPackages(PackageManager.GET_PERMISSIONS)
-        } catch (_: Exception) {
-            emptyList()
+        val launcherPackages = OfflineThreatScanner.getPackagesWithLauncherActivities(context, forceRefresh = forceRefresh)
+        val pkgFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            PackageManager.GET_PERMISSIONS or PackageManager.GET_SIGNING_CERTIFICATES or PackageManager.GET_META_DATA
+        } else {
+            @Suppress("DEPRECATION")
+            PackageManager.GET_PERMISSIONS or PackageManager.GET_SIGNATURES or PackageManager.GET_META_DATA
         }
-
-        val trustedStoreInstallers = setOf(
-            "com.android.vending",
-            "com.google.android.feedback",
-            "com.sec.android.app.samsungapps",
-            "com.samsung.android.app.omcagent",
-            "com.xiaomi.market",
-            "com.xiaomi.discover",
-            "com.xiaomi.mipicks",
-            "com.miui.securitycenter",
-            "com.miui.cloudbackup",
-            "com.miui.backup",
-            "com.android.updater",
-            "com.heytap.market",
-            "com.oppo.market",
-            "com.oneplus.backuprestore",
-            "com.vivo.appstore",
-            "com.bbk.appstore",
-            "com.huawei.appmarket",
-            "com.amazon.venezia"
-        )
+        val packages = try {
+            pm.getInstalledPackages(pkgFlags)
+        } catch (_: Exception) {
+            try {
+                pm.getInstalledPackages(PackageManager.GET_PERMISSIONS or PackageManager.GET_META_DATA)
+            } catch (_: Exception) {
+                try {
+                    pm.getInstalledPackages(PackageManager.GET_PERMISSIONS)
+                } catch (_: Exception) {
+                    emptyList()
+                }
+            }
+        }
 
         val reports = mutableListOf<AppPrivacyReport>()
         val now = System.currentTimeMillis()
@@ -597,12 +604,12 @@ object PrivacyAnalyzer {
                 permissionCatalog["SPECIAL_DEVICE_ADMIN"]?.let { grantedList.add(it) }
             }
 
-            val hasOverlay = checkAppOpAllowed(
+            // Special AppOp permissions MUST strictly equal MODE_ALLOWED (MODE_DEFAULT means denied for non-system apps)
+            val hasOverlay = isSpecialAppOpAllowed(
                 appOps = appOps,
                 op = AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW,
                 uid = appInfo.uid,
-                packageName = pkgInfo.packageName,
-                fallbackRequested = hasRequestedPermission(pkgInfo, Manifest.permission.SYSTEM_ALERT_WINDOW)
+                packageName = pkgInfo.packageName
             )
             if (hasOverlay) {
                 permissionCatalog[Manifest.permission.SYSTEM_ALERT_WINDOW]?.let { grantedList.add(it) }
@@ -615,12 +622,60 @@ object PrivacyAnalyzer {
                 val count = minOf(reqPerms.size, reqFlags.size)
                 for (i in 0 until count) {
                     val permName = reqPerms[i]
-                    val isGranted = (reqFlags[i] and PackageInfo.REQUESTED_PERMISSION_GRANTED) != 0
-                    if (permName == Manifest.permission.INTERNET && isGranted) {
+                    val isGrantedFlag = (reqFlags[i] and PackageInfo.REQUESTED_PERMISSION_GRANTED) != 0
+                    if (permName == Manifest.permission.INTERNET && isGrantedFlag) {
                         hasInternet = true
                     }
-                    if (permName == Manifest.permission.SYSTEM_ALERT_WINDOW) continue
-                    if (isGranted) {
+                    // Handle Special AppOps permissions strictly via AppOpsManager.MODE_ALLOWED
+                    when (permName) {
+                        Manifest.permission.SYSTEM_ALERT_WINDOW -> continue
+                        Manifest.permission.REQUEST_INSTALL_PACKAGES -> {
+                            if (isSpecialAppOpAllowed(appOps, "android:request_install_packages", appInfo.uid, pkgInfo.packageName)) {
+                                permissionCatalog[permName]?.let { info ->
+                                    if (grantedList.none { it.permissionName == info.permissionName }) {
+                                        grantedList.add(info)
+                                    }
+                                }
+                            }
+                            continue
+                        }
+                        Manifest.permission.MANAGE_EXTERNAL_STORAGE -> {
+                            val allowedAllFiles = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                isSpecialAppOpAllowed(appOps, "android:manage_external_storage", appInfo.uid, pkgInfo.packageName)
+                            } else {
+                                false
+                            }
+                            if (allowedAllFiles) {
+                                permissionCatalog[permName]?.let { info ->
+                                    if (grantedList.none { it.permissionName == info.permissionName }) {
+                                        grantedList.add(info)
+                                    }
+                                }
+                            }
+                            continue
+                        }
+                        Manifest.permission.PACKAGE_USAGE_STATS -> {
+                            if (isSpecialAppOpAllowed(appOps, AppOpsManager.OPSTR_GET_USAGE_STATS, appInfo.uid, pkgInfo.packageName)) {
+                                permissionCatalog[permName]?.let { info ->
+                                    if (grantedList.none { it.permissionName == info.permissionName }) {
+                                        grantedList.add(info)
+                                    }
+                                }
+                            }
+                            continue
+                        }
+                    }
+
+                    // On Android 13+ (API 33+), apps targeting SDK >= 33 use granular media permissions instead of legacy storage
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                        appInfo.targetSdkVersion >= Build.VERSION_CODES.TIRAMISU &&
+                        (permName == Manifest.permission.READ_EXTERNAL_STORAGE ||
+                            permName == Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    ) {
+                        continue
+                    }
+
+                    if (isGrantedFlag && isRuntimePermissionAppOpAllowed(appOps, permName, appInfo.uid, pkgInfo.packageName)) {
                         permissionCatalog[permName]?.let { info ->
                             if (grantedList.none { it.permissionName == info.permissionName }) {
                                 grantedList.add(info)
@@ -630,13 +685,9 @@ object PrivacyAnalyzer {
                 }
             }
 
-            val installDetails = getInstallOriginDetails(pm, pkgInfo.packageName)
+            val installDetails = getInstallOriginDetails(pm, pkgInfo)
             val installer = installDetails.installerPackage
-            val isSideloaded = !isSystem && !isBrandOem && (
-                installDetails.isExplicitLocalOrDownloadedSource ||
-                    installer == null ||
-                    installer !in trustedStoreInstallers
-                )
+            val isSideloaded = !isSystem && !isBrandOem && installDetails.isSideloaded
 
             val lastUsed = usageMap[pkgInfo.packageName] ?: 0L
             val isUnusedRecently = lastUsed in 1L until (now - sevenDaysMs)
@@ -645,28 +696,49 @@ object PrivacyAnalyzer {
                 it.riskLevel == PermissionRiskLevel.CRITICAL || it.riskLevel == PermissionRiskLevel.HIGH
             }
 
-            var rawRisk = grantedList.sumOf { it.riskLevel.weight }
-            if (canUpload) rawRisk += 6
-            if (isSideloaded && grantedList.isNotEmpty()) rawRisk += 10
-            if (isUnusedRecently && rawRisk >= 14) rawRisk += 6
-
-            val cappedRisk = rawRisk.coerceIn(0, 100)
-            val badge = when {
-                cappedRisk >= 35 -> "HIGH RISK"
-                cappedRisk >= 14 -> "MODERATE"
-                grantedList.isNotEmpty() -> "LOW RISK"
-                else -> "SAFE"
-            }
-
             val appName = try {
                 pm.getApplicationLabel(appInfo).toString()
             } catch (_: Exception) {
                 pkgInfo.packageName
             }
-            val icon = try {
-                pm.getApplicationIcon(appInfo)
+            val icon = appIconDrawableCache[pkgInfo.packageName] ?: try {
+                pm.getApplicationIcon(appInfo).also { loaded ->
+                    if (appIconDrawableCache.size < 350) {
+                        appIconDrawableCache[pkgInfo.packageName] = loaded
+                    }
+                }
             } catch (_: Exception) {
                 context.applicationInfo.loadIcon(pm)
+            }
+
+            val threatIntel = OfflineThreatScanner.inspectAppThreatHeuristics(
+                context = context,
+                pkgInfo = pkgInfo,
+                appName = appName,
+                isSystem = isSystem,
+                isBrandOem = isBrandOem,
+                isSideloaded = isSideloaded,
+                grantedPermissions = grantedList,
+                hasAccessibility = hasAccessibility,
+                hasNotifListener = hasNotifListener,
+                hasOverlay = hasOverlay,
+                isDeviceAdmin = isAdmin,
+                hasInternet = hasInternet,
+                launcherPackages = launcherPackages
+            )
+
+            var rawRisk = grantedList.sumOf { it.riskLevel.weight }
+            if (canUpload) rawRisk += 6
+            if (isSideloaded && grantedList.isNotEmpty()) rawRisk += 10
+            if (isUnusedRecently && rawRisk >= 14) rawRisk += 6
+            rawRisk += (threatIntel.threatScore / 2)
+
+            val cappedRisk = rawRisk.coerceIn(0, 100)
+            val badge = when {
+                cappedRisk >= 35 || threatIntel.threatSignals.any { it.isCritical } -> "HIGH RISK"
+                cappedRisk >= 14 || threatIntel.threatSignals.isNotEmpty() -> "MODERATE"
+                grantedList.isNotEmpty() -> "LOW RISK"
+                else -> "SAFE"
             }
 
             reports.add(
@@ -688,29 +760,42 @@ object PrivacyAnalyzer {
                     hasNotificationListener = hasNotifListener,
                     isDeviceAdmin = isAdmin,
                     firstInstallTimeMs = pkgInfo.firstInstallTime,
-                    lastUpdateTimeMs = pkgInfo.lastUpdateTime
+                    lastUpdateTimeMs = pkgInfo.lastUpdateTime,
+                    hasLauncherIcon = threatIntel.hasLauncherIcon,
+                    isHiddenStealthApp = (!threatIntel.hasLauncherIcon && grantedList.isNotEmpty()) || threatIntel.isBlankOrInvisibleLabel,
+                    isImpersonatingSystemOrBrand = threatIntel.isImpersonatingSystemOrBrand,
+                    impersonationReason = threatIntel.impersonationReason,
+                    certSha256 = threatIntel.certInspection.sha256Fingerprint,
+                    certSignerSummary = threatIntel.certInspection.issuerSummary,
+                    hasUntrustedOrDebugCert = threatIntel.certInspection.isDebugOrTestCertificate,
+                    isDebuggableApk = threatIntel.certInspection.isDebuggableManifest,
+                    threatSignals = threatIntel.threatSignals,
+                    threatScore = threatIntel.threatScore
                 )
             )
         }
 
         val sortedReports = reports.sortedWith(
             compareByDescending<AppPrivacyReport> { it.riskScore }
+                .thenByDescending { it.threatScore }
                 .thenByDescending { it.grantedPermissions.size }
                 .thenBy { it.appName.lowercase() }
         )
 
-        val highRiskCount = sortedReports.count { it.riskScore >= 35 }
-        val moderateCount = sortedReports.count { it.riskScore in 14..34 }
-        val safeCount = sortedReports.count { it.riskScore < 14 }
+        val highRiskCount = sortedReports.count { it.riskScore >= 35 || it.threatSignals.any { s -> s.isCritical } }
+        val moderateCount = sortedReports.count { it.riskScore in 14..34 && it.threatSignals.none { s -> s.isCritical } }
+        val safeCount = sortedReports.count { it.riskScore < 14 && it.threatSignals.isEmpty() }
         val unusedRiskyCount = sortedReports.count {
             it.riskScore >= 14 && it.lastTimeUsedMs > 0L && (now - it.lastTimeUsedMs) > sevenDaysMs
         }
         val exfilCount = sortedReports.count { it.canUploadSensitiveData }
+        val threatFlaggedCount = sortedReports.count { it.threatSignals.isNotEmpty() }
 
         val penaltyFromHigh = highRiskCount * 9
         val penaltyFromModerate = moderateCount * 3
         val penaltyFromUnused = unusedRiskyCount * 4
-        val totalPenalty = (penaltyFromHigh + penaltyFromModerate + penaltyFromUnused).coerceAtMost(88)
+        val penaltyFromThreats = threatFlaggedCount * 8
+        val totalPenalty = (penaltyFromHigh + penaltyFromModerate + penaltyFromUnused + penaltyFromThreats).coerceAtMost(88)
         val privacyScore = (100 - totalPenalty).coerceIn(12, 100)
 
         val (grade, headline, explanation) = when {
@@ -741,6 +826,7 @@ object PrivacyAnalyzer {
             safeAppCount = safeCount,
             unusedRiskyAppCount = unusedRiskyCount,
             dataExfiltrationRiskCount = exfilCount,
+            threatFlaggedAppCount = threatFlaggedCount,
             categoryCounts = categoryCounts,
             topActionTips = tips,
             appReports = sortedReports
@@ -1066,13 +1152,18 @@ object PrivacyAnalyzer {
         }
     }
 
+    /**
+     * Strictly checks special `signature|appop` permissions (Overlay, Install Unknown Apps,
+     * All Files Access, Usage Access). For these special permissions, `AppOpsManager.MODE_DEFAULT`
+     * means DENIED for third-party apps (the OS only flips them to `MODE_ALLOWED` when the user
+     * explicitly turns on the toggle in Special App Access).
+     */
     @Suppress("DEPRECATION")
-    private fun checkAppOpAllowed(
+    private fun isSpecialAppOpAllowed(
         appOps: AppOpsManager,
         op: String,
         uid: Int,
-        packageName: String,
-        fallbackRequested: Boolean
+        packageName: String
     ): Boolean {
         return try {
             val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -1081,13 +1172,36 @@ object PrivacyAnalyzer {
                 @Suppress("DEPRECATION")
                 appOps.checkOpNoThrow(op, uid, packageName)
             }
-            when (mode) {
-                AppOpsManager.MODE_ALLOWED -> true
-                AppOpsManager.MODE_DEFAULT -> fallbackRequested
-                else -> false
-            }
+            mode == AppOpsManager.MODE_ALLOWED
         } catch (_: Exception) {
-            fallbackRequested
+            false
+        }
+    }
+
+    /**
+     * Verifies that a runtime permission with `PROTECTION_FLAG_APPOP` has not been revoked
+     * via AppOps (`MODE_IGNORED` or `MODE_ERRORED`).
+     */
+    @Suppress("DEPRECATION")
+    private fun isRuntimePermissionAppOpAllowed(
+        appOps: AppOpsManager,
+        permName: String,
+        uid: Int,
+        packageName: String
+    ): Boolean {
+        return try {
+            val op = AppOpsManager.permissionToOp(permName) ?: return true
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                appOps.unsafeCheckOpNoThrow(op, uid, packageName)
+            } else {
+                @Suppress("DEPRECATION")
+                appOps.checkOpNoThrow(op, uid, packageName)
+            }
+            mode == AppOpsManager.MODE_ALLOWED ||
+                mode == AppOpsManager.MODE_DEFAULT ||
+                mode == 4 /* AppOpsManager.MODE_FOREGROUND */
+        } catch (_: Exception) {
+            true
         }
     }
 
@@ -1098,28 +1212,156 @@ object PrivacyAnalyzer {
 
     private data class InstallOriginDetails(
         val installerPackage: String?,
-        val isExplicitLocalOrDownloadedSource: Boolean
+        val isSideloaded: Boolean
     )
 
-    private fun getInstallOriginDetails(pm: PackageManager, packageName: String): InstallOriginDetails {
+    private val trustedStoreInstallers = setOf(
+        "com.android.vending",
+        "com.google.android.feedback",
+        "com.google.android.gms",
+        "com.google.android.apps.restore",
+        "com.google.android.apps.work.clouddpc",
+        "com.microsoft.windowsintune.companyportal",
+        "com.sec.android.app.samsungapps",
+        "com.samsung.android.app.omcagent",
+        "com.sec.android.easyMover",
+        "com.xiaomi.market",
+        "com.xiaomi.discover",
+        "com.xiaomi.mipicks",
+        "com.miui.huanji",
+        "com.android.updater",
+        "com.heytap.market",
+        "com.oppo.market",
+        "com.coloros.market",
+        "com.oneplus.market",
+        "com.realme.market",
+        "com.nothing.appstore",
+        "com.oneplus.backuprestore",
+        "com.coloros.backuprestore",
+        "com.heytap.backuprestore",
+        "com.vivo.appstore",
+        "com.bbk.appstore",
+        "com.vivo.easyshare",
+        "com.huawei.appmarket",
+        "com.amazon.venezia",
+        "org.fdroid.fdroid",
+        "com.aurora.store"
+    )
+
+    private val explicitSideloadInitiatorHints = listOf(
+        "chrome",
+        "browser",
+        "firefox",
+        "brave",
+        "opera",
+        "ucmobile",
+        "filemanager",
+        "documentsui",
+        "whatsapp",
+        "telegram",
+        "discord",
+        "downloads"
+    )
+
+    /**
+     * Accurately resolves whether an app came from an official app store (Google Play Store,
+     * Galaxy Store, Xiaomi GetApps, etc.) vs. being sideloaded from an APK file.
+     *
+     * Why previous detection had false positives (e.g. Pokémon GO from Play Store):
+     * 1. On Xiaomi/MIUI/HyperOS, Oppo/ColorOS, Vivo, and Samsung, when Play Store installs an app
+     *    (especially split APKs like Pokémon GO), `initiatingPackageName` is `com.android.vending`,
+     *    while the OEM security scanner re-commits the session so `installingPackageName` becomes
+     *    `com.miui.packageinstaller` or `com.google.android.packageinstaller`.
+     * 2. Apps distributed by Google Play Store carry Play Store stamp/split metadata inside
+     *    `ApplicationInfo.metaData` (`com.android.vending.derived.apk.id`, `com.android.vending.splits`,
+     *    `com.android.stamp.source`, `com.android.stamp.type`).
+     * 3. On Android 13+ (API 33+), `InstallSourceInfo.packageSource` explicitly reports
+     *    `PACKAGE_SOURCE_STORE` vs `PACKAGE_SOURCE_LOCAL_FILE` / `PACKAGE_SOURCE_DOWNLOADED_FILE`.
+     */
+    private fun getInstallOriginDetails(pm: PackageManager, pkgInfo: PackageInfo): InstallOriginDetails {
+        val packageName = pkgInfo.packageName
+        val appInfo = pkgInfo.applicationInfo
+        val isSys = appInfo != null &&
+            ((appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0 ||
+                (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0)
+        val isBrand = isBrandOrOemPackage(packageName)
+
+        if (isSys || isBrand || packageName == "com.example" || packageName.startsWith("com.aistudio.")) {
+            return InstallOriginDetails(installerPackage = "system", isSideloaded = false)
+        }
+
         return try {
+            val candidates = mutableListOf<String>()
+            var packageSource = 0
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 val info = pm.getInstallSourceInfo(packageName)
-                val installerPkg = info.installingPackageName ?: info.initiatingPackageName
-                val isLocalSource = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    val src = info.packageSource
-                    src == android.content.pm.PackageInstaller.PACKAGE_SOURCE_LOCAL_FILE ||
-                        src == android.content.pm.PackageInstaller.PACKAGE_SOURCE_DOWNLOADED_FILE
-                } else {
-                    false
+                info.initiatingPackageName?.takeIf { it.isNotBlank() }?.let { candidates.add(it) }
+                info.originatingPackageName?.takeIf { it.isNotBlank() }?.let { candidates.add(it) }
+                info.installingPackageName?.takeIf { it.isNotBlank() }?.let { candidates.add(it) }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    packageSource = info.packageSource
                 }
-                InstallOriginDetails(installerPkg, isLocalSource)
-            } else {
-                @Suppress("DEPRECATION")
-                InstallOriginDetails(pm.getInstallerPackageName(packageName), false)
             }
+            @Suppress("DEPRECATION")
+            pm.getInstallerPackageName(packageName)?.takeIf { it.isNotBlank() }?.let { candidates.add(it) }
+
+            // 1. If ANY of initiating, originating, installing, or legacy installer is a trusted store, it is NOT sideloaded!
+            val matchedStore = candidates.firstOrNull { it in trustedStoreInstallers }
+            if (matchedStore != null) {
+                return InstallOriginDetails(installerPackage = matchedStore, isSideloaded = false)
+            }
+
+            // 2. Check Android 13+ explicit PACKAGE_SOURCE_STORE
+            val isExplicitStoreSource = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                packageSource == android.content.pm.PackageInstaller.PACKAGE_SOURCE_STORE
+            if (isExplicitStoreSource) {
+                return InstallOriginDetails(
+                    installerPackage = candidates.firstOrNull() ?: "com.android.vending",
+                    isSideloaded = false
+                )
+            }
+
+            val isExplicitLocalOrDownloaded = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && (
+                packageSource == android.content.pm.PackageInstaller.PACKAGE_SOURCE_LOCAL_FILE ||
+                    packageSource == android.content.pm.PackageInstaller.PACKAGE_SOURCE_DOWNLOADED_FILE
+                )
+
+            val initiatedByBrowserOrFileMgr = candidates.any { pkg ->
+                val lower = pkg.lowercase()
+                explicitSideloadInitiatorHints.any { hint -> lower.contains(hint) }
+            }
+
+            // 3. Check Google Play Store stamp & split APK metadata in ApplicationInfo.metaData
+            val meta = appInfo?.metaData
+            val hasPlayStoreStamp = meta != null && (
+                meta.containsKey("com.android.vending.derived.apk.id") ||
+                    meta.containsKey("com.android.vending.splits") ||
+                    meta.containsKey("com.android.stamp.source") ||
+                    meta.containsKey("com.android.stamp.type")
+                )
+            val hasSplitApks = !appInfo?.splitSourceDirs.isNullOrEmpty()
+
+            if ((hasPlayStoreStamp || hasSplitApks) && !isExplicitLocalOrDownloaded && !initiatedByBrowserOrFileMgr) {
+                return InstallOriginDetails(installerPackage = "com.android.vending", isSideloaded = false)
+            }
+
+            val primaryInstaller = candidates.firstOrNull()
+            val isManualPackageInstaller = primaryInstaller != null && (
+                primaryInstaller.contains("packageinstaller", ignoreCase = true) ||
+                    primaryInstaller == "com.oplus.appdetail" ||
+                    primaryInstaller == "com.google.android.FileExplorer"
+                )
+
+            val isSideloaded = isExplicitLocalOrDownloaded ||
+                initiatedByBrowserOrFileMgr ||
+                isManualPackageInstaller ||
+                primaryInstaller == "com.android.shell" ||
+                (primaryInstaller == null && !hasPlayStoreStamp)
+
+            InstallOriginDetails(installerPackage = primaryInstaller, isSideloaded = isSideloaded)
         } catch (_: Exception) {
-            InstallOriginDetails(null, false)
+            InstallOriginDetails(installerPackage = null, isSideloaded = false)
         }
     }
 
@@ -1127,17 +1369,31 @@ object PrivacyAnalyzer {
         if (isSystem) return "System App"
         if (isBrandOem) return "Brand App"
         return when (installerPkg) {
-            "com.android.vending", "com.google.android.feedback" -> "Play Store"
+            "com.android.vending", "com.google.android.feedback", "com.google.android.gms" -> "Play Store"
+            "com.google.android.apps.restore",
+            "com.sec.android.easyMover",
+            "com.miui.huanji",
+            "com.oneplus.backuprestore",
+            "com.coloros.backuprestore",
+            "com.heytap.backuprestore",
+            "com.vivo.easyshare" -> "Device Restore"
+            "com.google.android.apps.work.clouddpc",
+            "com.microsoft.windowsintune.companyportal" -> "Work / MDM"
             "com.sec.android.app.samsungapps", "com.samsung.android.app.omcagent" -> "Galaxy Store"
             "com.xiaomi.market", "com.xiaomi.discover", "com.xiaomi.mipicks", "com.android.updater" -> "Xiaomi Store"
-            "com.heytap.market", "com.oppo.market" -> "App Market"
+            "com.heytap.market", "com.oppo.market", "com.coloros.market", "com.oneplus.market", "com.realme.market" -> "App Market"
+            "com.nothing.appstore" -> "Nothing Store"
             "com.vivo.appstore", "com.bbk.appstore" -> "V-Appstore"
             "com.huawei.appmarket" -> "AppGallery"
+            "com.amazon.venezia" -> "Amazon Appstore"
+            "org.fdroid.fdroid" -> "F-Droid"
+            "com.aurora.store" -> "Aurora Store"
             "com.google.android.packageinstaller",
             "com.android.packageinstaller",
             "com.miui.packageinstaller",
             "com.samsung.android.packageinstaller",
             "com.oplus.appdetail" -> "APK Installer"
+            "com.android.shell" -> "ADB / Shell"
             null -> "Sideloaded APK"
             else -> installerPkg
         }
@@ -1222,6 +1478,28 @@ object PrivacyAnalyzer {
         simpleExplanation = "Installed directly from an APK outside the official app store.",
         whyItMatters = "Review permissions granted to sideloaded apps carefully.",
         riskLevel = PermissionRiskLevel.HIGH,
+        category = PermissionCategory.SPECIAL_ACCESS
+    )
+
+    private val stealthStalkerwareTimelineInfo = PlainPermissionInfo(
+        permissionName = "SPECIAL_STEALTH_STALKERWARE",
+        permissionGroup = "SPECIAL_SECURITY",
+        shortTag = "Stealth Risk",
+        friendlyTitle = "Stealth / Impersonation Detection",
+        simpleExplanation = "App hides its launcher icon, uses a blank name, or impersonates a system utility.",
+        whyItMatters = "Uninstall unverified hidden or impersonating apps immediately.",
+        riskLevel = PermissionRiskLevel.CRITICAL,
+        category = PermissionCategory.SPECIAL_ACCESS
+    )
+
+    private val apkCertTrojanTimelineInfo = PlainPermissionInfo(
+        permissionName = "SPECIAL_APK_CERT_TROJAN",
+        permissionGroup = "SPECIAL_SECURITY",
+        shortTag = "APK / Cert",
+        friendlyTitle = "APK Certificate & Trojan Heuristics",
+        simpleExplanation = "Signed with a debug/test key or combines overlay, dropper, and interception permissions.",
+        whyItMatters = "Verify the developer or uninstall untrusted modded/dropper APKs.",
+        riskLevel = PermissionRiskLevel.CRITICAL,
         category = PermissionCategory.SPECIAL_ACCESS
     )
 
@@ -1452,8 +1730,8 @@ object PrivacyAnalyzer {
                 } else {
                     sideloadTimelineInfo
                 }
-                "INSTALL" -> sideloadTimelineInfo
-                "PERMISSION" -> permissionCatalog[Manifest.permission.REQUEST_INSTALL_PACKAGES]
+                "STEALTH_STALKERWARE" -> stealthStalkerwareTimelineInfo
+                "APK_CERT_TROJAN" -> apkCertTrojanTimelineInfo
                 else -> null
             } ?: continue
 
@@ -1471,6 +1749,8 @@ object PrivacyAnalyzer {
                     "DEVICE_ADMIN" -> "Device Admin"
                     "KEYBOARD" -> "Custom Keyboard"
                     "USB_ADB" -> "Developer / Sideload Check"
+                    "STEALTH_STALKERWARE" -> "Stealth / Stalkerware Check"
+                    "APK_CERT_TROJAN" -> "APK / Trojan Heuristic Check"
                     else -> ev.title
                 }
             }
@@ -1504,48 +1784,6 @@ object PrivacyAnalyzer {
                             "MIC", "CAMERA", "SCREEN", "CLIPBOARD", "LOCATION" -> "Hardware / Sensor Event"
                             else -> "State Change Alert"
                         },
-                        permissionInfo = permInfo
-                    )
-                )
-            }
-        }
-
-        // 3. Verified App Install & Permission Change Events (from PrivacyChanges)
-        val recentChanges = peekCachedChanges()
-            ?: getPrivacyChanges(context, summary.appReports, dispatchNotifications = false)
-        for (chg in recentChanges.take(30)) {
-            if (chg.packageName in ignored) continue
-            if (chg.changeType != PrivacyChangeType.NEW_APP && chg.changeType != PrivacyChangeType.PERM_ADDED) continue
-            val (cPkg, cName, cIcon) = resolvePkgMeta(chg.packageName)
-            val permInfo = if (chg.changeType == PrivacyChangeType.NEW_APP) {
-                sideloadTimelineInfo
-            } else {
-                permissionCatalog.values.firstOrNull {
-                    it.friendlyTitle.equals(chg.permissionTitle, ignoreCase = true) ||
-                        it.shortTag.equals(chg.permissionTitle, ignoreCase = true)
-                } ?: sideloadTimelineInfo
-            }
-            val duplicate = timeline.any { existing ->
-                existing.packageName == cPkg &&
-                    kotlin.math.abs(existing.timestamp - chg.timestamp) < 10_000L
-            }
-            if (!duplicate) {
-                timeline.add(
-                    PermissionAccessEvent(
-                        id = "change_${chg.id}",
-                        packageName = cPkg,
-                        appName = cName.ifBlank { chg.appName },
-                        icon = cIcon,
-                        permissionTitle = if (chg.changeType == PrivacyChangeType.NEW_APP) {
-                            "New App Installed (${chg.permissionTitle})"
-                        } else {
-                            "Permission Granted: ${chg.permissionTitle}"
-                        },
-                        shortTag = if (chg.changeType == PrivacyChangeType.NEW_APP) "New App" else permInfo.shortTag,
-                        category = permInfo.category,
-                        riskLevel = permInfo.riskLevel,
-                        timestamp = chg.timestamp,
-                        accessContext = "Package / Permission Change",
                         permissionInfo = permInfo
                     )
                 )
@@ -1610,8 +1848,21 @@ object PrivacyAnalyzer {
     @Volatile
     private var opEntryGetOpStrMethod: java.lang.reflect.Method? = null
     @Volatile
+    private var opEntryGetModeMethod: java.lang.reflect.Method? = null
+    @Volatile
     private var opEntryGetLastAccessTimeMethod: java.lang.reflect.Method? = null
 
+    /**
+     * Queries OS AppOps last-access timestamps ONLY for real sensor/data reads where the op mode
+     * is actually ALLOWED (`MODE_ALLOWED` or `MODE_FOREGROUND`).
+     *
+     * Why this is critical:
+     * Android stamps `lastAccessTime` on `android:request_install_packages`, `android:system_alert_window`,
+     * and `android:get_usage_stats` whenever an app merely calls `canRequestPackageInstalls()` or
+     * `Settings.canDrawOverlays()` to check if it has permission—even when the permission is DENIED!
+     * Excluding those passive capability-check ops and requiring `mode == MODE_ALLOWED || MODE_FOREGROUND`
+     * completely eliminates false-positive Timeline entries for apps like PhonePe and Uber.
+     */
     private fun queryAppOpsLastAccessMap(context: Context): Map<String, Map<String, Long>> {
         val map = mutableMapOf<String, MutableMap<String, Long>>()
         val now = System.currentTimeMillis()
@@ -1643,18 +1894,32 @@ object PrivacyAnalyzer {
                         null
                     } ?: continue
 
+                    val opMode = try {
+                        val modeMethod = opEntryGetModeMethod
+                            ?: opEntry.javaClass.getMethod("getMode").also { opEntryGetModeMethod = it }
+                        (modeMethod.invoke(opEntry) as? Int) ?: AppOpsManager.MODE_ALLOWED
+                    } catch (_: Exception) {
+                        AppOpsManager.MODE_ALLOWED
+                    }
+                    // Skip any op that is currently ignored/denied or in ungranted default state for special ops
+                    if (opMode != AppOpsManager.MODE_ALLOWED && opMode != 4 /* MODE_FOREGROUND */) {
+                        continue
+                    }
+
                     // Use getLastAccessTime ONLY (never getTime(), which can reflect op-grant/mode-change time)
+                    // Flag 0x15 = OP_FLAG_SELF (0x1) | OP_FLAG_TRUSTED_PROXIED (0x4) | OP_FLAG_TRUSTED_PROXY (0x10)
                     val lastTime = try {
                         val m = opEntryGetLastAccessTimeMethod
                             ?: opEntry.javaClass.getMethod("getLastAccessTime", Int::class.javaPrimitiveType).also {
                                 opEntryGetLastAccessTimeMethod = it
                             }
-                        (m.invoke(opEntry, 0x1f) as? Long) ?: 0L
+                        (m.invoke(opEntry, 0x15) as? Long) ?: 0L
                     } catch (_: Exception) {
                         0L
                     }
 
-                    if (lastTime in 1L..(now + 60_000L)) {
+                    val recentCutoff = now - (7L * 86_400_000L)
+                    if (lastTime in recentCutoff..(now + 60_000L)) {
                         val mappedPerm = when (opStr) {
                             AppOpsManager.OPSTR_CAMERA, "android:camera" -> Manifest.permission.CAMERA
                             AppOpsManager.OPSTR_RECORD_AUDIO, "android:record_audio" -> Manifest.permission.RECORD_AUDIO
@@ -1668,16 +1933,8 @@ object PrivacyAnalyzer {
                             "android:receive_sms" -> Manifest.permission.RECEIVE_SMS
                             "android:send_sms" -> Manifest.permission.SEND_SMS
                             AppOpsManager.OPSTR_READ_CALL_LOG, "android:read_call_log" -> Manifest.permission.READ_CALL_LOG
-                            AppOpsManager.OPSTR_READ_PHONE_STATE, "android:read_phone_state" -> Manifest.permission.READ_PHONE_STATE
-                            AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW, "android:system_alert_window" -> Manifest.permission.SYSTEM_ALERT_WINDOW
-                            AppOpsManager.OPSTR_READ_EXTERNAL_STORAGE, "android:read_external_storage" -> Manifest.permission.READ_EXTERNAL_STORAGE
-                            "android:write_external_storage" -> Manifest.permission.WRITE_EXTERNAL_STORAGE
                             "android:read_media_images" -> Manifest.permission.READ_MEDIA_IMAGES
                             "android:read_media_video" -> Manifest.permission.READ_MEDIA_VIDEO
-                            "android:manage_external_storage" -> Manifest.permission.MANAGE_EXTERNAL_STORAGE
-                            "android:request_install_packages" -> Manifest.permission.REQUEST_INSTALL_PACKAGES
-                            AppOpsManager.OPSTR_GET_USAGE_STATS, "android:get_usage_stats" -> Manifest.permission.PACKAGE_USAGE_STATS
-                            "android:read_clipboard" -> "SPECIAL_CLIPBOARD_READ"
                             "android:project_media" -> "SPECIAL_SCREEN_CAPTURE"
                             else -> null
                         }
@@ -1706,9 +1963,9 @@ object PrivacyAnalyzer {
     }
 
     private const val PREFS_PRIVACY_DIFF = "privacy_baseline_prefs"
-    private const val KEY_HAS_BASELINE = "has_baseline_v1"
-    private const val KEY_SNAPSHOT = "baseline_snapshot_v1"
-    private const val KEY_CHANGE_LOG = "change_log_v1"
+    private const val KEY_HAS_BASELINE = "has_baseline_v2"
+    private const val KEY_SNAPSHOT = "baseline_snapshot_v2"
+    private const val KEY_CHANGE_LOG = "change_log_v2"
 
     fun openOsPrivacyDashboard(context: Context): Boolean {
         val actions = listOf(
@@ -1767,60 +2024,14 @@ object PrivacyAnalyzer {
         val existingLog = decodeChangeLog(prefs.getString(KEY_CHANGE_LOG, "") ?: "").toMutableList()
 
         if (!hasBaseline) {
-            // Seed initial recent activity from recently installed/updated user apps so CHANGES tab is immediately useful
-            val seeded = mutableListOf<PrivacyChangeEvent>()
-            var idSeq = now - 1000L
-            val recentApps = userReports
-                .filter { it.grantedPermissions.isNotEmpty() }
-                .map { report ->
-                    val installTime = report.firstInstallTimeMs.takeIf { it > 0L }
-                        ?: report.lastUpdateTimeMs.takeIf { it > 0L }
-                        ?: try {
-                            pm.getPackageInfo(report.packageName, 0).lastUpdateTime.takeIf { it > 0L } ?: now
-                        } catch (_: Exception) {
-                            now
-                        }
-                    report to installTime
-                }
-                .sortedByDescending { it.second }
-                .take(6)
-
-            for ((app, ts) in recentApps) {
-                seeded.add(
-                    PrivacyChangeEvent(
-                        id = idSeq++,
-                        timestamp = ts,
-                        packageName = app.packageName,
-                        appName = app.appName,
-                        changeType = PrivacyChangeType.NEW_APP,
-                        permissionTitle = "${app.grantedPermissions.size} permissions active",
-                        detail = app.grantedPermissions.take(3).joinToString(", ") { it.shortTag }
-                    )
-                )
-                app.grantedPermissions.take(2).forEach { perm ->
-                    seeded.add(
-                        PrivacyChangeEvent(
-                            id = idSeq++,
-                            timestamp = ts,
-                            packageName = app.packageName,
-                            appName = app.appName,
-                            changeType = PrivacyChangeType.PERM_ADDED,
-                            permissionTitle = perm.friendlyTitle,
-                            detail = perm.shortTag
-                        )
-                    )
-                }
-            }
-
             val snapshotStr = encodeSnapshot(userReports)
-            val combined = (seeded.sortedByDescending { it.timestamp } + existingLog).take(100)
             prefs.edit()
                 .putBoolean(KEY_HAS_BASELINE, true)
                 .putString(KEY_SNAPSHOT, snapshotStr)
-                .putString(KEY_CHANGE_LOG, encodeChangeLog(combined))
+                .putString(KEY_CHANGE_LOG, "")
                 .apply()
-            cachedChangeEvents = combined
-            return combined
+            cachedChangeEvents = emptyList()
+            return emptyList()
         }
 
         val oldSnapshot = decodeSnapshot(prefs.getString(KEY_SNAPSHOT, "") ?: "")
