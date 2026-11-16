@@ -189,11 +189,53 @@ class LiveGuardMonitor private constructor(private val context: Context) {
     private val cachedRecServiceStopMap = mutableMapOf<String, Long>()
     private val cachedRecLastResumeMap = mutableMapOf<String, Long>()
 
+    private val appOpsLock = Any()
+    private val auditLock = Any()
+    @Volatile
+    private var lastRefreshAllStatesMs: Long = 0L
+
     // Cached reflection Method handles to avoid lookup overhead inside nested loops
     private val appOpsGetPackagesForOpsMethod: java.lang.reflect.Method? by lazy {
         try {
             AppOpsManager::class.java.getMethod("getPackagesForOps", IntArray::class.java)
         } catch (_: Exception) {
+            null
+        }
+    }
+    private val targetedAppOpIds: IntArray? by lazy {
+        try {
+            val strOpToOp = AppOpsManager::class.java.getMethod("strOpToOp", String::class.java)
+            val opNames = listOf(
+                "android:camera",
+                "android:record_audio",
+                "android:fine_location",
+                "android:coarse_location",
+                "android:monitor_location",
+                "android:monitor_location_high_power",
+                "android:read_clipboard",
+                "android:project_media",
+                "android:read_contacts",
+                "android:read_sms",
+                "android:receive_sms",
+                "android:send_sms",
+                "android:read_call_log",
+                "android:read_media_images",
+                "android:read_media_video",
+                "android:read_external_storage",
+                "android:write_external_storage",
+                "android:phone_call_microphone",
+                "android:phone_call_camera",
+                "android:receive_ambient_trigger_audio"
+            )
+            val resolved = opNames.mapNotNull { name ->
+                try {
+                    (strOpToOp.invoke(null, name) as? Int)?.takeIf { it >= 0 }
+                } catch (_: Throwable) {
+                    null
+                }
+            }.distinct().toIntArray()
+            if (resolved.isNotEmpty()) resolved else null
+        } catch (_: Throwable) {
             null
         }
     }
@@ -282,7 +324,13 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         if (isMonitoring) {
             bgExecutor.execute {
                 try {
-                    refreshDisplayCaptureState(triggerAlertIfNew = true)
+                    val recentCachedOps = cachedPkgOpsList?.takeIf {
+                        (System.currentTimeMillis() - cachedPkgOpsTimeMs) in 0L..10_000L
+                    }
+                    refreshDisplayCaptureState(
+                        triggerAlertIfNew = true,
+                        preloadedPkgOpsList = recentCachedOps
+                    )
                 } catch (_: Throwable) {
                 }
             }
@@ -293,7 +341,13 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         if (isMonitoring) {
             bgExecutor.execute {
                 try {
-                    refreshDisplayCaptureState(triggerAlertIfNew = false)
+                    val recentCachedOps = cachedPkgOpsList?.takeIf {
+                        (System.currentTimeMillis() - cachedPkgOpsTimeMs) in 0L..10_000L
+                    }
+                    refreshDisplayCaptureState(
+                        triggerAlertIfNew = false,
+                        preloadedPkgOpsList = recentCachedOps
+                    )
                 } catch (_: Throwable) {
                 }
             }
@@ -328,8 +382,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 try {
                     cachedAuditVectors = null
                     cachedAuditVectorsTimeMs = 0L
-                    val vectors = runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = false)
-                    evaluateAndNotifyLiveGuardChecks(vectors)
+                    runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = false)
                 } catch (_: Throwable) {
                 }
             }
@@ -350,16 +403,17 @@ class LiveGuardMonitor private constructor(private val context: Context) {
 
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) {
-            scheduleDisplayCaptureRefresh(triggerAlertIfNew = true, delayMs = 200L)
+            // Allow OEM Smart Sidebar / freeform window transition to finish before checking displays
+            scheduleDisplayCaptureRefresh(triggerAlertIfNew = true, delayMs = 750L)
         }
 
         override fun onDisplayRemoved(displayId: Int) {
-            scheduleDisplayCaptureRefresh(triggerAlertIfNew = false, delayMs = 350L)
+            scheduleDisplayCaptureRefresh(triggerAlertIfNew = false, delayMs = 600L)
         }
 
         override fun onDisplayChanged(displayId: Int) {
-            // Coalesce frequent refresh-rate/brightness/PiP onDisplayChanged bursts off the main thread
-            scheduleDisplayCaptureRefresh(triggerAlertIfNew = true, delayMs = 450L)
+            // Coalesce frequent refresh-rate/brightness/PiP/sidebar onDisplayChanged bursts off the main thread
+            scheduleDisplayCaptureRefresh(triggerAlertIfNew = true, delayMs = 800L)
         }
     }
 
@@ -1200,10 +1254,13 @@ class LiveGuardMonitor private constructor(private val context: Context) {
 
     fun startMonitoring() {
         if (isMonitoring) {
-            bgExecutor.execute {
-                try {
-                    refreshAllStates()
-                } catch (_: Throwable) {
+            val now = System.currentTimeMillis()
+            if ((now - lastRefreshAllStatesMs) > 5_000L) {
+                bgExecutor.execute {
+                    try {
+                        refreshAllStates()
+                    } catch (_: Throwable) {
+                    }
                 }
             }
             return
@@ -1306,8 +1363,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         bgExecutor.execute {
             try {
                 refreshAllStates()
-                val vectors = runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = false)
-                evaluateAndNotifyLiveGuardChecks(vectors)
+                runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = false)
             } catch (_: Throwable) {
             }
         }
@@ -1389,6 +1445,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
 
     fun refreshAllStates() {
         try {
+            lastRefreshAllStatesMs = System.currentTimeMillis()
             val pkgOps = fetchAllPackageOps()
             val usageSnapshot = queryCombinedUsageState()
             refreshMicAndCallState(
@@ -1660,22 +1717,43 @@ class LiveGuardMonitor private constructor(private val context: Context) {
     @Volatile
     private var cachedPkgOpsTimeMs: Long = 0L
 
+    fun getCachedOrFetchPackageOps(forceFresh: Boolean = false): List<*>? =
+        fetchAllPackageOps(forceFresh = forceFresh)
+
     private fun fetchAllPackageOps(forceFresh: Boolean = false): List<*>? {
         val now = System.currentTimeMillis()
         if (!forceFresh) {
             val cached = cachedPkgOpsList
-            if (cached != null && (now - cachedPkgOpsTimeMs) in 0L..3_500L) {
+            if (cached != null && (now - cachedPkgOpsTimeMs) in 0L..4_500L) {
                 return cached
             }
         }
-        return try {
-            val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
-            (appOpsGetPackagesForOpsMethod?.invoke(appOps, null) as? List<*>)?.also {
-                cachedPkgOpsList = it
-                cachedPkgOpsTimeMs = now
+        synchronized(appOpsLock) {
+            val nowLocked = System.currentTimeMillis()
+            if (!forceFresh) {
+                val cached = cachedPkgOpsList
+                if (cached != null && (nowLocked - cachedPkgOpsTimeMs) in 0L..4_500L) {
+                    return cached
+                }
             }
-        } catch (_: Exception) {
-            null
+            return try {
+                val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+                val method = appOpsGetPackagesForOpsMethod ?: return cachedPkgOpsList
+                // Pass targetedAppOpIds instead of null so AppOpsService filters in system_server
+                // and returns a ~15KB Binder parcel instead of a 700KB+ parcel of all 140 ops across 300 packages.
+                val opIds = targetedAppOpIds
+                val result = (try {
+                    method.invoke(appOps, opIds) as? List<*>
+                } catch (_: Throwable) {
+                    null
+                }) ?: (method.invoke(appOps, null) as? List<*>)
+                result?.also {
+                    cachedPkgOpsList = it
+                    cachedPkgOpsTimeMs = System.currentTimeMillis()
+                } ?: cachedPkgOpsList
+            } catch (_: Throwable) {
+                cachedPkgOpsList
+            }
         }
     }
 
@@ -2209,10 +2287,26 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     dispLower.contains("sidebar") ||
                     dispLower.contains("edgepanel") ||
                     dispLower.contains("pip") ||
+                    dispLower.contains("floating") ||
+                    dispLower.contains("popup") ||
+                    dispLower.contains("split") ||
+                    dispLower.contains("activityview") ||
+                    dispLower.contains("taskvirtualdisplay") ||
                     ownerLower.contains("freeform") ||
                     ownerLower.contains("smartsidebar") ||
+                    ownerLower.contains("sidebar") ||
                     ownerLower.contains("cocktailbar") ||
-                    ownerLower.contains("multiwindow")
+                    ownerLower.contains("multiwindow") ||
+                    ownerLower.contains("floating") ||
+                    (ownerPkg != null && !isScreenRecorderPackage(ownerPkg) && (
+                        ownerLower.startsWith("com.miui.") ||
+                            ownerLower.startsWith("com.xiaomi.") ||
+                            ownerLower.startsWith("com.oplus.") ||
+                            ownerLower.startsWith("com.coloros.") ||
+                            ownerLower.startsWith("com.heytap.") ||
+                            ownerLower.startsWith("com.vivo.") ||
+                            ownerLower.startsWith("com.samsung.android.app.cocktailbarservice")
+                        ))
                 val isCaptureOrMirrorDisplay = !isOemFreeformOrSidebarDisplay && (
                     isPresentation ||
                         dispLower.contains("mirror") ||
@@ -2662,7 +2756,20 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 return existing
             }
         }
-        val pkgOps = fetchAllPackageOps(forceFresh = logAuditEvent)
+        synchronized(auditLock) {
+            val nowLocked = System.currentTimeMillis()
+            if (!logAuditEvent) {
+                val existing = cachedAuditVectors
+                if (existing != null &&
+                    cachedAuditIncludeSystem == includeSystemApps &&
+                    (nowLocked - cachedAuditVectorsTimeMs) in 0L..15_000L &&
+                    (nowLocked - _captureState.value.lastUpdatedMs) in 0L..10_000L
+                ) {
+                    evaluateAndNotifyLiveGuardChecks(existing, forceNotifyActive = false)
+                    return existing
+                }
+            }
+            val pkgOps = fetchAllPackageOps(forceFresh = logAuditEvent)
         if (logAuditEvent || (!isMonitoring && (nowMs - _captureState.value.lastUpdatedMs) > 5_000L)) {
             val usageSnap = queryCombinedUsageState()
             refreshMicAndCallState(
@@ -3047,6 +3154,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         evaluateAndNotifyLiveGuardChecks(allVectors, forceNotifyActive = false)
 
         return allVectors
+        }
     }
 
     /**

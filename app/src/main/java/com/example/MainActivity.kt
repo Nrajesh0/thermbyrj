@@ -160,7 +160,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private val viewModel: ThermalViewModel by viewModels()
-    private var activityScreenRecordingConsumer: java.util.function.Consumer<Int>? = null
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { _ ->
@@ -188,21 +187,17 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Staggered, low-impact background pre-warm after initial UI and storage scan settle
+        // Staggered, low-impact background pre-warm after initial UI, service, and storage scan settle
         lifecycleScope.launch(Dispatchers.IO) {
-            com.example.ui.screens.VaultManager.cleanupStalePreviewCache(applicationContext)
-            delay(1_200L)
             try {
-                if (PrivacyAnalyzer.peekCachedPrivacySummary(false) == null) {
-                    val summary = PrivacyAnalyzer.analyzeDevicePrivacy(applicationContext, includeSystemApps = false)
-                    delay(250L)
-                    PrivacyAnalyzer.getPrivacyChanges(applicationContext, summary.appReports)
-                }
-                delay(300L)
-                val guard = LiveGuardMonitor.getInstance(applicationContext)
-                guard.runDeepSecurityAudit(includeSystemApps = false)
-                delay(300L)
-                PrivacyAnalyzer.getPermissionAccessTimeline(applicationContext, includeSystemApps = false, forceRefresh = true)
+                com.example.ui.screens.VaultManager.cleanupStalePreviewCache(applicationContext)
+                delay(2_800L)
+                val summary = PrivacyAnalyzer.peekCachedPrivacySummary(false)
+                    ?: PrivacyAnalyzer.analyzeDevicePrivacy(applicationContext, includeSystemApps = false)
+                delay(400L)
+                PrivacyAnalyzer.getPrivacyChanges(applicationContext, summary.appReports)
+                delay(400L)
+                PrivacyAnalyzer.getPermissionAccessTimeline(applicationContext, includeSystemApps = false, forceRefresh = false)
             } catch (_: Throwable) {
             }
         }
@@ -219,41 +214,24 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         isUiForeground = true
         com.example.service.ThermalMonitor.getInstance(applicationContext).startMonitoring()
-        val guard = LiveGuardMonitor.getInstance(applicationContext)
-        guard.startMonitoring()
-        if (Build.VERSION.SDK_INT >= 35 && activityScreenRecordingConsumer == null) {
-            try {
-                val appCtx = applicationContext
-                val consumer = java.util.function.Consumer<Int> { state ->
-                    try {
-                        LiveGuardMonitor.getInstance(appCtx).onOsScreenRecordingStateChanged(state == 1)
-                    } catch (_: Throwable) {
-                    }
-                }
-                val initialState = windowManager.addScreenRecordingCallback(mainExecutor, consumer)
-                activityScreenRecordingConsumer = consumer
-                guard.onOsScreenRecordingStateChanged(initialState == 1)
-            } catch (_: Throwable) {
-            }
-        }
+        LiveGuardMonitor.getInstance(applicationContext).startMonitoring()
     }
 
     override fun onStop() {
-        if (Build.VERSION.SDK_INT >= 35) {
-            activityScreenRecordingConsumer?.let { consumer ->
-                try {
-                    windowManager.removeScreenRecordingCallback(consumer)
-                } catch (_: Throwable) {
-                }
-                activityScreenRecordingConsumer = null
-            }
-        }
         super.onStop()
         isUiForeground = false
         val prefs = getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
         if (!prefs.getBoolean("background_monitoring", true)) {
             com.example.service.ThermalMonitor.getInstance(applicationContext).stopMonitoring()
             LiveGuardMonitor.getInstance(applicationContext).stopMonitoring()
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        try {
+            super.onSaveInstanceState(outState)
+        } catch (_: Throwable) {
+            outState.clear()
         }
     }
 }
@@ -333,10 +311,6 @@ fun MainScreen(viewModel: ThermalViewModel) {
             widgetJob?.cancel()
             prefs.unregisterOnSharedPreferenceChangeListener(listener)
         }
-    }
-
-    LaunchedEffect(Unit) {
-        LiveGuardMonitor.getInstance(context).startMonitoring()
     }
 
     val pagerState = rememberPagerState(pageCount = { 4 })

@@ -525,6 +525,10 @@ object PrivacyAnalyzer {
         invalidateTimelineCache()
     }
 
+    private val privacyScanLock = Any()
+    private val telemetryScanLock = Any()
+    private val timelineLock = Any()
+
     fun peekCachedChanges(): List<PrivacyChangeEvent>? = cachedChangeEvents
 
     fun analyzeDevicePrivacy(
@@ -540,39 +544,44 @@ object PrivacyAnalyzer {
                 return cached
             }
         }
-        val pm = context.packageManager
-        val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
-        val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+        synchronized(privacyScanLock) {
+            val nowLocked = System.currentTimeMillis()
+            if (!forceRefresh) {
+                val cached = if (includeSystemApps) cachedPrivacySystem else cachedPrivacyUser
+                val cachedTs = if (includeSystemApps) cachedPrivacySystemTimeMs else cachedPrivacyUserTimeMs
+                if (cached != null && (nowLocked - cachedTs) < 60_000L) {
+                    return cached
+                }
+            }
+            val pm = context.packageManager
+            val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+            val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
 
-        val enabledAccessibilitySet = getEnabledAccessibilityPackages(context)
-        val enabledNotifListeners = getEnabledNotificationListeners(context)
-        val activeAdminSet = try {
-            dpm.activeAdmins?.map { it.packageName }?.toSet() ?: emptySet()
-        } catch (_: Exception) {
-            emptySet()
-        }
+            val enabledAccessibilitySet = getEnabledAccessibilityPackages(context)
+            val enabledNotifListeners = getEnabledNotificationListeners(context)
+            val activeAdminSet = try {
+                dpm.activeAdmins?.map { it.packageName }?.toSet() ?: emptySet()
+            } catch (_: Throwable) {
+                emptySet()
+            }
 
-        val usageMap = getRecentUsageMap(context)
-        val launcherPackages = OfflineThreatScanner.getPackagesWithLauncherActivities(context, forceRefresh = forceRefresh)
-        val pkgFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            PackageManager.GET_PERMISSIONS or PackageManager.GET_SIGNING_CERTIFICATES or PackageManager.GET_META_DATA
-        } else {
-            @Suppress("DEPRECATION")
-            PackageManager.GET_PERMISSIONS or PackageManager.GET_SIGNATURES or PackageManager.GET_META_DATA
-        }
-        val packages = try {
-            pm.getInstalledPackages(pkgFlags)
-        } catch (_: Exception) {
-            try {
-                pm.getInstalledPackages(PackageManager.GET_PERMISSIONS or PackageManager.GET_META_DATA)
-            } catch (_: Exception) {
-                try {
+            val usageMap = getRecentUsageMap(context)
+            val launcherPackages = OfflineThreatScanner.getPackagesWithLauncherActivities(context, forceRefresh = forceRefresh)
+            // Query ONLY GET_PERMISSIONS in the bulk call to keep the Binder parcel small (<100 KB).
+            // Certificates and manifest metadata are fetched lazily per user package only on cache miss.
+            val packages = try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    pm.getInstalledPackages(PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS.toLong()))
+                } else {
                     pm.getInstalledPackages(PackageManager.GET_PERMISSIONS)
-                } catch (_: Exception) {
+                }
+            } catch (_: Throwable) {
+                try {
+                    pm.getInstalledPackages(0)
+                } catch (_: Throwable) {
                     emptyList()
                 }
             }
-        }
 
         val reports = mutableListOf<AppPrivacyReport>()
         val now = System.currentTimeMillis()
@@ -839,6 +848,7 @@ object PrivacyAnalyzer {
             cachedPrivacyUserTimeMs = System.currentTimeMillis()
         }
         return result
+        }
     }
 
     /**
@@ -858,76 +868,95 @@ object PrivacyAnalyzer {
                 return cached
             }
         }
-        val pm = context.packageManager
-        val flags = PackageManager.GET_PERMISSIONS or
-            PackageManager.GET_SERVICES or
-            PackageManager.GET_RECEIVERS or
-            PackageManager.GET_PROVIDERS or
-            PackageManager.GET_ACTIVITIES
+        synchronized(telemetryScanLock) {
+            val nowLocked = System.currentTimeMillis()
+            if (!forceRefresh) {
+                val cached = if (includeSystemApps) cachedTelemetrySystem else cachedTelemetryUser
+                val cachedTs = if (includeSystemApps) cachedTelemetrySystemTimeMs else cachedTelemetryUserTimeMs
+                if (cached != null && (nowLocked - cachedTs) < 30_000L) {
+                    return cached
+                }
+            }
+            val pm = context.packageManager
+            val detailFlags = PackageManager.GET_PERMISSIONS or
+                PackageManager.GET_SERVICES or
+                PackageManager.GET_RECEIVERS or
+                PackageManager.GET_PROVIDERS or
+                PackageManager.GET_ACTIVITIES
 
-        val packages = try {
-            pm.getInstalledPackages(flags)
-        } catch (_: Exception) {
-            try {
-                pm.getInstalledPackages(PackageManager.GET_PERMISSIONS)
-            } catch (_: Exception) {
+            // Fetch lightweight application list first to avoid a 1MB+ Binder TransactionTooLargeException
+            val installedApps = try {
+                pm.getInstalledApplications(0)
+            } catch (_: Throwable) {
                 emptyList()
             }
-        }
 
-        val adNetworkSignatures = listOf(
-            "Google AdMob" to listOf("com.google.android.gms.ads", "com.google.ads"),
-            "Meta Audience Ads" to listOf("com.facebook.ads", "com.facebook.appevents"),
-            "AppLovin Ads" to listOf("com.applovin"),
-            "Unity Ads" to listOf("com.unity3d.ads", "com.unity3d.services.ads"),
-            "IronSource" to listOf("com.ironsource"),
-            "Vungle / Liftoff" to listOf("com.vungle"),
-            "InMobi" to listOf("com.inmobi"),
-            "Pangle / TikTok Ads" to listOf("com.bytedance.sdk.openadsdk"),
-            "Chartboost" to listOf("com.chartboost"),
-            "Mintegral" to listOf("com.mbridge.msdk")
-        )
+            val adNetworkSignatures = listOf(
+                "Google AdMob" to listOf("com.google.android.gms.ads", "com.google.ads"),
+                "Meta Audience Ads" to listOf("com.facebook.ads", "com.facebook.appevents"),
+                "AppLovin Ads" to listOf("com.applovin"),
+                "Unity Ads" to listOf("com.unity3d.ads", "com.unity3d.services.ads"),
+                "IronSource" to listOf("com.ironsource"),
+                "Vungle / Liftoff" to listOf("com.vungle"),
+                "InMobi" to listOf("com.inmobi"),
+                "Pangle / TikTok Ads" to listOf("com.bytedance.sdk.openadsdk"),
+                "Chartboost" to listOf("com.chartboost"),
+                "Mintegral" to listOf("com.mbridge.msdk")
+            )
 
-        val analyticsSignatures = listOf(
-            "Firebase Analytics" to listOf("com.google.firebase.analytics", "com.google.android.gms.measurement", "AppMeasurementService"),
-            "Crashlytics" to listOf("com.google.firebase.crashlytics", "com.crashlytics"),
-            "AppsFlyer Attribution" to listOf("com.appsflyer"),
-            "Adjust Tracker" to listOf("com.adjust.sdk"),
-            "Branch DeepLinks" to listOf("io.branch.referral"),
-            "Mixpanel" to listOf("com.mixpanel"),
-            "Amplitude" to listOf("com.amplitude"),
-            "Segment" to listOf("com.segment.analytics"),
-            "OneSignal Push" to listOf("com.onesignal"),
-            "Braze / Appboy" to listOf("com.braze", "com.appboy"),
-            "Flurry Analytics" to listOf("com.flurry"),
-            "Sentry Telemetry" to listOf("io.sentry")
-        )
+            val analyticsSignatures = listOf(
+                "Firebase Analytics" to listOf("com.google.firebase.analytics", "com.google.android.gms.measurement", "AppMeasurementService"),
+                "Crashlytics" to listOf("com.google.firebase.crashlytics", "com.crashlytics"),
+                "AppsFlyer Attribution" to listOf("com.appsflyer"),
+                "Adjust Tracker" to listOf("com.adjust.sdk"),
+                "Branch DeepLinks" to listOf("io.branch.referral"),
+                "Mixpanel" to listOf("com.mixpanel"),
+                "Amplitude" to listOf("com.amplitude"),
+                "Segment" to listOf("com.segment.analytics"),
+                "OneSignal Push" to listOf("com.onesignal"),
+                "Braze / Appboy" to listOf("com.braze", "com.appboy"),
+                "Flurry Analytics" to listOf("com.flurry"),
+                "Sentry Telemetry" to listOf("io.sentry")
+            )
 
-        val reports = mutableListOf<AppTelemetryReport>()
+            val reports = mutableListOf<AppTelemetryReport>()
 
-        for (pkgInfo in packages) {
-            val appInfo = pkgInfo.applicationInfo ?: continue
-            if (pkgInfo.packageName == context.packageName) continue
+            for (appInfo in installedApps) {
+                if (appInfo.packageName == context.packageName) continue
 
-            val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0 ||
-                (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
-            if (isSystem && !includeSystemApps) continue
+                val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0 ||
+                    (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+                if (isSystem && !includeSystemApps) continue
 
-            // Collect all component class names in this package
-            val componentNames = buildList {
-                pkgInfo.services?.forEach { add(it.name) }
-                pkgInfo.receivers?.forEach { add(it.name) }
-                pkgInfo.providers?.forEach { add(it.name) }
-                pkgInfo.activities?.forEach { add(it.name) }
-            }
+                val pkgInfo = try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        pm.getPackageInfo(appInfo.packageName, PackageManager.PackageInfoFlags.of(detailFlags.toLong()))
+                    } else {
+                        pm.getPackageInfo(appInfo.packageName, detailFlags)
+                    }
+                } catch (_: Throwable) {
+                    try {
+                        pm.getPackageInfo(appInfo.packageName, PackageManager.GET_PERMISSIONS)
+                    } catch (_: Throwable) {
+                        continue
+                    }
+                }
 
-            val detectedAds = adNetworkSignatures.mapNotNull { (label, prefixes) ->
-                if (componentNames.any { cls -> prefixes.any { cls.contains(it, ignoreCase = true) } }) label else null
-            }
+                // Collect all component class names in this package
+                val componentNames = buildList {
+                    pkgInfo.services?.forEach { add(it.name) }
+                    pkgInfo.receivers?.forEach { add(it.name) }
+                    pkgInfo.providers?.forEach { add(it.name) }
+                    pkgInfo.activities?.forEach { add(it.name) }
+                }
 
-            val detectedAnalytics = analyticsSignatures.mapNotNull { (label, prefixes) ->
-                if (componentNames.any { cls -> prefixes.any { cls.contains(it, ignoreCase = true) } }) label else null
-            }
+                val detectedAds = adNetworkSignatures.mapNotNull { (label, prefixes) ->
+                    if (componentNames.any { cls -> prefixes.any { cls.contains(it, ignoreCase = true) } }) label else null
+                }
+
+                val detectedAnalytics = analyticsSignatures.mapNotNull { (label, prefixes) ->
+                    if (componentNames.any { cls -> prefixes.any { cls.contains(it, ignoreCase = true) } }) label else null
+                }
 
             val reqPerms = pkgInfo.requestedPermissions?.toSet() ?: emptySet()
             val hasInternet = Manifest.permission.INTERNET in reqPerms
@@ -1019,6 +1048,7 @@ object PrivacyAnalyzer {
             cachedTelemetryUserTimeMs = System.currentTimeMillis()
         }
         return result
+        }
     }
 
     private fun buildShortActionTips(reports: List<AppPrivacyReport>, unusedRiskyCount: Int): List<String> {
@@ -1332,8 +1362,19 @@ object PrivacyAnalyzer {
                 explicitSideloadInitiatorHints.any { hint -> lower.contains(hint) }
             }
 
-            // 3. Check Google Play Store stamp & split APK metadata in ApplicationInfo.metaData
-            val meta = appInfo?.metaData
+            // 3. Check Google Play Store stamp & split APK metadata in ApplicationInfo.metaData (lazily fetched if needed)
+            val meta = appInfo?.metaData ?: try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    pm.getApplicationInfo(
+                        packageName,
+                        PackageManager.ApplicationInfoFlags.of(PackageManager.GET_META_DATA.toLong())
+                    ).metaData
+                } else {
+                    pm.getApplicationInfo(packageName, PackageManager.GET_META_DATA).metaData
+                }
+            } catch (_: Throwable) {
+                null
+            }
             val hasPlayStoreStamp = meta != null && (
                 meta.containsKey("com.android.vending.derived.apk.id") ||
                     meta.containsKey("com.android.vending.splits") ||
@@ -1515,14 +1556,22 @@ object PrivacyAnalyzer {
                 return cached
             }
         }
-        val hasCachedSummary = peekCachedPrivacySummary(includeSystemApps) != null
-        val summary = analyzeDevicePrivacy(
-            context,
-            includeSystemApps = includeSystemApps,
-            forceRefresh = forceRefresh && !hasCachedSummary
-        )
-        val reportsByPkg = summary.appReports.associateBy { it.packageName }
-        val appOpsTimes = queryAppOpsLastAccessMap(context)
+        synchronized(timelineLock) {
+            val nowLocked = System.currentTimeMillis()
+            if (!forceRefresh) {
+                val cached = if (includeSystemApps) cachedTimelineSystem else cachedTimelineUser
+                if (cached != null && (nowLocked - cachedTimelineTimeMs) < 10_000L) {
+                    return cached
+                }
+            }
+            val hasCachedSummary = peekCachedPrivacySummary(includeSystemApps) != null
+            val summary = analyzeDevicePrivacy(
+                context,
+                includeSystemApps = includeSystemApps,
+                forceRefresh = forceRefresh && !hasCachedSummary
+            )
+            val reportsByPkg = summary.appReports.associateBy { it.packageName }
+            val appOpsTimes = queryAppOpsLastAccessMap(context)
         val pm = context.packageManager
         val guardMonitor = LiveGuardMonitor.getInstance(context)
         val ignored = guardMonitor.ignoredPackages.value
@@ -1801,6 +1850,7 @@ object PrivacyAnalyzer {
         }
         cachedTimelineTimeMs = System.currentTimeMillis()
         return sortedTimeline
+        }
     }
 
     /**
@@ -1867,12 +1917,9 @@ object PrivacyAnalyzer {
         val map = mutableMapOf<String, MutableMap<String, Long>>()
         val now = System.currentTimeMillis()
         try {
-            val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
-            val getPackagesForOps = appOpsGetPackagesForOpsMethod
-                ?: appOps.javaClass.getMethod("getPackagesForOps", IntArray::class.java).also {
-                    appOpsGetPackagesForOpsMethod = it
-                }
-            val pkgOpsList = getPackagesForOps.invoke(appOps, null) as? List<*> ?: return emptyMap()
+            // Reuse LiveGuardMonitor's synchronized, targeted AppOps query cache to avoid duplicate large Binder transactions
+            val pkgOpsList = LiveGuardMonitor.getInstance(context).getCachedOrFetchPackageOps(forceFresh = false)
+                ?: return emptyMap()
 
             for (pkgOps in pkgOpsList) {
                 if (pkgOps == null) continue
