@@ -88,6 +88,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
+import java.io.RandomAccessFile
 import java.security.MessageDigest
 
 data class DuplicateGroup(
@@ -121,15 +122,13 @@ fun DuplicateFinderScreen(onBack: () -> Unit) {
     var scanTrigger by remember { mutableIntStateOf(0) }
     var showSmartCleanConfirm by remember { mutableStateOf(false) }
     var hasManageStorage by remember {
-        mutableStateOf(
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else true
-        )
+        mutableStateOf(com.example.service.PermissionUtils.hasAllFilesPermission())
     }
 
     val manageStorageLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) {
-        hasManageStorage = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else true
+        hasManageStorage = com.example.service.PermissionUtils.hasAllFilesPermission()
         scanTrigger++
     }
 
@@ -178,51 +177,48 @@ fun DuplicateFinderScreen(onBack: () -> Unit) {
 
     LaunchedEffect(scanTrigger) {
         isScanning = true
-        withContext(Dispatchers.IO) {
-            val root = Environment.getExternalStorageDirectory()
-            val sizeMap = mutableMapOf<Long, MutableList<File>>()
+        statusText = "Scanning storage for duplicate files..."
+        val computedGroups = withContext(Dispatchers.IO) {
+            try {
+                val root = Environment.getExternalStorageDirectory()
+                val seenCanonicalPaths = HashSet<String>()
+                val candidateFiles = mutableListOf<File>()
 
-            fun walk(dir: File) {
-                val list = dir.listFiles() ?: return
-                for (f in list) {
-                    if (f.isDirectory) {
-                        if (!f.name.startsWith(".") && f.name != "Android") {
-                            walk(f)
+                fun walk(dir: File) {
+                    val list = dir.listFiles() ?: return
+                    for (f in list) {
+                        if (f.isDirectory) {
+                            if (!f.name.startsWith(".") && f.name != "Android") {
+                                walk(f)
+                            }
+                        } else if (f.isFile && f.canRead()) {
+                            val len = f.length()
+                            if (len >= DuplicateHashVerifier.MIN_FILE_SIZE_BYTES) {
+                                val canon = try {
+                                    f.canonicalPath
+                                } catch (_: Exception) {
+                                    f.absolutePath
+                                }
+                                if (seenCanonicalPaths.add(canon)) {
+                                    candidateFiles.add(f)
+                                }
+                            }
                         }
-                    } else {
-                        val len = f.length()
-                        if (len > 10240) { // Only scan files > 10KB
-                            sizeMap.getOrPut(len) { mutableListOf() }.add(f)
-                        }
                     }
                 }
+
+                walk(root)
+                DuplicateHashVerifier.findExactDuplicates(candidateFiles) { stageMsg ->
+                    scope.launch(Dispatchers.Main) {
+                        statusText = stageMsg
+                    }
+                }
+            } catch (_: Throwable) {
+                emptyList()
             }
-
-            walk(root)
-            val potentialGroups = sizeMap.filter { it.value.size > 1 }
-            statusText = "Comparing ${potentialGroups.size} size matches..."
-
-            val results = mutableListOf<DuplicateGroup>()
-            for ((size, files) in potentialGroups) {
-                val hashMap = mutableMapOf<String, MutableList<File>>()
-                for (f in files) {
-                    val h = getFastMd5(f)
-                    if (h.isNotEmpty()) {
-                        hashMap.getOrPut(h) { mutableListOf() }.add(f)
-                    }
-                }
-                for ((hash, dupes) in hashMap) {
-                    if (dupes.size > 1) {
-                        // Sort oldest first so index 0 is the "original"
-                        val sorted = dupes.sortedBy { it.lastModified() }
-                        results.add(DuplicateGroup(hash, size, sorted))
-                    }
-                }
-            }
-
-            duplicateGroups = results.sortedByDescending { it.size * (it.files.size - 1) }
-            isScanning = false
         }
+        duplicateGroups = computedGroups
+        isScanning = false
     }
 
     Scaffold(
@@ -304,11 +300,15 @@ fun DuplicateFinderScreen(onBack: () -> Unit) {
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Button(
                                     onClick = {
-                                        val intent = Intent(
-                                            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                                            Uri.parse("package:${context.packageName}")
-                                        )
-                                        manageStorageLauncher.launch(intent)
+                                        try {
+                                            val intent = Intent(
+                                                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                                Uri.parse("package:${context.packageName}")
+                                            )
+                                            manageStorageLauncher.launch(intent)
+                                        } catch (_: Throwable) {
+                                            com.example.service.PermissionUtils.launchAllFilesAccessSettings(context)
+                                        }
                                     },
                                     colors = ButtonDefaults.buttonColors(containerColor = AuraOrange)
                                 ) {
@@ -354,7 +354,7 @@ fun DuplicateFinderScreen(onBack: () -> Unit) {
                                 }
                                 Column(horizontalAlignment = Alignment.End) {
                                     Text("${duplicateGroups.size} Groups", color = TextPrimary, fontWeight = FontWeight.SemiBold)
-                                    Text("Tap any file to preview", color = TextSecondary, style = MaterialTheme.typography.labelSmall)
+                                    Text("SHA-256 verified · Tap to preview", color = TextSecondary, style = MaterialTheme.typography.labelSmall)
                                 }
                             }
                         }
@@ -509,16 +509,126 @@ fun DuplicateFinderScreen(onBack: () -> Unit) {
     }
 }
 
-private fun getFastMd5(file: File): String {
-    return try {
-        val digest = MessageDigest.getInstance("MD5")
-        FileInputStream(file).use { fis ->
-            val buffer = ByteArray(8192)
-            val read = fis.read(buffer)
-            if (read > 0) digest.update(buffer, 0, read)
+/**
+ * Three-stage exact duplicate engine:
+ * 1. Exact byte-length grouping (>= 1 KB)
+ * 2. Fast partial SHA-256 fingerprint (head 8 KB + mid 8 KB + tail 8 KB)
+ * 3. Full-file streaming SHA-256 digest before ever flagging files as identical
+ */
+internal object DuplicateHashVerifier {
+    const val MIN_FILE_SIZE_BYTES = 1024L
+    private const val SAMPLE_WINDOW_BYTES = 8192
+    private const val FULL_BUFFER_BYTES = 65536
+
+    fun findExactDuplicates(
+        files: List<File>,
+        onStage: (String) -> Unit = {}
+    ): List<DuplicateGroup> {
+        val sizeMap = mutableMapOf<Long, MutableList<File>>()
+        for (file in files) {
+            if (!file.isFile) continue
+            val len = file.length()
+            if (len >= MIN_FILE_SIZE_BYTES) {
+                sizeMap.getOrPut(len) { mutableListOf() }.add(file)
+            }
         }
-        digest.digest().joinToString("") { "%02x".format(it) }
-    } catch (_: Exception) {
-        ""
+
+        val sizeMatches = sizeMap.filter { it.value.size > 1 }
+        if (sizeMatches.isEmpty()) return emptyList()
+
+        onStage("Fingerprinting ${sizeMatches.size} size matches...")
+        val partialCandidates = mutableListOf<Pair<Long, List<File>>>()
+        for ((size, group) in sizeMatches) {
+            val partialMap = mutableMapOf<String, MutableList<File>>()
+            for (file in group) {
+                val fp = computePartialFingerprint(file, size)
+                if (fp.isNotEmpty()) {
+                    partialMap.getOrPut(fp) { mutableListOf() }.add(file)
+                }
+            }
+            for ((_, matches) in partialMap) {
+                if (matches.size > 1) {
+                    partialCandidates.add(size to matches)
+                }
+            }
+        }
+
+        if (partialCandidates.isEmpty()) return emptyList()
+
+        onStage("Verifying exact SHA-256 matches (${partialCandidates.size} groups)...")
+        val results = mutableListOf<DuplicateGroup>()
+        for ((size, candidates) in partialCandidates) {
+            val fullHashMap = mutableMapOf<String, MutableList<File>>()
+            for (file in candidates) {
+                val fullHash = computeFullSha256(file)
+                if (fullHash.isNotEmpty()) {
+                    fullHashMap.getOrPut(fullHash) { mutableListOf() }.add(file)
+                }
+            }
+            for ((hash, dupes) in fullHashMap) {
+                if (dupes.size > 1) {
+                    val sorted = dupes.sortedWith(compareBy<File>({ it.lastModified() }, { it.absolutePath }))
+                    results.add(DuplicateGroup(hash = hash, size = size, files = sorted))
+                }
+            }
+        }
+
+        return results
+            .distinctBy { it.hash }
+            .sortedByDescending { it.size * (it.files.size - 1) }
+    }
+
+    fun computePartialFingerprint(file: File, expectedLength: Long = file.length()): String {
+        return try {
+            val digest = MessageDigest.getInstance("SHA-256")
+            digest.update(expectedLength.toString().toByteArray())
+            val buf = ByteArray(SAMPLE_WINDOW_BYTES)
+            RandomAccessFile(file, "r").use { raf ->
+                val actualLen = raf.length()
+                if (actualLen <= SAMPLE_WINDOW_BYTES * 3L) {
+                    raf.seek(0L)
+                    var read: Int
+                    while (raf.read(buf).also { read = it } != -1) {
+                        digest.update(buf, 0, read)
+                    }
+                } else {
+                    // Head 8 KB
+                    raf.seek(0L)
+                    val headRead = raf.read(buf, 0, SAMPLE_WINDOW_BYTES)
+                    if (headRead > 0) digest.update(buf, 0, headRead)
+
+                    // Middle 8 KB
+                    val midOffset = (actualLen / 2L) - (SAMPLE_WINDOW_BYTES / 2L)
+                    raf.seek(midOffset.coerceAtLeast(0L))
+                    val midRead = raf.read(buf, 0, SAMPLE_WINDOW_BYTES)
+                    if (midRead > 0) digest.update(buf, 0, midRead)
+
+                    // Tail 8 KB
+                    val tailOffset = (actualLen - SAMPLE_WINDOW_BYTES).coerceAtLeast(0L)
+                    raf.seek(tailOffset)
+                    val tailRead = raf.read(buf, 0, SAMPLE_WINDOW_BYTES)
+                    if (tailRead > 0) digest.update(buf, 0, tailRead)
+                }
+            }
+            digest.digest().joinToString("") { "%02x".format(it) }
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    fun computeFullSha256(file: File): String {
+        return try {
+            val digest = MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(FULL_BUFFER_BYTES)
+            FileInputStream(file).use { fis ->
+                var read: Int
+                while (fis.read(buffer).also { read = it } != -1) {
+                    digest.update(buffer, 0, read)
+                }
+            }
+            digest.digest().joinToString("") { "%02x".format(it) }
+        } catch (_: Exception) {
+            ""
+        }
     }
 }

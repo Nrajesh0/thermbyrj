@@ -29,20 +29,17 @@ import java.util.Locale
 
 class ThermalWidgetProvider : AppWidgetProvider() {
     override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
-        ThermalMonitor.getInstance(context).forceUpdate()
-        updateAllWidgets(context, appWidgetManager = appWidgetManager, appWidgetIds = appWidgetIds)
+        try {
+            ThermalMonitor.getInstance(context).forceUpdate()
+            updateAllWidgets(context, appWidgetManager = appWidgetManager, appWidgetIds = appWidgetIds)
 
-        val prefs = context.getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
-        if (prefs.getBoolean("background_monitoring", true)) {
-            try {
-                val serviceIntent = Intent(context, ThermalTrackerService::class.java)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(serviceIntent)
-                } else {
-                    context.startService(serviceIntent)
-                }
-            } catch (_: Exception) {
+            val prefs = context.getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
+            if (prefs.getBoolean("background_monitoring", true) &&
+                (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || MainActivity.isUiForeground)
+            ) {
+                com.example.startTrackingServiceSafely(context)
             }
+        } catch (_: Throwable) {
         }
     }
 
@@ -50,10 +47,15 @@ class ThermalWidgetProvider : AppWidgetProvider() {
         fun updateAllWidgets(
             context: Context,
             recentRecords: List<ThermalRecord>? = null,
-            appWidgetManager: AppWidgetManager = AppWidgetManager.getInstance(context),
-            appWidgetIds: IntArray = appWidgetManager.getAppWidgetIds(ComponentName(context, ThermalWidgetProvider::class.java))
+            appWidgetManager: AppWidgetManager? = AppWidgetManager.getInstance(context),
+            appWidgetIds: IntArray = try {
+                appWidgetManager?.getAppWidgetIds(ComponentName(context, ThermalWidgetProvider::class.java)) ?: IntArray(0)
+            } catch (_: Throwable) {
+                IntArray(0)
+            }
         ) {
-            if (appWidgetIds.isEmpty()) return
+            if (appWidgetManager == null || appWidgetIds.isEmpty()) return
+            try {
 
             val monitor = ThermalMonitor.getInstance(context)
             val live = monitor.liveData.value
@@ -143,6 +145,8 @@ class ThermalWidgetProvider : AppWidgetProvider() {
             }
 
             appWidgetManager.updateAppWidget(appWidgetIds, views)
+            } catch (_: Throwable) {
+            }
         }
 
         private fun renderWidgetBackgroundBitmap(bgColor: Int, borderColor: Int): Bitmap {
@@ -172,19 +176,26 @@ class ThermalWidgetProvider : AppWidgetProvider() {
             val width = 400
             val height = 120
             val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            val valid = records.filter { it.batteryTemp.isFinite() }
+            if (valid.size < 2) return bitmap
             val canvas = Canvas(bitmap)
 
-            val minTemp = records.minOf { it.batteryTemp } - 1.5f
-            val maxTemp = records.maxOf { it.batteryTemp } + 1.5f
-            val timeStart = records.first().timestamp
-            val timeRange = records.last().timestamp - timeStart
+            val minTemp = valid.minOf { it.batteryTemp } - 1.5f
+            val maxTemp = valid.maxOf { it.batteryTemp } + 1.5f
+            val timeStart = valid.first().timestamp
+            val timeRange = (valid.last().timestamp - timeStart).coerceAtLeast(0L)
             val tempRange = (maxTemp - minTemp).coerceAtLeast(1f)
 
             val path = Path()
             var firstPoint = true
-            records.forEach { record ->
-                val x = if (timeRange == 0L) 0f else ((record.timestamp - timeStart).toFloat() / timeRange) * width
-                val y = height - 8f - (((record.batteryTemp - minTemp) / tempRange) * (height - 16f))
+            valid.forEachIndexed { idx, record ->
+                val x = if (timeRange == 0L) {
+                    (idx.toFloat() / (valid.size - 1).coerceAtLeast(1)) * width
+                } else {
+                    (((record.timestamp - timeStart).toFloat() / timeRange) * width).coerceIn(0f, width.toFloat())
+                }
+                val y = (height - 8f - (((record.batteryTemp - minTemp) / tempRange) * (height - 16f)))
+                    .coerceIn(4f, height - 4f)
                 if (firstPoint) {
                     path.moveTo(x, y)
                     firstPoint = false

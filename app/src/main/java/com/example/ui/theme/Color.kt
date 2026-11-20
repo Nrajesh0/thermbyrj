@@ -37,13 +37,16 @@ object ThemeState {
     var showAmbientGlow by mutableStateOf(false)
 
     fun loadFromPrefs(context: Context) {
-        val prefs = context.getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
-        val accentKey = prefs.getString("theme_accent", "CYAN") ?: "CYAN"
-        val surfaceKey = prefs.getString("theme_surface", "OBSIDIAN") ?: "OBSIDIAN"
-        accentPreset = AccentPreset.entries.find { it.key == accentKey } ?: AccentPreset.CYAN
-        surfacePreset = SurfacePreset.entries.find { it.key == surfaceKey } ?: SurfacePreset.OBSIDIAN
-        ultraMinimalCards = prefs.getBoolean("ultra_minimal_cards", true)
-        showAmbientGlow = prefs.getBoolean("ambient_glow", false)
+        try {
+            val prefs = context.getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
+            val accentKey = prefs.getString("theme_accent", "CYAN") ?: "CYAN"
+            val surfaceKey = prefs.getString("theme_surface", "OBSIDIAN") ?: "OBSIDIAN"
+            accentPreset = AccentPreset.entries.find { it.key == accentKey } ?: AccentPreset.CYAN
+            surfacePreset = SurfacePreset.entries.find { it.key == surfaceKey } ?: SurfacePreset.OBSIDIAN
+            ultraMinimalCards = prefs.getBoolean("ultra_minimal_cards", true)
+            showAmbientGlow = prefs.getBoolean("ambient_glow", false)
+        } catch (_: Throwable) {
+        }
     }
 }
 

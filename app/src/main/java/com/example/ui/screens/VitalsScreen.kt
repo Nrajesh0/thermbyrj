@@ -575,14 +575,16 @@ private fun SingleTempTrackingCard(
                         style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.Bold)
                     )
                 }
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "${String.format(Locale.US, "%.1f°", min24)}–${String.format(Locale.US, "%.1f°", max24)}",
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
-                    color = TextSecondary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                if (liveData.batteryTemp > 0f || last24h.isNotEmpty()) {
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "${String.format(Locale.US, "%.1f°", min24)}–${String.format(Locale.US, "%.1f°", max24)}",
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                        color = TextSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
             }
 
             Row(
@@ -622,7 +624,7 @@ private fun SingleTempTrackingCard(
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = if (showChart) "Hide 24h" else "24h Graph",
+                        text = if (showChart) "Hide Vitals" else "Vitals & 24h",
                         color = if (showChart) AuraCyan else TextSecondary,
                         style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
                     )
@@ -669,7 +671,63 @@ private fun SingleTempTrackingCard(
             Column {
                 Spacer(modifier = Modifier.height(8.dp))
                 HorizontalDivider(color = GlassBorder.copy(alpha = 0.5f))
-                Spacer(modifier = Modifier.height(6.dp))
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // Live Hardware Telemetry Strip (OS Thermal State / CPU, Live Power W/mA, RAM, Battery)
+                val cpuOrThrottleLabel = if (liveData.cpuTemp > 0f) {
+                    String.format(Locale.US, "%.1f°C", liveData.cpuTemp)
+                } else {
+                    liveData.thermalStatusLabel
+                }
+                val cpuOrThrottleTitle = if (liveData.cpuTemp > 0f) "CPU TEMP" else "THERMAL"
+                val powerLabel = when {
+                    liveData.batteryCurrentMa != 0 && liveData.batteryVoltage > 0 -> {
+                        val watts = abs(liveData.batteryCurrentMa) * (liveData.batteryVoltage / 1000f) / 1000f
+                        String.format(Locale.US, "%.1fW", watts)
+                    }
+                    liveData.batteryVoltage > 0 -> String.format(Locale.US, "%.2fV", liveData.batteryVoltage / 1000f)
+                    else -> liveData.chargingSource
+                }
+                val powerSub = if (liveData.batteryCurrentMa != 0) {
+                    "${abs(liveData.batteryCurrentMa)} mA"
+                } else {
+                    "${liveData.batteryLevel}% ${liveData.chargingSource}"
+                }
+                val ramUsedPct = if (liveData.totalRam > 0L) {
+                    (((liveData.totalRam - liveData.availRam).coerceAtLeast(0L) * 100L) / liveData.totalRam).toInt()
+                } else 0
+                val ramAvailGb = if (liveData.availRam > 0L) {
+                    String.format(Locale.US, "%.1f GB free", liveData.availRam / 1_000_000_000.0)
+                } else "—"
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    VitalMiniStatCell(
+                        label = cpuOrThrottleTitle,
+                        value = cpuOrThrottleLabel,
+                        sub = if (liveData.cpuTemp > 0f) liveData.thermalStatusLabel else "${liveData.cpuCores} cores",
+                        accent = if (liveData.thermalStatusCode >= 2) AuraOrange else AuraCyan,
+                        modifier = Modifier.weight(1f)
+                    )
+                    VitalMiniStatCell(
+                        label = if (liveData.isCharging) "CHARGE" else "POWER",
+                        value = powerLabel,
+                        sub = powerSub,
+                        accent = if (liveData.isCharging) AuraGreen else AuraPurple,
+                        modifier = Modifier.weight(1f)
+                    )
+                    VitalMiniStatCell(
+                        label = "RAM USED",
+                        value = if (liveData.totalRam > 0L) "$ramUsedPct%" else "—",
+                        sub = ramAvailGb,
+                        accent = if (ramUsedPct >= 85) AuraRose else AuraCyan,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -700,6 +758,45 @@ private fun SingleTempTrackingCard(
     }
 }
 
+@Composable
+private fun VitalMiniStatCell(
+    label: String,
+    value: String,
+    sub: String,
+    accent: Color,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(GlassPanel.copy(alpha = 0.85f))
+            .border(1.dp, GlassBorder.copy(alpha = 0.7f), RoundedCornerShape(10.dp))
+            .padding(horizontal = 8.dp, vertical = 6.dp)
+    ) {
+        Text(
+            text = label,
+            color = TextTertiary,
+            style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, letterSpacing = 0.8.sp),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            text = value,
+            color = accent,
+            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            text = sub,
+            color = TextSecondary,
+            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
 private fun launchHiddenSetting(context: Context, item: HiddenSettingItem) {
     for (target in item.targets) {
         val intent = Intent().apply {
@@ -727,8 +824,8 @@ private fun launchHiddenSetting(context: Context, item: HiddenSettingItem) {
 
     if (item.secretDialerCode != null) {
         try {
-            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            clipboard.setPrimaryClip(ClipData.newPlainText("Secret Code", item.secretDialerCode))
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            clipboard?.setPrimaryClip(ClipData.newPlainText("Secret Code", item.secretDialerCode))
             val dialIntent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(item.secretDialerCode)}")).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
@@ -739,13 +836,13 @@ private fun launchHiddenSetting(context: Context, item: HiddenSettingItem) {
             ).show()
             context.startActivity(dialIntent)
             return
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
     }
 
     try {
         context.startActivity(Intent(Settings.ACTION_SETTINGS).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
-    } catch (_: Exception) {
+    } catch (_: Throwable) {
     }
 }
 
@@ -764,10 +861,10 @@ internal fun buildHiddenSettingsCatalog(context: Context): List<HiddenSettingIte
     }
 
     val refreshRateBadge = try {
-        val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
-        val rate = dm.getDisplay(Display.DEFAULT_DISPLAY)?.refreshRate?.roundToInt() ?: 60
+        val dm = context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+        val rate = dm?.getDisplay(Display.DEFAULT_DISPLAY)?.refreshRate?.roundToInt() ?: 60
         "${rate}Hz"
-    } catch (_: Exception) {
+    } catch (_: Throwable) {
         null
     }
 

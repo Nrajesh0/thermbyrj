@@ -63,24 +63,28 @@ object PermissionUtils {
     }
 
     fun hasAllFilesPermission(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Environment.isExternalStorageManager()
-        } else {
-            true
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Environment.isExternalStorageManager()
+            } else {
+                true
+            }
+        } catch (_: Throwable) {
+            false
         }
     }
 
     @Suppress("DEPRECATION")
     fun hasUsageStatsPermission(context: Context): Boolean {
         return try {
-            val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+            val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return false
             val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
             } else {
                 appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
             }
             mode == AppOpsManager.MODE_ALLOWED
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             false
         }
     }

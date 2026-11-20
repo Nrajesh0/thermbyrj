@@ -139,51 +139,123 @@ object FileManagerOps {
         return result
     }
 
+    internal fun buildUniqueDestination(targetDir: File, source: File, sameDirectoryCopy: Boolean): File {
+        val base = if (source.isDirectory) source.name else source.nameWithoutExtension
+        val ext = if (source.isDirectory) "" else source.extension
+        val initialName = if (sameDirectoryCopy) {
+            if (ext.isNotBlank()) "${base}_copy.$ext" else "${base}_copy"
+        } else {
+            source.name
+        }
+        var candidate = File(targetDir, initialName)
+        if (!candidate.exists()) return candidate
+
+        var index = 2
+        while (candidate.exists()) {
+            val suffix = if (sameDirectoryCopy) "_copy_$index" else "_$index"
+            val name = if (ext.isNotBlank()) "$base$suffix.$ext" else "$base$suffix"
+            candidate = File(targetDir, name)
+            index++
+        }
+        return candidate
+    }
+
+    internal fun isDescendantOrSameDirectory(src: File, targetDir: File): Boolean {
+        if (!src.isDirectory) return false
+        return try {
+            val srcCanon = src.canonicalPath
+            val targetCanon = targetDir.canonicalPath
+            val srcPrefix = if (srcCanon.endsWith(File.separator)) srcCanon else srcCanon + File.separator
+            targetCanon == srcCanon || targetCanon.startsWith(srcPrefix)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    internal fun isValidFileName(name: String): Boolean {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty() || trimmed == "." || trimmed == "..") return false
+        if (trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains('\u0000')) return false
+        return true
+    }
+
     fun executeClipboardPaste(context: Context, clip: SharedFileClipboard, targetDir: File): Int {
+        if (!targetDir.exists() || !targetDir.isDirectory) return 0
         var successCount = 0
         for (srcPath in clip.paths) {
             val src = File(srcPath)
             if (!src.exists()) continue
-            var dest = File(targetDir, src.name)
-            if (dest.absolutePath == src.absolutePath) {
-                if (clip.operation == SharedClipboardOp.MOVE) continue
-                val suffix = if (src.extension.isNotBlank()) "_copy.${src.extension}" else "_copy"
-                dest = File(targetDir, "${src.nameWithoutExtension}$suffix")
-            } else if (dest.exists()) {
-                val stamp = System.currentTimeMillis() % 10000
-                val suffix = if (src.extension.isNotBlank()) "_$stamp.${src.extension}" else "_$stamp"
-                dest = File(targetDir, "${src.nameWithoutExtension}$suffix")
+
+            // Prevent pasting a directory into itself or one of its subdirectories
+            if (isDescendantOrSameDirectory(src, targetDir)) continue
+
+            val samePath = try {
+                File(targetDir, src.name).canonicalPath == src.canonicalPath
+            } catch (_: Exception) {
+                File(targetDir, src.name).absolutePath == src.absolutePath
             }
+            if (samePath && clip.operation == SharedClipboardOp.MOVE) continue
+
+            val dest = buildUniqueDestination(targetDir, src, sameDirectoryCopy = samePath)
             try {
                 if (clip.operation == SharedClipboardOp.COPY) {
-                    src.copyRecursively(dest, overwrite = true)
-                    MediaScannerConnection.scanFile(context, arrayOf(dest.absolutePath), null, null)
-                    successCount++
+                    val copied = src.copyRecursively(dest, overwrite = false)
+                    if (copied && dest.exists()) {
+                        MediaScannerConnection.scanFile(context, arrayOf(dest.absolutePath), null, null)
+                        successCount++
+                    } else if (dest.exists()) {
+                        if (dest.isDirectory) dest.deleteRecursively() else dest.delete()
+                    }
                 } else {
                     if (src.renameTo(dest)) {
                         FileShredder.cleanupMediaStoreEntry(context, src.absolutePath, null)
                         MediaScannerConnection.scanFile(context, arrayOf(dest.absolutePath), null, null)
                         successCount++
                     } else {
-                        src.copyRecursively(dest, overwrite = true)
-                        if (src.isDirectory) src.deleteRecursively() else src.delete()
-                        FileShredder.cleanupMediaStoreEntry(context, src.absolutePath, null)
-                        MediaScannerConnection.scanFile(context, arrayOf(dest.absolutePath), null, null)
-                        successCount++
+                        val expectedSize = if (src.isFile) src.length() else computeRecursiveSize(src)
+                        val copied = src.copyRecursively(dest, overwrite = false)
+                        val verified = copied && dest.exists() && (
+                            if (src.isFile) dest.length() == expectedSize
+                            else computeRecursiveSize(dest) == expectedSize
+                        )
+                        if (verified) {
+                            if (src.isDirectory) src.deleteRecursively() else src.delete()
+                            FileShredder.cleanupMediaStoreEntry(context, src.absolutePath, null)
+                            MediaScannerConnection.scanFile(context, arrayOf(dest.absolutePath), null, null)
+                            successCount++
+                        } else {
+                            // Never delete source if cross-filesystem copy failed or was truncated
+                            if (dest.exists()) {
+                                if (dest.isDirectory) dest.deleteRecursively() else dest.delete()
+                            }
+                        }
                     }
                 }
             } catch (_: Exception) {
+                try {
+                    if (dest.exists() && src.exists()) {
+                        if (dest.isDirectory) dest.deleteRecursively() else dest.delete()
+                    }
+                } catch (_: Exception) {
+                }
             }
         }
-        StorageScanCache.invalidate()
+        if (successCount > 0) {
+            StorageScanCache.invalidate()
+        }
         return successCount
     }
 
     fun renameFileSafely(context: Context, file: File, newName: String): Boolean {
+        val cleanName = newName.trim()
+        if (!isValidFileName(cleanName)) return false
         val parent = file.parentFile ?: return false
-        val dest = File(parent, newName)
+        val dest = File(parent, cleanName)
         if (dest.exists()) return false
         return try {
+            val parentCanon = parent.canonicalPath
+            val destParentCanon = dest.canonicalFile.parentFile?.canonicalPath
+            if (destParentCanon != parentCanon) return false
             val ok = file.renameTo(dest)
             if (ok) {
                 FileShredder.cleanupMediaStoreEntry(context, file.absolutePath, null)
@@ -198,23 +270,37 @@ object FileManagerOps {
 
     fun compressFilesToZip(sources: List<File>, destZip: File): Boolean {
         return try {
+            val destCanonical = destZip.canonicalPath
             ZipOutputStream(BufferedOutputStream(FileOutputStream(destZip))).use { zos ->
                 for (src in sources) {
-                    addFileToZip(zos, src, src.name)
+                    if (!src.exists()) continue
+                    if (src.canonicalPath == destCanonical) continue
+                    addFileToZip(zos, src, src.name, destCanonical)
                 }
             }
             StorageScanCache.invalidate()
             true
         } catch (_: Exception) {
+            try {
+                if (destZip.exists()) destZip.delete()
+            } catch (_: Exception) {
+            }
             false
         }
     }
 
-    private fun addFileToZip(zos: ZipOutputStream, file: File, entryName: String) {
+    private fun addFileToZip(zos: ZipOutputStream, file: File, entryName: String, destCanonical: String) {
+        if (file.canonicalPath == destCanonical) return
         if (file.isDirectory) {
-            val children = file.listFiles() ?: return
-            for (child in children) {
-                addFileToZip(zos, child, "$entryName/${child.name}")
+            val children = file.listFiles() ?: emptyArray()
+            if (children.isEmpty()) {
+                val dirEntryName = if (entryName.endsWith("/")) entryName else "$entryName/"
+                zos.putNextEntry(ZipEntry(dirEntryName))
+                zos.closeEntry()
+            } else {
+                for (child in children) {
+                    addFileToZip(zos, child, "$entryName/${child.name}", destCanonical)
+                }
             }
         } else {
             FileInputStream(file).use { fis ->
@@ -233,12 +319,18 @@ object FileManagerOps {
             val outDir = File(targetParentDir, zipFile.nameWithoutExtension)
             if (!outDir.exists()) outDir.mkdirs()
             val canonicalOutDir = outDir.canonicalPath
+            val canonicalOutPrefix = if (canonicalOutDir.endsWith(File.separator)) {
+                canonicalOutDir
+            } else {
+                canonicalOutDir + File.separator
+            }
             ZipInputStream(BufferedInputStream(FileInputStream(zipFile))).use { zis ->
                 var entry: ZipEntry? = zis.nextEntry
                 while (entry != null) {
                     val outFile = File(outDir, entry.name)
-                    if (!outFile.canonicalPath.startsWith(canonicalOutDir)) {
-                        break // Zip-slip protection
+                    val outCanonical = outFile.canonicalPath
+                    if (outCanonical != canonicalOutDir && !outCanonical.startsWith(canonicalOutPrefix)) {
+                        throw SecurityException("Blocked Zip-Slip path traversal: ${entry.name}")
                     }
                     if (entry.isDirectory) {
                         outFile.mkdirs()
@@ -265,6 +357,8 @@ object FileManagerOps {
      * and securely shreds/cleans up both disk plaintext and MediaStore index.
      */
     fun encryptFileToVault(context: Context, sourceFile: File, contentUri: Uri? = null): Boolean {
+        var destFile: File? = null
+        var registered = false
         return try {
             if (!sourceFile.exists() || !sourceFile.isFile) return false
             val originalName = sourceFile.name
@@ -272,12 +366,13 @@ object FileManagerOps {
             val originalSize = sourceFile.length()
             val uuid = UUID.randomUUID().toString()
             val vaultDir = VaultManager.getVaultDir(context)
-            val destFile = File(vaultDir, "$uuid.enc")
-            if (destFile.exists()) destFile.delete()
+            val targetDest = File(vaultDir, "$uuid.enc")
+            destFile = targetDest
+            if (targetDest.exists()) targetDest.delete()
 
             val encryptedFile = EncryptedFile.Builder(
                 context,
-                destFile,
+                targetDest,
                 VaultManager.getMasterKey(context),
                 EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB
             ).build()
@@ -288,8 +383,8 @@ object FileManagerOps {
                 }
             }
 
-            if (!destFile.exists() || (originalSize > 0L && destFile.length() == 0L)) {
-                destFile.delete()
+            if (!targetDest.exists() || (originalSize > 0L && targetDest.length() == 0L)) {
+                targetDest.delete()
                 return false
             }
 
@@ -300,6 +395,7 @@ object FileManagerOps {
                 originalParentPath = originalParent,
                 originalSizeBytes = originalSize
             )
+            registered = true
 
             // Securely shred plaintext blocks (NIST 1-Pass) + clean up MediaStore index
             val targetUri = contentUri ?: FileShredder.findMediaContentUriForFile(context, sourceFile)
@@ -322,6 +418,12 @@ object FileManagerOps {
             StorageScanCache.invalidate()
             true
         } catch (_: Exception) {
+            if (!registered) {
+                try {
+                    destFile?.let { if (it.exists()) it.delete() }
+                } catch (_: Exception) {
+                }
+            }
             false
         }
     }
@@ -493,18 +595,22 @@ object FileManagerOps {
                 appInfo.sourceDir = file.absolutePath
                 appInfo.publicSourceDir = file.absolutePath
                 val drawable = appInfo.loadIcon(pm)
-                if (drawable is BitmapDrawable && drawable.bitmap != null) {
-                    drawable.bitmap
+                if (drawable is BitmapDrawable && drawable.bitmap != null && !drawable.bitmap.isRecycled) {
+                    val src = drawable.bitmap.toSafeComposeBitmap()
+                    if (src != null) {
+                        if (src.width <= 128 && src.height <= 128) src
+                        else Bitmap.createScaledBitmap(src, 128, 128, true)
+                    } else null
                 } else {
-                    val w = drawable.intrinsicWidth.coerceAtLeast(64)
-                    val h = drawable.intrinsicHeight.coerceAtLeast(64)
+                    val w = (if (drawable.intrinsicWidth > 0) drawable.intrinsicWidth else 96).coerceIn(1, 128)
+                    val h = (if (drawable.intrinsicHeight > 0) drawable.intrinsicHeight else 96).coerceIn(1, 128)
                     val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
                     val canvas = Canvas(bmp)
                     drawable.setBounds(0, 0, canvas.width, canvas.height)
                     drawable.draw(canvas)
                     bmp
                 }
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
                 null
             }
         }

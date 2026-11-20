@@ -26,7 +26,7 @@ import kotlinx.coroutines.launch
 
 class FileShredService : Service() {
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate + safeCoroutineExceptionHandler())
     private var collectorJob: Job? = null
 
     companion object {
@@ -37,7 +37,10 @@ class FileShredService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        createChannel()
+        try {
+            createChannel()
+        } catch (_: Throwable) {
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -53,36 +56,53 @@ class FileShredService : Service() {
             } else {
                 startForeground(SHRED_NOTIF_ID, initialNotif)
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
+            try {
+                stopSelf()
+            } catch (_: Throwable) {
+            }
+            return START_NOT_STICKY
         }
 
         if (collectorJob?.isActive != true) {
             collectorJob = serviceScope.launch {
-                var wasRunning = false
-                ShredJobCoordinator.state.collect { st ->
-                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                    if (st.isRunning) {
-                        wasRunning = true
-                        val pct = (st.progress * 100f).toInt().coerceIn(0, 100)
-                        if (canPostNotification()) {
-                            nm.notify(
-                                SHRED_NOTIF_ID,
-                                buildProgressNotification(
-                                    st.statusText.ifBlank { "Shredding files..." },
-                                    pct,
-                                    100,
-                                    indeterminate = st.totalFiles <= 0
-                                )
-                            )
+                try {
+                    var wasRunning = false
+                    ShredJobCoordinator.state.collect { st ->
+                        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                        if (st.isRunning) {
+                            wasRunning = true
+                            val pct = (st.progress * 100f).toInt().coerceIn(0, 100)
+                            if (canPostNotification() && nm != null) {
+                                try {
+                                    nm.notify(
+                                        SHRED_NOTIF_ID,
+                                        buildProgressNotification(
+                                            st.statusText.ifBlank { "Shredding files..." },
+                                            pct,
+                                            100,
+                                            indeterminate = st.totalFiles <= 0
+                                        )
+                                    )
+                                } catch (_: Throwable) {
+                                }
+                            }
+                        } else if (wasRunning) {
+                            postCompletionNotification(st.lastResult)
+                            try {
+                                ServiceCompat.stopForeground(this@FileShredService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                                stopSelf()
+                            } catch (_: Throwable) {
+                            }
+                        } else if (!st.isRunning) {
+                            try {
+                                ServiceCompat.stopForeground(this@FileShredService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                                stopSelf()
+                            } catch (_: Throwable) {
+                            }
                         }
-                    } else if (wasRunning) {
-                        postCompletionNotification(st.lastResult)
-                        ServiceCompat.stopForeground(this@FileShredService, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                        stopSelf()
-                    } else if (!st.isRunning) {
-                        ServiceCompat.stopForeground(this@FileShredService, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                        stopSelf()
                     }
+                } catch (_: Throwable) {
                 }
             }
         }
@@ -91,35 +111,42 @@ class FileShredService : Service() {
     }
 
     private fun canPostNotification(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
-        } else {
-            true
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            } else {
+                true
+            }
+        } catch (_: Throwable) {
+            false
         }
     }
 
     private fun postCompletionNotification(result: ShredResult?) {
-        if (result == null || !canPostNotification()) return
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val text = if (result.blockedForOverwrite.isNotEmpty()) {
-            "Shredded ${result.shreddedCount} file(s); ${result.blockedForOverwrite.size} blocked (needs All Files Access)."
-        } else {
-            "Permanently shredded ${result.shreddedCount} file(s) (${formatBytes(result.totalBytesWiped)})."
+        try {
+            if (result == null || !canPostNotification()) return
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+            val text = if (result.blockedForOverwrite.isNotEmpty()) {
+                "Shredded ${result.shreddedCount} file(s); ${result.blockedForOverwrite.size} blocked (needs All Files Access)."
+            } else {
+                "Permanently shredded ${result.shreddedCount} file(s) (${formatBytes(result.totalBytesWiped)})."
+            }
+            val pi = PendingIntent.getActivity(
+                this,
+                0,
+                Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val notif = NotificationCompat.Builder(this, SHRED_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_menu_info_details)
+                .setContentTitle("Secure Shredder Complete")
+                .setContentText(text)
+                .setAutoCancel(true)
+                .setContentIntent(pi)
+                .build()
+            nm.notify(SHRED_DONE_NOTIF_ID, notif)
+        } catch (_: Throwable) {
         }
-        val pi = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val notif = NotificationCompat.Builder(this, SHRED_CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle("Secure Shredder Complete")
-            .setContentText(text)
-            .setAutoCancel(true)
-            .setContentIntent(pi)
-            .build()
-        nm.notify(SHRED_DONE_NOTIF_ID, notif)
     }
 
     private fun buildProgressNotification(
@@ -128,7 +155,7 @@ class FileShredService : Service() {
         max: Int,
         indeterminate: Boolean
     ) = NotificationCompat.Builder(this, SHRED_CHANNEL_ID)
-        .setSmallIcon(R.mipmap.ic_launcher)
+        .setSmallIcon(android.R.drawable.ic_menu_delete)
         .setContentTitle("Secure File Shredder Active")
         .setContentText(text)
         .setOngoing(true)
@@ -141,8 +168,11 @@ class FileShredService : Service() {
     }
 
     override fun onDestroy() {
-        collectorJob?.cancel()
-        serviceScope.cancel()
+        try {
+            collectorJob?.cancel()
+            serviceScope.cancel()
+        } catch (_: Throwable) {
+        }
         super.onDestroy()
     }
 

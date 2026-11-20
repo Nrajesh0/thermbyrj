@@ -144,9 +144,15 @@ fun DataTelemetryScreen(onBack: () -> Unit) {
     }
 
     LaunchedEffect(refreshTrigger, includeSystemApps) {
-        isLoading = true
+        if (summary == null) {
+            isLoading = true
+        }
         val result = withContext(Dispatchers.IO) {
-            PrivacyAnalyzer.analyzeAppTelemetryAndTrackers(context, includeSystemApps = includeSystemApps)
+            PrivacyAnalyzer.analyzeAppTelemetryAndTrackers(
+                context,
+                includeSystemApps = includeSystemApps,
+                forceRefresh = refreshTrigger > 1
+            )
         }
         summary = result
         if (selectedApp != null) {
@@ -167,18 +173,21 @@ fun DataTelemetryScreen(onBack: () -> Unit) {
             "CLEAN" -> list.filter { it.telemetryScore == 0 }
             else -> list
         }
-        if (searchQuery.isBlank()) {
+        val q = searchQuery.trim()
+        if (q.isBlank()) {
             byFilter
         } else {
-            byFilter.filter {
-                it.appName.contains(searchQuery.trim(), ignoreCase = true) ||
-                    it.packageName.contains(searchQuery.trim(), ignoreCase = true)
+            byFilter.filter { app ->
+                app.appName.contains(q, ignoreCase = true) ||
+                    app.packageName.contains(q, ignoreCase = true) ||
+                    app.detectedAdNetworks.any { it.contains(q, ignoreCase = true) } ||
+                    app.detectedAnalyticsSdks.any { it.contains(q, ignoreCase = true) } ||
+                    app.telemetrySignals.any { it.contains(q, ignoreCase = true) }
             }
         }
     }
 
-    if (selectedApp != null) {
-        val app = selectedApp!!
+    selectedApp?.let { app ->
         ModalBottomSheet(
             onDismissRequest = { selectedApp = null },
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
@@ -194,30 +203,39 @@ fun DataTelemetryScreen(onBack: () -> Unit) {
                     )
                     try {
                         context.startActivity(dataIntent)
-                    } catch (_: Exception) {
+                    } catch (_: Throwable) {
+                        try {
+                            context.startActivity(
+                                Intent(
+                                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                    Uri.fromParts("package", app.packageName, null)
+                                )
+                            )
+                        } catch (_: Throwable) {
+                        }
+                    }
+                },
+                onOpenAppSettings = {
+                    try {
                         context.startActivity(
                             Intent(
                                 Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                                 Uri.fromParts("package", app.packageName, null)
                             )
                         )
+                    } catch (_: Throwable) {
                     }
                 },
-                onOpenAppSettings = {
-                    context.startActivity(
-                        Intent(
-                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                            Uri.fromParts("package", app.packageName, null)
-                        )
-                    )
-                },
                 onUninstallClick = {
-                    context.startActivity(
-                        Intent(
-                            Intent.ACTION_DELETE,
-                            Uri.fromParts("package", app.packageName, null)
+                    try {
+                        context.startActivity(
+                            Intent(
+                                Intent.ACTION_DELETE,
+                                Uri.fromParts("package", app.packageName, null)
+                            )
                         )
-                    )
+                    } catch (_: Throwable) {
+                    }
                 },
                 onClose = { selectedApp = null }
             )

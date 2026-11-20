@@ -169,6 +169,8 @@ import com.example.service.ShredStandard
 import com.example.service.ShredTarget
 import com.example.service.AppRefreshCoordinator
 import com.example.service.StorageScanCache
+import com.example.service.safeStartActivity
+import com.example.service.toSafeComposeBitmap
 import com.example.ui.components.ActiveFilePreview
 import com.example.ui.components.BuiltInFilePreviewHost
 import com.example.ui.components.ExpandableSearchBar
@@ -216,14 +218,18 @@ private val explorerThumbCache = LruCache<String, Bitmap>(96)
 
 @Suppress("DEPRECATION")
 private fun checkUsageStatsPermission(context: Context): Boolean {
-    val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
-    val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
-    } else {
-        @Suppress("DEPRECATION")
-        appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
+    return try {
+        val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return false
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
+        } else {
+            @Suppress("DEPRECATION")
+            appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
+        }
+        mode == AppOpsManager.MODE_ALLOWED
+    } catch (_: Throwable) {
+        false
     }
-    return mode == AppOpsManager.MODE_ALLOWED
 }
 
 private fun checkMediaPermission(context: Context): Boolean {
@@ -273,9 +279,7 @@ fun FilesScreen() {
 
     var hasUsageAccess by remember { mutableStateOf(checkUsageStatsPermission(context)) }
     var hasManageStorage by remember {
-        mutableStateOf(
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else true
-        )
+        mutableStateOf(PermissionUtils.hasAllFilesPermission())
     }
     var hasPermission by remember { mutableStateOf(checkMediaPermission(context)) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
@@ -290,10 +294,13 @@ fun FilesScreen() {
 
     // Storage Volumes & Folder Browser state
     val storageVolumes = remember(hasManageStorage) { FileManagerOps.getAvailableStorageVolumes(context) }
-    var selectedVolumeRootPath by rememberSaveable { mutableStateOf(storageVolumes.first().rootDir.absolutePath) }
-    val rootDir = remember(selectedVolumeRootPath, storageVolumes) {
+    val defaultRootDir = remember(storageVolumes) {
+        storageVolumes.firstOrNull()?.rootDir ?: Environment.getExternalStorageDirectory()
+    }
+    var selectedVolumeRootPath by rememberSaveable { mutableStateOf(defaultRootDir.absolutePath) }
+    val rootDir = remember(selectedVolumeRootPath, storageVolumes, defaultRootDir) {
         storageVolumes.firstOrNull { it.rootDir.absolutePath == selectedVolumeRootPath }?.rootDir
-            ?: storageVolumes.first().rootDir
+            ?: defaultRootDir
     }
     var currentDirPath by rememberSaveable { mutableStateOf(rootDir.absolutePath) }
     val currentDir = remember(currentDirPath, rootDir) {
@@ -393,7 +400,7 @@ fun FilesScreen() {
     val manageStorageLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) {
-        hasManageStorage = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else true
+        hasManageStorage = PermissionUtils.hasAllFilesPermission()
         forceFilesRescan = true
         StorageScanCache.invalidate()
         refreshTrigger++
@@ -443,7 +450,7 @@ fun FilesScreen() {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 hasUsageAccess = checkUsageStatsPermission(context)
-                hasManageStorage = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else true
+                hasManageStorage = PermissionUtils.hasAllFilesPermission()
                 hasPermission = checkMediaPermission(context)
                 interruptedShredPath = if (shredState.isRunning) null else FileShredder.peekInterruptedShredPath(context)
                 refreshTrigger++
@@ -495,7 +502,7 @@ fun FilesScreen() {
         }
         forceFilesRescan = false
         if (categories.isEmpty()) isAnalyzing = true
-        withContext(Dispatchers.IO) {
+        val scanResult = withContext(Dispatchers.IO) {
             val (tot, free) = queryDeviceStorageTotals(context)
             val used = max(0L, tot - free)
 
@@ -514,19 +521,21 @@ fun FilesScreen() {
             var exactAppSize = 0L
             if (checkUsageStatsPermission(context)) {
                 try {
-                    val storageStatsManager = context.getSystemService(Context.STORAGE_STATS_SERVICE) as StorageStatsManager
-                    val pm = context.packageManager
-                    val packages = pm.getInstalledApplications(0)
-                    val seenUids = HashSet<Int>(packages.size)
-                    for (app in packages) {
-                        if (!seenUids.add(app.uid)) continue
-                        try {
-                            val stats = storageStatsManager.queryStatsForUid(StorageManager.UUID_DEFAULT, app.uid)
-                            exactAppSize += stats.appBytes + stats.dataBytes + stats.cacheBytes
-                        } catch (_: Exception) {
+                    val storageStatsManager = context.getSystemService(Context.STORAGE_STATS_SERVICE) as? StorageStatsManager
+                    if (storageStatsManager != null) {
+                        val pm = context.packageManager
+                        val packages = pm.getInstalledApplications(0)
+                        val seenUids = HashSet<Int>(packages.size)
+                        for (app in packages) {
+                            if (!seenUids.add(app.uid)) continue
+                            try {
+                                val stats = storageStatsManager.queryStatsForUid(StorageManager.UUID_DEFAULT, app.uid)
+                                exactAppSize += stats.appBytes + stats.dataBytes + stats.cacheBytes
+                            } catch (_: Throwable) {
+                            }
                         }
                     }
-                } catch (_: Exception) {
+                } catch (_: Throwable) {
                 }
             }
 
@@ -553,13 +562,15 @@ fun FilesScreen() {
             cachedFilesPermKey = permKey
             cachedFilesGeneration = currentGen
 
-            totalSpace = tot
-            freeSpace = free
-            usedSpace = used
-            categories = newCats
-            recentFiles = recents
-            isAnalyzing = false
+            Triple(Triple(tot, free, used), newCats, recents)
         }
+
+        totalSpace = scanResult.first.first
+        freeSpace = scanResult.first.second
+        usedSpace = scanResult.first.third
+        categories = scanResult.second
+        recentFiles = scanResult.third
+        isAnalyzing = false
     }
 
     LaunchedEffect(currentDir, refreshTrigger, activeSubTab, showHiddenFiles, showOnlyStarred, starredPaths) {
@@ -602,7 +613,7 @@ fun FilesScreen() {
         } else {
             browserItems.filter { it.name.contains(searchQuery.trim(), ignoreCase = true) }
         }
-        baseList.sortedWith { a, b ->
+        baseList.distinctBy { it.file.absolutePath }.sortedWith { a, b ->
             if (a.isDirectory != b.isDirectory) {
                 if (a.isDirectory) -1 else 1
             } else {
@@ -727,8 +738,7 @@ fun FilesScreen() {
     }
 
     // Rename Dialog
-    if (itemForRename != null) {
-        val target = itemForRename!!
+    itemForRename?.let { target ->
         AlertDialog(
             onDismissRequest = { itemForRename = null },
             containerColor = GlassPanel,
@@ -973,8 +983,7 @@ fun FilesScreen() {
     }
 
     // Simpler Single-Item Context Menu Sheet
-    if (itemForMenu != null) {
-        val target = itemForMenu!!
+    itemForMenu?.let { target ->
         val path = target.file.absolutePath
         val isStarred = path in starredPaths
         val isZip = !target.isDirectory && target.file.extension.equals("zip", ignoreCase = true)
@@ -1106,8 +1115,7 @@ fun FilesScreen() {
     }
 
     // File / Folder Properties (Details) Sheet
-    if (itemForDetails != null) {
-        val target = itemForDetails!!
+    itemForDetails?.let { target ->
         FileDetailsSheet(
             item = target,
             onClose = { itemForDetails = null }
@@ -1249,8 +1257,8 @@ fun FilesScreen() {
                         StorageDonutChart(totalSpace, usedSpace, freeSpace, categories)
                     }
 
-                    if (interruptedShredPath != null && !shredState.isRunning) {
-                        val remPath = interruptedShredPath!!
+                    val remPath = interruptedShredPath
+                    if (remPath != null && !shredState.isRunning) {
                         item {
                             GlassCard(modifier = Modifier.fillMaxWidth()) {
                                 Column {
@@ -1324,7 +1332,11 @@ fun FilesScreen() {
                                 title = "Media Access",
                                 subtitle = "Scan photos, videos & docs",
                                 onGrant = {
-                                    permissionLauncher.launch(PermissionUtils.requiredMediaPermissions())
+                                    try {
+                                        permissionLauncher.launch(PermissionUtils.requiredMediaPermissions())
+                                    } catch (_: Throwable) {
+                                        PermissionUtils.launchAppDetailsSettings(context)
+                                    }
                                 }
                             )
                         }
@@ -1340,7 +1352,7 @@ fun FilesScreen() {
                                 onGrant = {
                                     try {
                                         manageStorageLauncher.launch(PermissionUtils.buildAllFilesAccessIntent(context))
-                                    } catch (_: Exception) {
+                                    } catch (_: Throwable) {
                                         PermissionUtils.launchAllFilesAccessSettings(context)
                                     }
                                 }
@@ -1356,7 +1368,11 @@ fun FilesScreen() {
                                 title = "App Size Access",
                                 subtitle = "Measure exact app cache & storage",
                                 onGrant = {
-                                    usageAccessLauncher.launch(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                                    try {
+                                        usageAccessLauncher.launch(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                                    } catch (_: Throwable) {
+                                        PermissionUtils.launchUsageAccessSettings(context)
+                                    }
                                 }
                             )
                         }
@@ -1840,8 +1856,7 @@ fun FilesScreen() {
                     Spacer(modifier = Modifier.height(8.dp))
 
                     // Clipboard Paste Bar (when Copy or Move is active)
-                    if (clipboard != null) {
-                        val clip = clipboard!!
+                    clipboard?.let { clip ->
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -1911,8 +1926,9 @@ fun FilesScreen() {
                                 modifier = Modifier.padding(start = 4.dp)
                             )
                             Row(horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
-                                if (selectedPaths.size == 1) {
-                                    val singleFile = File(selectedPaths.first())
+                                val singleSelectedPath = if (selectedPaths.size == 1) selectedPaths.firstOrNull() else null
+                                if (singleSelectedPath != null) {
+                                    val singleFile = File(singleSelectedPath)
                                     MiniBarAction(Icons.Default.Edit, "Rename", AuraCyan) {
                                         renameInput = singleFile.name
                                         itemForRename = toBrowserFileItem(singleFile)
@@ -1930,8 +1946,14 @@ fun FilesScreen() {
                                 }
                                 MiniBarAction(Icons.Default.Archive, "Zip", AuraGreen) {
                                     val targets = selectedPaths.map { File(it) }
+                                    if (targets.isEmpty()) return@MiniBarAction
                                     coroutineScope.launch {
-                                        val archiveName = if (targets.size == 1) "${targets.first().nameWithoutExtension}.zip" else "archive_${System.currentTimeMillis() / 1000}.zip"
+                                        val firstTarget = targets.firstOrNull()
+                                        val archiveName = if (targets.size == 1 && firstTarget != null) {
+                                            "${firstTarget.nameWithoutExtension}.zip"
+                                        } else {
+                                            "archive_${System.currentTimeMillis() / 1000}.zip"
+                                        }
                                         val ok = withContext(Dispatchers.IO) {
                                             FileManagerOps.compressFilesToZip(targets, File(currentDir, archiveName))
                                         }
@@ -2127,13 +2149,21 @@ private fun FileDetailsSheet(
     var sha256Hash by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(item.file) {
-        withContext(Dispatchers.IO) {
-            if (item.isDirectory) {
-                calculatedSize = FileManagerOps.computeRecursiveSize(item.file)
-            } else if (item.sizeBytes in 1..(50L * 1024 * 1024)) {
-                sha256Hash = FileManagerOps.computeSha256Short(item.file)
+        val computed = withContext(Dispatchers.IO) {
+            try {
+                if (item.isDirectory) {
+                    FileManagerOps.computeRecursiveSize(item.file) to null
+                } else if (item.sizeBytes in 1..(50L * 1024 * 1024)) {
+                    item.sizeBytes to FileManagerOps.computeSha256Short(item.file)
+                } else {
+                    item.sizeBytes to null
+                }
+            } catch (_: Throwable) {
+                item.sizeBytes to null
             }
         }
+        calculatedSize = computed.first
+        sha256Hash = computed.second
     }
 
     val dateStr = remember(item.lastModified) {
@@ -2170,8 +2200,8 @@ private fun FileDetailsSheet(
             InfoRow("SIZE", formatBytes(calculatedSize))
             InfoRow("MODIFIED", dateStr)
             InfoRow("ACCESS", perms)
-            if (sha256Hash != null) {
-                InfoRow("SHA-256", sha256Hash!!)
+            sha256Hash?.let { hash ->
+                InfoRow("SHA-256", hash)
             }
             Spacer(modifier = Modifier.height(8.dp))
             Text("PATH", style = MaterialTheme.typography.labelSmall, color = TextTertiary)
@@ -2293,9 +2323,10 @@ private fun ExplorerThumbnail(
         modifier = modifier.background(tint.copy(alpha = 0.16f)),
         contentAlignment = Alignment.Center
     ) {
-        if (bitmap != null) {
+        val safeBmp = remember(bitmap) { bitmap.toSafeComposeBitmap() }
+        if (safeBmp != null) {
             Image(
-                bitmap = bitmap!!.asImageBitmap(),
+                bitmap = safeBmp.asImageBitmap(),
                 contentDescription = file.name,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()
@@ -2523,8 +2554,8 @@ private fun shareFileWithProvider(context: Context, file: File) {
             putExtra(Intent.EXTRA_STREAM, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        context.startActivity(Intent.createChooser(intent, "Share file"))
-    } catch (_: Exception) {
+        context.safeStartActivity(Intent.createChooser(intent, "Share file"), "Unable to share file")
+    } catch (_: Throwable) {
         Toast.makeText(context, "Unable to share file", Toast.LENGTH_SHORT).show()
     }
 }

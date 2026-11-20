@@ -128,6 +128,7 @@ fun PrivacyShieldScreen() {
     var telemetrySummary by remember { mutableStateOf(PrivacyAnalyzer.peekCachedTelemetry(false)) }
     var changeEvents by remember { mutableStateOf(PrivacyAnalyzer.peekCachedChanges() ?: emptyList()) }
     var isLoading by remember { mutableStateOf(summary == null) }
+    var isTelemetryLoading by remember { mutableStateOf(false) }
 
     // Sub-tab filter & sort states
     var activeAppFilter by remember { mutableStateOf("ALL") }
@@ -157,7 +158,7 @@ fun PrivacyShieldScreen() {
     LaunchedEffect(refreshTrigger, globalRefreshVersion, includeSystemApps) {
         isLoading = summary == null
         val forceFresh = refreshTrigger > 1 || globalRefreshVersion > 0
-        val (privResult, changes, telemResult) = withContext(Dispatchers.IO) {
+        val (privResult, changes) = withContext(Dispatchers.IO) {
             val priv = PrivacyAnalyzer.analyzeDevicePrivacy(
                 context,
                 includeSystemApps = includeSystemApps,
@@ -168,23 +169,35 @@ fun PrivacyShieldScreen() {
                 currentReports = priv.appReports,
                 dispatchNotifications = true
             )
-            val telem = PrivacyAnalyzer.analyzeAppTelemetryAndTrackers(
+            priv to chg
+        }
+        summary = privResult
+        changeEvents = changes
+        if (selectedAppForModal != null) {
+            selectedAppForModal = privResult.appReports.find { r -> r.packageName == selectedAppForModal?.packageName }
+        }
+        isLoading = false
+    }
+
+    // Load Ad/Tracker Telemetry lazily when the user actually visits TRACKERS (or refreshes an already-loaded telemetry snapshot)
+    LaunchedEffect(activeSubTab, refreshTrigger, globalRefreshVersion, includeSystemApps) {
+        if (activeSubTab != "TRACKERS" && telemetrySummary == null) return@LaunchedEffect
+        if (telemetrySummary == null) {
+            isTelemetryLoading = true
+        }
+        val forceFresh = refreshTrigger > 1 || globalRefreshVersion > 0
+        val telemResult = withContext(Dispatchers.IO) {
+            PrivacyAnalyzer.analyzeAppTelemetryAndTrackers(
                 context,
                 includeSystemApps = includeSystemApps,
                 forceRefresh = forceFresh
             )
-            Triple(priv, chg, telem)
         }
-        summary = privResult
-        changeEvents = changes
         telemetrySummary = telemResult
-        if (selectedAppForModal != null) {
-            selectedAppForModal = privResult.appReports.find { r -> r.packageName == selectedAppForModal?.packageName }
-        }
         if (selectedTrackerApp != null) {
             selectedTrackerApp = telemResult.appReports.find { r -> r.packageName == selectedTrackerApp?.packageName }
         }
-        isLoading = false
+        isTelemetryLoading = false
     }
 
     val currentSummary = summary
@@ -275,8 +288,7 @@ fun PrivacyShieldScreen() {
     }
 
     // App Permission Bottom Sheet
-    if (selectedAppForModal != null) {
-        val app = selectedAppForModal!!
+    selectedAppForModal?.let { app ->
         ModalBottomSheet(
             onDismissRequest = { selectedAppForModal = null },
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
@@ -305,8 +317,7 @@ fun PrivacyShieldScreen() {
     }
 
     // Tracker Inspection Bottom Sheet
-    if (selectedTrackerApp != null) {
-        val app = selectedTrackerApp!!
+    selectedTrackerApp?.let { app ->
         ModalBottomSheet(
             onDismissRequest = { selectedTrackerApp = null },
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
@@ -722,6 +733,11 @@ fun PrivacyShieldScreen() {
 
                 "TRACKERS" -> {
                     val telem = currentTelemetry
+                    if (isTelemetryLoading && telem == null) {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator(color = AuraPurple, strokeWidth = 2.dp)
+                        }
+                    } else {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -758,10 +774,11 @@ fun PrivacyShieldScreen() {
                                 .clickable {
                                     try {
                                         context.startActivity(Intent("com.google.android.gms.settings.ADS_PRIVACY"))
-                                    } catch (_: Exception) {
+                                    } catch (_: Throwable) {
                                         try {
                                             context.startActivity(Intent(Settings.ACTION_PRIVACY_SETTINGS))
-                                        } catch (_: Exception) {}
+                                        } catch (_: Throwable) {
+                                        }
                                     }
                                 }
                                 .padding(horizontal = 11.dp, vertical = 6.dp),
@@ -853,6 +870,7 @@ fun PrivacyShieldScreen() {
                                 )
                             }
                         }
+                    }
                     }
                 }
             }

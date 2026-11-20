@@ -56,13 +56,13 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `live guard monitor runs 10 point deep audit, ignore list, and logs events`() {
+    fun `live guard monitor runs 12 point deep audit, ignore list, and logs events`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val monitor = LiveGuardMonitor.getInstance(context)
         monitor.startMonitoring()
 
         val vectors = monitor.runDeepSecurityAudit(includeSystemApps = false)
-        assertEquals(10, vectors.size)
+        assertEquals(12, vectors.size)
         assertTrue(vectors.any { it.id == "bg_location" })
         assertTrue(vectors.any { it.id == "clipboard_access" })
 

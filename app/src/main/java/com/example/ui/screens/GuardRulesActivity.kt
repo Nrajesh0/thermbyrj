@@ -157,7 +157,7 @@ private fun openGuardNotificationSettings(context: Context) {
     }
     try {
         context.startActivity(intent)
-    } catch (_: Exception) {
+    } catch (_: Throwable) {
         try {
             context.startActivity(
                 Intent(
@@ -165,7 +165,7 @@ private fun openGuardNotificationSettings(context: Context) {
                     Uri.fromParts("package", context.packageName, null)
                 )
             )
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
     }
 }
@@ -361,7 +361,11 @@ fun GuardRulesScreen(onBack: () -> Unit) {
                                             prefs.edit().putBoolean("live_guard_alerts", true).commit()
                                         }
                                         Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> {
-                                            notificationPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                            try {
+                                                notificationPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                            } catch (_: Throwable) {
+                                                openGuardNotificationSettings(context)
+                                            }
                                         }
                                         else -> openGuardNotificationSettings(context)
                                     }
@@ -470,7 +474,7 @@ fun GuardRulesScreen(onBack: () -> Unit) {
                                 .clickable {
                                     try {
                                         context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
-                                    } catch (_: Exception) {
+                                    } catch (_: Throwable) {
                                     }
                                 }
                                 .padding(horizontal = 10.dp, vertical = 6.dp)

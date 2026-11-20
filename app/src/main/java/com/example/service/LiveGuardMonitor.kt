@@ -47,6 +47,7 @@ data class LiveCaptureState(
     val isClipboardAccessedRecently: Boolean = false,
     val recentClipboardApps: List<String> = emptyList(),
     val isVpnOrProxyActive: Boolean = false,
+    val isAppOpsIntrospectionAvailable: Boolean = false,
     val lastUpdatedMs: Long = System.currentTimeMillis()
 )
 
@@ -81,9 +82,14 @@ data class GuardEvent(
 
 class LiveGuardMonitor private constructor(private val context: Context) {
 
-    private val displayManager = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
-    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-    private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    private val displayManager = context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+    private val mediaRouter = try {
+        context.getSystemService(Context.MEDIA_ROUTER_SERVICE) as? android.media.MediaRouter
+    } catch (_: Throwable) {
+        null
+    }
+    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+    private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
     private val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
     private val mainHandler = Handler(Looper.getMainLooper())
     private val bgExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
@@ -151,11 +157,16 @@ class LiveGuardMonitor private constructor(private val context: Context) {
     private var isScreenInteractive = true
     private var screenReceiverRegistered = false
     private var displayListenerRegistered = false
+    private var mediaRouterCallbackRegistered = false
     private var audioCallbackRegistered = false
     private var cameraCallbackRegistered = false
     private var clipboardListenerRegistered = false
     private var videoObserverRegistered = false
     private var settingsObserverRegistered = false
+    @Volatile
+    private var activeMediaRouterMirrorRoute: String? = null
+    @Volatile
+    private var appOpsIntrospectionAvailable: Boolean = false
 
     @Volatile
     private var pendingMicLogRunnable: Runnable? = null
@@ -395,25 +406,86 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         }
 
         override fun onChange(selfChange: Boolean, uri: android.net.Uri?) {
-            super.onChange(selfChange, uri)
-            mainHandler.removeCallbacks(debouncedSettingsAuditRunnable)
-            mainHandler.postDelayed(debouncedSettingsAuditRunnable, 400L)
+            try {
+                super.onChange(selfChange, uri)
+                mainHandler.removeCallbacks(debouncedSettingsAuditRunnable)
+                mainHandler.postDelayed(debouncedSettingsAuditRunnable, 400L)
+            } catch (_: Throwable) {
+            }
         }
     }
 
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) {
-            // Allow OEM Smart Sidebar / freeform window transition to finish before checking displays
-            scheduleDisplayCaptureRefresh(triggerAlertIfNew = true, delayMs = 750L)
+            try {
+                // Allow OEM Smart Sidebar / freeform window transition to finish before checking displays
+                scheduleDisplayCaptureRefresh(triggerAlertIfNew = true, delayMs = 750L)
+            } catch (_: Throwable) {
+            }
         }
 
         override fun onDisplayRemoved(displayId: Int) {
-            scheduleDisplayCaptureRefresh(triggerAlertIfNew = false, delayMs = 600L)
+            try {
+                scheduleDisplayCaptureRefresh(triggerAlertIfNew = false, delayMs = 600L)
+            } catch (_: Throwable) {
+            }
         }
 
         override fun onDisplayChanged(displayId: Int) {
-            // Coalesce frequent refresh-rate/brightness/PiP/sidebar onDisplayChanged bursts off the main thread
-            scheduleDisplayCaptureRefresh(triggerAlertIfNew = true, delayMs = 800L)
+            try {
+                // Coalesce frequent refresh-rate/brightness/PiP/sidebar onDisplayChanged bursts off the main thread
+                scheduleDisplayCaptureRefresh(triggerAlertIfNew = true, delayMs = 800L)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun updateMediaRouterMirrorStateOnMain(triggerRefreshOnChange: Boolean) {
+        try {
+            val router = mediaRouter ?: return
+            val liveVideoRoute = router.getSelectedRoute(android.media.MediaRouter.ROUTE_TYPE_LIVE_VIDEO)
+            val detectedRoute: String? = if (liveVideoRoute != null) {
+                val presDisplay = liveVideoRoute.presentationDisplay
+                val routeName = liveVideoRoute.name?.toString().orEmpty()
+                val isNonDefaultVideoRoute = presDisplay != null ||
+                    (liveVideoRoute != router.defaultRoute &&
+                        (routeName.contains("cast", ignoreCase = true) ||
+                            routeName.contains("mirror", ignoreCase = true) ||
+                            routeName.contains("tv", ignoreCase = true) ||
+                            routeName.contains("display", ignoreCase = true) ||
+                            routeName.contains("wireless", ignoreCase = true)))
+                if (isNonDefaultVideoRoute) {
+                    if (routeName.isNotBlank()) "Screen Mirroring ($routeName)" else "Screen Mirroring Route"
+                } else {
+                    null
+                }
+            } else {
+                null
+            }
+            val changed = activeMediaRouterMirrorRoute != detectedRoute
+            activeMediaRouterMirrorRoute = detectedRoute
+            if (triggerRefreshOnChange && changed) {
+                scheduleDisplayCaptureRefresh(triggerAlertIfNew = detectedRoute != null, delayMs = 250L)
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    private val mediaRouterCallback = object : android.media.MediaRouter.SimpleCallback() {
+        override fun onRouteSelected(router: android.media.MediaRouter?, type: Int, info: android.media.MediaRouter.RouteInfo?) {
+            updateMediaRouterMirrorStateOnMain(triggerRefreshOnChange = true)
+        }
+
+        override fun onRouteUnselected(router: android.media.MediaRouter?, type: Int, info: android.media.MediaRouter.RouteInfo?) {
+            updateMediaRouterMirrorStateOnMain(triggerRefreshOnChange = true)
+        }
+
+        override fun onRoutePresentationDisplayChanged(router: android.media.MediaRouter?, info: android.media.MediaRouter.RouteInfo?) {
+            updateMediaRouterMirrorStateOnMain(triggerRefreshOnChange = true)
+        }
+
+        override fun onRouteChanged(router: android.media.MediaRouter?, info: android.media.MediaRouter.RouteInfo?) {
+            updateMediaRouterMirrorStateOnMain(triggerRefreshOnChange = true)
         }
     }
 
@@ -423,34 +495,46 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         }
 
         override fun onChange(selfChange: Boolean, uri: android.net.Uri?) {
-            super.onChange(selfChange, uri)
-            scheduleDisplayCaptureRefresh(triggerAlertIfNew = true, delayMs = 450L)
+            try {
+                super.onChange(selfChange, uri)
+                scheduleDisplayCaptureRefresh(triggerAlertIfNew = true, delayMs = 450L)
+            } catch (_: Throwable) {
+            }
         }
     }
 
     private val clipChangedListener = ClipboardManager.OnPrimaryClipChangedListener {
-        // Re-check clipboard access shortly after clip changes so background snooping apps are caught immediately
-        mainHandler.removeCallbacks(debouncedClipboardRunnable)
-        mainHandler.postDelayed(debouncedClipboardRunnable, 650L)
+        try {
+            // Re-check clipboard access shortly after clip changes so background snooping apps are caught immediately
+            mainHandler.removeCallbacks(debouncedClipboardRunnable)
+            mainHandler.postDelayed(debouncedClipboardRunnable, 650L)
+        } catch (_: Throwable) {
+        }
     }
 
     private val screenStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context?, intent: Intent?) {
-            when (intent?.action) {
-                Intent.ACTION_SCREEN_OFF -> {
-                    isScreenInteractive = false
-                    if (_rulesConfig.value.pausePollingScreenOff) {
-                        mainHandler.removeCallbacks(periodicMonitorRunnable)
+            try {
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_OFF -> {
+                        isScreenInteractive = false
+                        if (_rulesConfig.value.pausePollingScreenOff) {
+                            mainHandler.removeCallbacks(periodicMonitorRunnable)
+                        }
+                    }
+                    Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
+                        isScreenInteractive = true
+                        if (isMonitoring) {
+                            mainHandler.removeCallbacks(periodicMonitorRunnable)
+                            mainHandler.postDelayed(periodicMonitorRunnable, 1500L)
+                            bgExecutor.execute { refreshAllStates() }
+                            if (intent.action == Intent.ACTION_USER_PRESENT && synchronized(busyCameras) { busyCameras.isNotEmpty() }) {
+                                updateCameraState()
+                            }
+                        }
                     }
                 }
-                Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
-                    isScreenInteractive = true
-                    if (isMonitoring) {
-                        mainHandler.removeCallbacks(periodicMonitorRunnable)
-                        mainHandler.postDelayed(periodicMonitorRunnable, 1500L)
-                        bgExecutor.execute { refreshAllStates() }
-                    }
-                }
+            } catch (_: Throwable) {
             }
         }
     }
@@ -461,32 +545,35 @@ class LiveGuardMonitor private constructor(private val context: Context) {
 
     private val packageChangeReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context?, intent: Intent?) {
-            val action = intent?.action ?: return
-            if (action == Intent.ACTION_PACKAGE_ADDED ||
-                action == Intent.ACTION_PACKAGE_REPLACED ||
-                action == Intent.ACTION_PACKAGE_REMOVED
-            ) {
-                bgExecutor.execute {
-                    try {
-                        PrivacyAnalyzer.invalidateAllCaches()
-                        cachedAuditVectors = null
-                        cachedAuditVectorsTimeMs = 0L
-                        val summary = PrivacyAnalyzer.analyzeDevicePrivacy(
-                            context,
-                            includeSystemApps = false,
-                            forceRefresh = true
-                        )
-                        PrivacyAnalyzer.getPrivacyChanges(
-                            context = context,
-                            currentReports = summary.appReports,
-                            dispatchNotifications = true
-                        )
-                        val vectors = runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = false)
-                        evaluateAndNotifyLiveGuardChecks(vectors)
-                        lastPermissionDiffCheckMs = System.currentTimeMillis()
-                    } catch (_: Throwable) {
+            try {
+                val action = intent?.action ?: return
+                if (action == Intent.ACTION_PACKAGE_ADDED ||
+                    action == Intent.ACTION_PACKAGE_REPLACED ||
+                    action == Intent.ACTION_PACKAGE_REMOVED
+                ) {
+                    bgExecutor.execute {
+                        try {
+                            PrivacyAnalyzer.invalidateAllCaches()
+                            cachedAuditVectors = null
+                            cachedAuditVectorsTimeMs = 0L
+                            val summary = PrivacyAnalyzer.analyzeDevicePrivacy(
+                                context,
+                                includeSystemApps = false,
+                                forceRefresh = true
+                            )
+                            PrivacyAnalyzer.getPrivacyChanges(
+                                context = context,
+                                currentReports = summary.appReports,
+                                dispatchNotifications = true
+                            )
+                            val vectors = runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = false)
+                            evaluateAndNotifyLiveGuardChecks(vectors)
+                            lastPermissionDiffCheckMs = System.currentTimeMillis()
+                        } catch (_: Throwable) {
+                        }
                     }
                 }
+            } catch (_: Throwable) {
             }
         }
     }
@@ -606,7 +693,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                             bgExecutor.execute {
                                 try {
                                     val currentConfigs = try {
-                                        audioManager.activeRecordingConfigurations.toList()
+                                        audioManager?.activeRecordingConfigurations?.toList() ?: emptyList()
                                     } catch (_: Throwable) {
                                         emptyList()
                                     }
@@ -655,7 +742,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                             bgExecutor.execute {
                                 try {
                                     val currentConfigs = try {
-                                        audioManager.activeRecordingConfigurations.toList()
+                                        audioManager?.activeRecordingConfigurations?.toList() ?: emptyList()
                                     } catch (_: Throwable) {
                                         emptyList()
                                     }
@@ -704,30 +791,42 @@ class LiveGuardMonitor private constructor(private val context: Context) {
 
     private val cameraCallback = object : CameraManager.AvailabilityCallback() {
         override fun onCameraAvailable(cameraId: String) {
-            super.onCameraAvailable(cameraId)
-            synchronized(busyCameras) {
-                busyCameras.remove(cameraId)
+            try {
+                super.onCameraAvailable(cameraId)
+                synchronized(busyCameras) {
+                    busyCameras.remove(cameraId)
+                }
+                updateCameraState()
+            } catch (_: Throwable) {
             }
-            updateCameraState()
         }
 
         override fun onCameraUnavailable(cameraId: String) {
-            super.onCameraUnavailable(cameraId)
-            synchronized(busyCameras) {
-                busyCameras.add(cameraId)
+            try {
+                super.onCameraUnavailable(cameraId)
+                synchronized(busyCameras) {
+                    busyCameras.add(cameraId)
+                }
+                updateCameraState()
+            } catch (_: Throwable) {
             }
-            updateCameraState()
         }
     }
 
     init {
-        PreferencesBackupManager.autoRestoreIfCleared(context)
-        loadSavedEvents()
-        loadRulesConfig()
-        loadTrustedRules()
-        loadSnoozes()
-        loadAcknowledgedVectors()
-        loadKnownVectorBaseline()
+        try {
+            PreferencesBackupManager.autoRestoreIfCleared(context)
+        } catch (_: Throwable) {
+        }
+        try {
+            loadSavedEvents()
+            loadRulesConfig()
+            loadTrustedRules()
+            loadSnoozes()
+            loadAcknowledgedVectors()
+            loadKnownVectorBaseline()
+        } catch (_: Throwable) {
+        }
     }
 
     fun reloadPersistedState() {
@@ -1084,20 +1183,24 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         }
     }
 
-    private fun isScreenInteractiveAndUnlocked(): Boolean {
-        if (!isDeviceScreenInteractive()) return false
+    private fun isDeviceKeyguardLocked(): Boolean {
         return try {
             val km = context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
-            km?.isKeyguardLocked != true
+            km?.isKeyguardLocked == true
         } catch (_: Exception) {
-            true
+            false
         }
+    }
+
+    private fun isScreenInteractiveAndUnlocked(): Boolean {
+        if (!isDeviceScreenInteractive()) return false
+        return !isDeviceKeyguardLocked()
     }
 
     private fun isActivePhoneOrVoipCall(audioConfigs: List<AudioRecordingConfiguration>): Boolean {
         val mode = try {
-            audioManager.mode
-        } catch (_: Exception) {
+            audioManager?.mode ?: AudioManager.MODE_NORMAL
+        } catch (_: Throwable) {
             AudioManager.MODE_NORMAL
         }
         if (mode == AudioManager.MODE_IN_CALL || mode == AudioManager.MODE_IN_COMMUNICATION) {
@@ -1106,7 +1209,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         return audioConfigs.any { cfg ->
             try {
                 cfg.clientAudioSource == MediaRecorder.AudioSource.VOICE_COMMUNICATION
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
                 false
             }
         }
@@ -1125,8 +1228,8 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         ) {
             val configsToCheck = audioConfigs.ifEmpty {
                 try {
-                    audioManager.activeRecordingConfigurations
-                } catch (_: Exception) {
+                    audioManager?.activeRecordingConfigurations ?: emptyList()
+                } catch (_: Throwable) {
                     emptyList()
                 }
             }
@@ -1304,22 +1407,52 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         }
         if (!displayListenerRegistered) {
             try {
-                displayManager.registerDisplayListener(displayListener, mainHandler)
-                displayListenerRegistered = true
+                val dm = displayManager
+                if (dm != null) {
+                    dm.registerDisplayListener(displayListener, mainHandler)
+                    displayListenerRegistered = true
+                }
             } catch (_: Throwable) {
+            }
+        }
+        if (!mediaRouterCallbackRegistered && mediaRouter != null) {
+            val registerRouter = {
+                if (isMonitoring && !mediaRouterCallbackRegistered) {
+                    try {
+                        mediaRouter.addCallback(
+                            android.media.MediaRouter.ROUTE_TYPE_LIVE_VIDEO,
+                            mediaRouterCallback,
+                            android.media.MediaRouter.CALLBACK_FLAG_UNFILTERED_EVENTS
+                        )
+                        mediaRouterCallbackRegistered = true
+                        updateMediaRouterMirrorStateOnMain(triggerRefreshOnChange = false)
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                registerRouter()
+            } else {
+                mainHandler.post(registerRouter)
             }
         }
         if (!audioCallbackRegistered) {
             try {
-                audioManager.registerAudioRecordingCallback(audioRecordingCallback, mainHandler)
-                audioCallbackRegistered = true
+                val am = audioManager
+                if (am != null) {
+                    am.registerAudioRecordingCallback(audioRecordingCallback, mainHandler)
+                    audioCallbackRegistered = true
+                }
             } catch (_: Throwable) {
             }
         }
         if (!cameraCallbackRegistered) {
             try {
-                cameraManager.registerAvailabilityCallback(cameraCallback, mainHandler)
-                cameraCallbackRegistered = true
+                val cm = cameraManager
+                if (cm != null) {
+                    cm.registerAvailabilityCallback(cameraCallback, mainHandler)
+                    cameraCallbackRegistered = true
+                }
             } catch (_: Throwable) {
             }
         }
@@ -1401,21 +1534,36 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         }
         if (displayListenerRegistered) {
             try {
-                displayManager.unregisterDisplayListener(displayListener)
+                displayManager?.unregisterDisplayListener(displayListener)
             } catch (_: Throwable) {
             }
             displayListenerRegistered = false
         }
+        if (mediaRouterCallbackRegistered) {
+            val unregisterRouter = {
+                try {
+                    mediaRouter?.removeCallback(mediaRouterCallback)
+                } catch (_: Throwable) {
+                }
+                mediaRouterCallbackRegistered = false
+                activeMediaRouterMirrorRoute = null
+            }
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                unregisterRouter()
+            } else {
+                mainHandler.post(unregisterRouter)
+            }
+        }
         if (audioCallbackRegistered) {
             try {
-                audioManager.unregisterAudioRecordingCallback(audioRecordingCallback)
+                audioManager?.unregisterAudioRecordingCallback(audioRecordingCallback)
             } catch (_: Throwable) {
             }
             audioCallbackRegistered = false
         }
         if (cameraCallbackRegistered) {
             try {
-                cameraManager.unregisterAvailabilityCallback(cameraCallback)
+                cameraManager?.unregisterAvailabilityCallback(cameraCallback)
             } catch (_: Throwable) {
             }
             cameraCallbackRegistered = false
@@ -1474,12 +1622,12 @@ class LiveGuardMonitor private constructor(private val context: Context) {
     ) {
         try {
             val configs = try {
-                audioManager.activeRecordingConfigurations.toList()
+                audioManager?.activeRecordingConfigurations?.toList() ?: emptyList()
             } catch (_: Throwable) {
                 emptyList()
             }
             val audioMode = try {
-                audioManager.mode
+                audioManager?.mode ?: AudioManager.MODE_NORMAL
             } catch (_: Throwable) {
                 AudioManager.MODE_NORMAL
             }
@@ -1496,22 +1644,15 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     preloadedPkgOpsList = preloadedPkgOpsList,
                     preloadedUsageSnapshot = usageSnapshot
                 ).toMutableList()
-                if (base.isEmpty() && isInCallOrComm) {
-                    // During cellular or VoIP calls, identify the active dialer / call app immediately
-                    val callCandidates = buildList {
-                        usageSnapshot.activeForegroundPackage?.let { add(it) }
-                        usageSnapshot.lastNonSelfForegroundPackage?.let { add(it) }
-                        addAll(usageSnapshot.activeForegroundServicePackages)
-                    }.distinct()
+                if (base.isEmpty() && isInCallOrComm && isScreenInteractiveAndUnlocked()) {
+                    // Only attribute to the currently active unlocked foreground app (never guess from unrelated background services)
+                    val fgPkg = usageSnapshot.activeForegroundPackage
                     val pm = context.packageManager
-                    for (cand in callCandidates) {
-                        if (cand == context.packageName || cand in getLauncherPackages()) continue
-                        val hasCallOrMicPerm = pm.checkPermission(android.Manifest.permission.RECORD_AUDIO, cand) == android.content.pm.PackageManager.PERMISSION_GRANTED ||
-                            pm.checkPermission(android.Manifest.permission.READ_PHONE_STATE, cand) == android.content.pm.PackageManager.PERMISSION_GRANTED ||
-                            pm.checkPermission(android.Manifest.permission.CALL_PHONE, cand) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                    if (fgPkg != null && fgPkg != context.packageName && fgPkg !in getLauncherPackages()) {
+                        val hasCallOrMicPerm = pm.checkPermission(android.Manifest.permission.RECORD_AUDIO, fgPkg) == android.content.pm.PackageManager.PERMISSION_GRANTED ||
+                            pm.checkPermission(android.Manifest.permission.CALL_PHONE, fgPkg) == android.content.pm.PackageManager.PERMISSION_GRANTED
                         if (hasCallOrMicPerm) {
-                            base.add(cand to resolveAppLabel(cand))
-                            break
+                            base.add(fgPkg to resolveAppLabel(fgPkg))
                         }
                     }
                 }
@@ -1585,9 +1726,11 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         }
     }
 
-    private fun updateCameraState() {
+    internal fun updateCameraState() {
         val currentBusy = synchronized(busyCameras) { busyCameras.toSet() }
-        val isCamNow = currentBusy.isNotEmpty()
+        // Ignore transient lock-screen camera activations (Face Unlock / biometric camera warm-up)
+        val isKeyguardLocked = isDeviceKeyguardLocked()
+        val isCamNow = currentBusy.isNotEmpty() && !isKeyguardLocked
         bgExecutor.execute {
             try {
                 val resolvedCam = if (isCamNow) {
@@ -1603,8 +1746,8 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     (resolvedCam.isEmpty() && isGlobalSensorSnoozed(GuardSensorType.CAMERA))
                 _captureState.value = _captureState.value.copy(
                     isCameraActive = isCamNow && !shouldSuppressAlert,
-                    busyCameraIds = if (shouldSuppressAlert) emptySet() else currentBusy,
-                    activeCameraApps = unignoredCam.map { it.second },
+                    busyCameraIds = if (isCamNow && !shouldSuppressAlert) currentBusy else emptySet(),
+                    activeCameraApps = if (isCamNow && !shouldSuppressAlert) unignoredCam.map { it.second } else emptyList(),
                     lastUpdatedMs = System.currentTimeMillis()
                 )
                 if (!isCamNow || shouldSuppressAlert) {
@@ -1629,7 +1772,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                         bgExecutor.execute {
                             try {
                                 val busyNow = synchronized(busyCameras) { busyCameras.toSet() }
-                                if (busyNow.isEmpty() || lastCameraLogged) return@execute
+                                if (busyNow.isEmpty() || isDeviceKeyguardLocked() || lastCameraLogged) return@execute
 
                                 val freshResolved = resolveActiveSensorApps(
                                     targetOpStr = "android:camera",
@@ -1673,7 +1816,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                         bgExecutor.execute {
                             try {
                                 val busyNow = synchronized(busyCameras) { busyCameras.toSet() }
-                                if (busyNow.isEmpty() || lastCameraAlertDispatched) return@execute
+                                if (busyNow.isEmpty() || isDeviceKeyguardLocked() || lastCameraAlertDispatched) return@execute
 
                                 val freshResolved = resolveActiveSensorApps(
                                     targetOpStr = "android:camera",
@@ -1737,7 +1880,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 }
             }
             return try {
-                val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+                val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return cachedPkgOpsList
                 val method = appOpsGetPackagesForOpsMethod ?: return cachedPkgOpsList
                 // Pass targetedAppOpIds instead of null so AppOpsService filters in system_server
                 // and returns a ~15KB Binder parcel instead of a 700KB+ parcel of all 140 ops across 300 packages.
@@ -1746,12 +1889,26 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     method.invoke(appOps, opIds) as? List<*>
                 } catch (_: Throwable) {
                     null
-                }) ?: (method.invoke(appOps, null) as? List<*>)
-                result?.also {
-                    cachedPkgOpsList = it
+                }) ?: (try {
+                    method.invoke(appOps, null) as? List<*>
+                } catch (_: Throwable) {
+                    null
+                })
+                if (result != null) {
+                    appOpsIntrospectionAvailable = true
+                    cachedPkgOpsList = result
                     cachedPkgOpsTimeMs = System.currentTimeMillis()
-                } ?: cachedPkgOpsList
+                    result
+                } else {
+                    if (cachedPkgOpsList == null) {
+                        appOpsIntrospectionAvailable = false
+                    }
+                    cachedPkgOpsList
+                }
             } catch (_: Throwable) {
+                if (cachedPkgOpsList == null) {
+                    appOpsIntrospectionAvailable = false
+                }
                 cachedPkgOpsList
             }
         }
@@ -1874,10 +2031,11 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             }
         }
 
-        // 3. UsageStatsManager fallback:
-        // Attribute to the currently RESUMED foreground app, OR if the user just switched to `dot` (or home screen)
-        // while a call/recording is ongoing, check active foreground services and the just-active app!
-        if (foundPackages.isEmpty()) {
+        // 3. Conservative UsageStatsManager fallback:
+        // Only attribute to the currently RESUMED foreground app while the screen is unlocked.
+        // Never blindly blame unrelated background foreground-service apps merely because they hold a permission;
+        // when Android hides the active sensor client UID, leave the caller unnamed rather than accusing the wrong app.
+        if (foundPackages.isEmpty() && isScreenInteractiveAndUnlocked()) {
             val fgSnapshot = preloadedUsageSnapshot ?: queryCombinedUsageState()
             val launchers = getLauncherPackages()
             val fgPkg = fgSnapshot.activeForegroundPackage
@@ -1887,26 +2045,6 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 pm.checkPermission(requiredPermission, fgPkg) == android.content.pm.PackageManager.PERMISSION_GRANTED
             ) {
                 foundPackages.add(fgPkg)
-            } else {
-                // User is likely viewing `dot` while another app is recording in a foreground service or call
-                for (srvPkg in fgSnapshot.activeForegroundServicePackages) {
-                    if (srvPkg != context.packageName &&
-                        srvPkg !in launchers &&
-                        pm.checkPermission(requiredPermission, srvPkg) == android.content.pm.PackageManager.PERMISSION_GRANTED
-                    ) {
-                        foundPackages.add(srvPkg)
-                    }
-                }
-                if (foundPackages.isEmpty()) {
-                    val recentFg = fgSnapshot.lastNonSelfForegroundPackage
-                    if (recentFg != null &&
-                        recentFg != context.packageName &&
-                        recentFg !in launchers &&
-                        pm.checkPermission(requiredPermission, recentFg) == android.content.pm.PackageManager.PERMISSION_GRANTED
-                    ) {
-                        foundPackages.add(recentFg)
-                    }
-                }
             }
         }
 
@@ -1960,7 +2098,8 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         }
         return try {
             val now = System.currentTimeMillis()
-            val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+            val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
+                ?: return ForegroundUsageSnapshot(usageAccessGranted = false, activeForegroundPackage = null, lastLeftForegroundMs = emptyMap())
             val launchers = getLauncherPackages()
             synchronized(usageStatsLock) {
                 val queryStart = if (lastUsageQueryEndMs == 0L || now < lastUsageQueryEndMs || (now - lastUsageQueryEndMs) > 10L * 60_000L) {
@@ -2108,7 +2247,18 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 return
             }
             val fgPkg = fgSnapshot.activeForegroundPackage
-            val pkgOpsList = preloadedPkgOpsList ?: fetchAllPackageOps() ?: return
+            val pkgOpsList = preloadedPkgOpsList ?: fetchAllPackageOps()
+            if (pkgOpsList == null) {
+                _captureState.value = _captureState.value.copy(
+                    isBackgroundLocationActive = false,
+                    activeLocationApps = emptyList(),
+                    isClipboardAccessedRecently = false,
+                    recentClipboardApps = emptyList(),
+                    isAppOpsIntrospectionAvailable = false,
+                    lastUpdatedMs = now
+                )
+                return
+            }
 
             val locPackages = linkedMapOf<String, String>()
             val clipPackages = linkedMapOf<String, String>()
@@ -2116,7 +2266,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             for (pkgOps in pkgOpsList) {
                 if (pkgOps == null) continue
                 val (pkgName, ops) = extractPkgOpsNameAndOps(pkgOps) ?: continue
-                if (pkgName == context.packageName || isPackageIgnored(pkgName)) continue
+                if (pkgName == context.packageName) continue
                 if (pkgName == fgPkg) continue
 
                 val lastLeftFg = fgSnapshot.lastLeftForegroundMs[pkgName] ?: 0L
@@ -2171,6 +2321,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 activeLocationApps = locPackages.values.toList(),
                 isClipboardAccessedRecently = clipPackages.isNotEmpty(),
                 recentClipboardApps = clipPackages.values.toList(),
+                isAppOpsIntrospectionAvailable = true,
                 lastUpdatedMs = now
             )
 
@@ -2250,20 +2401,25 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             // 1. Standard + Presentation + Hidden Virtual Displays (DisplayManager)
             val allDisplays = mutableMapOf<Int, Display>()
             try {
-                displayManager.displays?.forEach { allDisplays[it.displayId] = it }
+                displayManager?.displays?.forEach { allDisplays[it.displayId] = it }
             } catch (_: Throwable) {
             }
             try {
-                displayManager.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION)?.forEach {
+                displayManager?.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION)?.forEach {
                     allDisplays[it.displayId] = it
                 }
             } catch (_: Throwable) {
             }
             try {
-                val allInc = displayManagerGetHiddenMethod?.invoke(
-                    displayManager,
-                    "android.hardware.display.category.ALL_INCLUDING_DISABLED"
-                ) as? Array<*>
+                val dm = displayManager
+                val allInc = if (dm != null) {
+                    displayManagerGetHiddenMethod?.invoke(
+                        dm,
+                        "android.hardware.display.category.ALL_INCLUDING_DISABLED"
+                    ) as? Array<*>
+                } else {
+                    null
+                }
                 allInc?.filterIsInstance<Display>()?.forEach { allDisplays[it.displayId] = it }
             } catch (_: Throwable) {
             }
@@ -2336,36 +2492,18 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 }
             }
 
-            // 1b. MediaRouter active Live Video / Wireless Display / Screen Mirroring route check (only if thread has a Looper)
-            if (Looper.myLooper() != null) {
-                try {
-                    val mediaRouter = context.getSystemService(Context.MEDIA_ROUTER_SERVICE) as? android.media.MediaRouter
-                    val liveVideoRoute = mediaRouter?.getSelectedRoute(android.media.MediaRouter.ROUTE_TYPE_LIVE_VIDEO)
-                    if (liveVideoRoute != null) {
-                        val presDisplay = liveVideoRoute.presentationDisplay
-                        val routeName = liveVideoRoute.name?.toString().orEmpty()
-                        val isNonDefaultVideoRoute = presDisplay != null ||
-                            (liveVideoRoute != mediaRouter.defaultRoute &&
-                                (routeName.contains("cast", ignoreCase = true) ||
-                                    routeName.contains("mirror", ignoreCase = true) ||
-                                    routeName.contains("tv", ignoreCase = true) ||
-                                    routeName.contains("display", ignoreCase = true) ||
-                                    routeName.contains("wireless", ignoreCase = true)))
-                        if (isNonDefaultVideoRoute) {
-                            hasMirrorOrCastDisplay = true
-                            val indicator = if (routeName.isNotBlank()) "Screen Mirroring ($routeName)" else "Screen Mirroring Route"
-                            if (captureIndicators.none { it.equals(indicator, ignoreCase = true) }) {
-                                captureIndicators.add(indicator)
-                            }
-                        }
-                    }
-                } catch (_: Throwable) {
+            // 1b. Live MediaRouter Wireless Display / Screen Mirroring route (kept updated on mainHandler)
+            val mirrorRouteIndicator = activeMediaRouterMirrorRoute
+            if (!mirrorRouteIndicator.isNullOrBlank()) {
+                hasMirrorOrCastDisplay = true
+                if (captureIndicators.none { it.equals(mirrorRouteIndicator, ignoreCase = true) }) {
+                    captureIndicators.add(mirrorRouteIndicator)
                 }
             }
 
             // 2. Internal Audio Loopback (REMOTE_SUBMIX = 8) & client UID attribution
             val audioConfigs = try {
-                audioManager.activeRecordingConfigurations.toList()
+                audioManager?.activeRecordingConfigurations?.toList() ?: emptyList()
             } catch (_: Throwable) {
                 emptyList()
             }
@@ -2489,8 +2627,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                         packageName = primaryPkg
                     )
                 }
-                // Always dispatch notification once per active capture session—never let a silent refresh swallow it!
-                if (!lastScreenCaptureAlertDispatched) {
+                if (triggerAlertIfNew && !lastScreenCaptureAlertDispatched) {
                     lastScreenCaptureAlertDispatched = true
                     maybeDispatchGuardNotification(
                         GuardAlertPayload(
@@ -2559,19 +2696,23 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 ?.let { activeRecorders.add(it.first) }
         }
 
-        // B. Use shared incremental UsageStats snapshot for active FOREGROUND_SERVICE_START or recent screen recorder session
-        val usageSnap = preloadedUsageSnapshot ?: queryCombinedUsageState()
-        if (usageSnap.usageAccessGranted) {
-            for ((pkg, startTs) in usageSnap.recorderServiceStarts) {
-                val stopTs = usageSnap.recorderServiceStops[pkg] ?: 0L
-                if (startTs > stopTs && (now - startTs) < 30L * 60L * 1000L) {
-                    activeRecorders.add(pkg)
-                }
-            }
-            if (isMicOrAudioActive) {
-                for ((pkg, resumeTs) in usageSnap.recorderLastResumes) {
-                    if ((now - resumeTs) < 5L * 60L * 1000L) {
+        // B. Use UsageStats recorder hints ONLY to attribute a package name when a real OS/display/file/audio
+        // capture signal is already active. Never treat historical recorder service starts or app resumes as
+        // standalone live recording triggers (OEM recorders often omit FOREGROUND_SERVICE_STOP cleanly).
+        if (hasOtherCaptureSignal) {
+            val usageSnap = preloadedUsageSnapshot ?: queryCombinedUsageState()
+            if (usageSnap.usageAccessGranted) {
+                for ((pkg, startTs) in usageSnap.recorderServiceStarts) {
+                    val stopTs = usageSnap.recorderServiceStops[pkg] ?: 0L
+                    if (startTs > stopTs && (now - startTs) < 10L * 60L * 1000L) {
                         activeRecorders.add(pkg)
+                    }
+                }
+                if (activeRecorders.isEmpty() && isMicOrAudioActive) {
+                    for ((pkg, resumeTs) in usageSnap.recorderLastResumes) {
+                        if ((now - resumeTs) < 2L * 60L * 1000L) {
+                            activeRecorders.add(pkg)
+                        }
                     }
                 }
             }
@@ -2615,7 +2756,8 @@ class LiveGuardMonitor private constructor(private val context: Context) {
     internal fun detectActiveScreenRecordingFile(): ScreenRecordingFileHit? {
         val now = System.currentTimeMillis()
 
-        // 1. Check MediaStore ONLY for videos in ScreenRecorder paths or screen-recording filenames
+        // 1. Check MediaStore STRICTLY for IS_PENDING = 1 (actively open for write right now).
+        // Completed videos (even recent ones) are NOT active recordings and must not cause false alerts.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
                 val projection = arrayOf(
@@ -2624,12 +2766,12 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     MediaStore.Video.Media.OWNER_PACKAGE_NAME,
                     MediaStore.Video.Media.DATE_MODIFIED
                 )
-                val cutoffSec = (now - 25_000L) / 1000L
+                val staleCutoffSec = (now - 120_000L) / 1000L
                 context.contentResolver.query(
                     MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
                     projection,
-                    "${MediaStore.Video.Media.IS_PENDING} = 1 OR ${MediaStore.Video.Media.DATE_MODIFIED} >= ?",
-                    arrayOf(cutoffSec.toString()),
+                    "${MediaStore.Video.Media.IS_PENDING} = 1 AND ${MediaStore.Video.Media.DATE_MODIFIED} >= ?",
+                    arrayOf(staleCutoffSec.toString()),
                     "${MediaStore.Video.Media.DATE_MODIFIED} DESC"
                 )?.use { cursor ->
                     while (cursor.moveToNext()) {
@@ -2650,7 +2792,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             }
         }
 
-        // 2. Check standard MIUI / HyperOS / Android ScreenRecorder directories for files actively being written
+        // 2. Check dedicated ScreenRecorder directories strictly for active temp recording buffers (.tmp / .part)
         try {
             val root = Environment.getExternalStorageDirectory()
             val candidateDirs = listOf(
@@ -2666,8 +2808,8 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     if (!f.isFile) continue
                     val ageMs = now - f.lastModified()
                     val nameLower = f.name.lowercase()
-                    if ((nameLower.endsWith(".tmp") && ageMs in 0..180_000L) ||
-                        ((nameLower.endsWith(".mp4") || nameLower.endsWith(".mkv")) && ageMs in 0..25_000L)
+                    if ((nameLower.endsWith(".tmp") || nameLower.endsWith(".part") || nameLower.endsWith(".recording")) &&
+                        ageMs in 0..15_000L
                     ) {
                         return ScreenRecordingFileHit(fileName = f.name, ownerPackage = null)
                     }
@@ -2682,7 +2824,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
     @Suppress("DEPRECATION")
     private fun detectRunningCapturePackages(): List<String> {
         return try {
-            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return emptyList()
             val services = am.getRunningServices(100) ?: emptyList()
             services.mapNotNull { srv ->
                 val cls = srv.service.className.lowercase()
@@ -2830,15 +2972,36 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     !(perm.permissionName == android.Manifest.permission.CAMERA && GuardSensorType.CAMERA in r)
             }
         }
+        val resolvedActiveNames = (live.activeMicApps + live.activeCameraApps).toSet()
+        val activeMicCamMatchedApps = if (micCamActive && resolvedActiveNames.isNotEmpty()) {
+            micCamApps.filter { app ->
+                app.appName in resolvedActiveNames || app.packageName in resolvedActiveNames
+            }
+        } else {
+            emptyList()
+        }
+        val activeMicCamDetails = buildList {
+            if (live.isMicActive) {
+                val micWho = live.activeMicApps.takeIf { it.isNotEmpty() }?.joinToString(", ")
+                    ?: "App hidden by Android OS"
+                add("Microphone active (${live.activeMicSessions.coerceAtLeast(1)} stream): $micWho")
+            }
+            if (live.isCameraActive) {
+                val camWho = live.activeCameraApps.takeIf { it.isNotEmpty() }?.joinToString(", ")
+                    ?: "App hidden by Android OS"
+                add("Camera active (Lens ${live.busyCameraIds.joinToString().ifBlank { "?" }}): $camWho")
+            }
+        }
         val micCamVector = if (micCamActive) {
             SecurityAuditVector(
                 id = "live_mic_cam",
                 title = "Mic & Camera Live",
-                plainSummary = "Sensor is actively recording right now",
-                detailedAdvice = "If you aren't on a call or recording video, an app is using your mic or camera.",
+                plainSummary = activeMicCamDetails.firstOrNull() ?: "Sensor is actively recording right now",
+                detailedAdvice = "Hardware sensor is active right now. If Android hides the exact app name, check your green status-bar privacy indicator or OS Privacy Dashboard.",
                 severity = AuditSeverity.DANGER,
                 statusBadge = "ACTIVE NOW",
-                flaggedApps = micCamApps.take(8),
+                flaggedApps = activeMicCamMatchedApps,
+                extraDetails = activeMicCamDetails,
                 settingsAction = Settings.ACTION_PRIVACY_SETTINGS,
                 actionButtonLabel = "Privacy Controls"
             )
@@ -2847,7 +3010,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 id = "live_mic_cam",
                 title = "Mic & Camera Live",
                 plainSummary = "Idle • ${micCamApps.size} apps have permission",
-                detailedAdvice = "Revoke Camera or Mic access for apps that don't need voice or video.",
+                detailedAdvice = "Monitors live OS AudioRecordingCallback & CameraManager callbacks. Revoke Camera or Mic access for apps that don't need voice or video.",
                 severity = AuditSeverity.SAFE,
                 statusBadge = "IDLE",
                 flaggedApps = micCamApps.take(6)
@@ -2867,7 +3030,11 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 bgLocationApps.isEmpty() -> "No apps have Always-Allow GPS"
                 else -> "${bgLocationApps.size} app(s) allowed 24/7 background GPS"
             },
-            detailedAdvice = "Apps with Always-Allow location can track your movement even when closed. Change to 'Only while using' or ignore trusted apps.",
+            detailedAdvice = if (live.isAppOpsIntrospectionAvailable) {
+                "Apps with Always-Allow location can track your movement even when closed. Change to 'Only while using' or ignore trusted apps."
+            } else {
+                "Audits every app granted 24/7 Always-Allow GPS permission. Android blocks third-party apps from reading live background GPS AppOps logs — check OS Privacy Dashboard for per-minute GPS history."
+            },
             severity = when {
                 live.isBackgroundLocationActive -> AuditSeverity.DANGER
                 bgLocationApps.isNotEmpty() -> AuditSeverity.WARNING
@@ -2892,13 +3059,18 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         }
         val clipboardVector = SecurityAuditVector(
             id = "clipboard_access",
-            title = "Clipboard Snooping",
+            title = "Clipboard Protection",
             plainSummary = when {
                 live.isClipboardAccessedRecently -> "Read recently by ${live.recentClipboardApps.joinToString(", ")}"
-                clipboardTimelineApps.isEmpty() -> "No background clipboard reads detected"
-                else -> "${clipboardTimelineApps.size} app(s) read clipboard recently"
+                clipboardTimelineApps.isNotEmpty() -> "${clipboardTimelineApps.size} app(s) read clipboard recently"
+                !live.isAppOpsIntrospectionAvailable -> "Protected by Android 10+ (OS Privacy Controls)"
+                else -> "No background clipboard reads detected"
             },
-            detailedAdvice = "Monitors AppOps clipboard reads in the background to catch silent password, OTP, or link snooping.",
+            detailedAdvice = if (live.isAppOpsIntrospectionAvailable) {
+                "Monitors AppOps clipboard reads in the background to catch silent password, OTP, or link snooping."
+            } else {
+                "Android 10+ automatically blocks background apps from reading your clipboard and shows a toast when any foreground app pastes. Android restricts raw clipboard AppOps logs to the OS Privacy Dashboard."
+            },
             severity = when {
                 live.isClipboardAccessedRecently -> AuditSeverity.WARNING
                 clipboardTimelineApps.isNotEmpty() -> AuditSeverity.WARNING
@@ -2906,8 +3078,9 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             },
             statusBadge = when {
                 live.isClipboardAccessedRecently -> "READ NOW"
-                clipboardTimelineApps.isEmpty() -> "SAFE"
-                else -> "${clipboardTimelineApps.size} RECENT"
+                clipboardTimelineApps.isNotEmpty() -> "${clipboardTimelineApps.size} RECENT"
+                !live.isAppOpsIntrospectionAvailable -> "OS GUARDED"
+                else -> "SAFE"
             },
             flaggedApps = clipboardTimelineApps,
             settingsAction = Settings.ACTION_PRIVACY_SETTINGS,
@@ -2930,16 +3103,25 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             actionButtonLabel = "Overlay Settings"
         )
 
-        // 6. Accessibility Screen-Readers
+        // 6. Accessibility Screen-Readers (exclude stock OS / OEM accessibility helpers unless system apps requested)
         val accessibilityApps = allApps.filter { it.hasAccessibilityAccess }
+        val stockAccessibilityAllowlist = setOf(
+            "com.google.android.marvin.talkback",
+            "com.google.android.accessibility.switchaccess",
+            "com.samsung.accessibility"
+        )
         val enabledRawServices = PrivacyAnalyzer.getEnabledAccessibilityPackages(context)
-            .filter { it != context.packageName && it !in fullIgnored }
+            .filter { pkg ->
+                pkg != context.packageName &&
+                    pkg !in fullIgnored &&
+                    (includeSystemApps || (!PrivacyAnalyzer.isBrandOrOemPackage(pkg) && pkg !in stockAccessibilityAllowlist))
+            }
         val accessCount = maxOf(accessibilityApps.size, enabledRawServices.size)
         val accessibilityVector = SecurityAuditVector(
             id = "accessibility_monitors",
             title = "Screen Readers",
-            plainSummary = if (accessCount == 0) "No apps are reading screen text" else "$accessCount service(s) can read all screen text",
-            detailedAdvice = "Spyware often uses Accessibility to read chats and passwords. Disable unknown services.",
+            plainSummary = if (accessCount == 0) "No third-party apps reading screen text" else "$accessCount service(s) can read all screen text",
+            detailedAdvice = "Spyware often uses Accessibility to read chats and passwords. Disable unknown third-party services.",
             severity = if (accessCount > 0) AuditSeverity.DANGER else AuditSeverity.SAFE,
             statusBadge = if (accessCount == 0) "SAFE" else "$accessCount ACTIVE",
             flaggedApps = accessibilityApps,
@@ -3011,14 +3193,14 @@ class LiveGuardMonitor private constructor(private val context: Context) {
         val sideloadVector = SecurityAuditVector(
             id = "sideload_adb",
             title = "Sideloads & USB Debug",
-            plainSummary = if (sysFlags.isEmpty()) "Verified store/brand apps, Verifier ON & ADB off" else sysFlags.joinToString(" • "),
-            detailedAdvice = "Turn off USB Debugging when not needed, keep OS Package Verification on, and review third-party APKs installed outside official stores.",
+            plainSummary = if (sysFlags.isEmpty()) "Verified store/brand apps & ADB off" else sysFlags.joinToString(" • "),
+            detailedAdvice = "Turn off USB Debugging when not needed and review third-party APKs installed outside official app stores.",
             severity = if (adbEnabled || !verifierEnabled) AuditSeverity.DANGER else if (sideloadedApps.isNotEmpty()) AuditSeverity.WARNING else AuditSeverity.SAFE,
             statusBadge = if (sysFlags.isEmpty()) "SAFE" else "REVIEW",
             flaggedApps = sideloadedApps,
             extraDetails = sysFlags,
-            settingsAction = Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS,
-            actionButtonLabel = "Developer Options"
+            settingsAction = if (adbEnabled) Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS else Settings.ACTION_MANAGE_ALL_APPLICATIONS_SETTINGS,
+            actionButtonLabel = if (adbEnabled) "Developer Options" else "Review Apps"
         )
 
         // 11. Offline Stalkerware, Ghost Apps & System Impersonation
@@ -3173,7 +3355,6 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             if (cfg.alertMode == GuardAlertMode.SILENT_LOG) return
             val thermalPrefs = context.getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
             if (!thermalPrefs.getBoolean("live_guard_alerts", true)) return
-            if (isGlobalSensorSnoozed(GuardSensorType.SCREEN)) return
 
             val canPostNotifications = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 ContextCompat.checkSelfPermission(
@@ -3200,6 +3381,12 @@ class LiveGuardMonitor private constructor(private val context: Context) {
             val pendingAlerts = mutableListOf<PendingCheckAlert>()
 
             for (vector in vectors) {
+                val isLiveCaptureOrSensor = vector.id == "screen_recording" || vector.id == "live_mic_cam"
+                // Live hardware vectors are already notified in real time by OS callbacks (avoid duplicate alerts)
+                if (isLiveCaptureOrSensor && !forceNotifyActive) {
+                    continue
+                }
+
                 val currentItems: Set<String> = buildSet {
                     vector.flaggedApps.forEach { add("app:${it.packageName}") }
                     vector.extraDetails.forEach { add("detail:$it") }
@@ -3223,7 +3410,6 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     continue
                 }
 
-                val isLiveCaptureOrSensor = vector.id == "screen_recording" || vector.id == "live_mic_cam"
                 val previousItems = knownVectorItemsMap[vector.id] ?: emptySet()
                 val newlyAddedItems = currentItems - previousItems
 
@@ -3238,10 +3424,19 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                     continue
                 }
 
-                if (canPostNotifications) {
-                    knownVectorItemsMap[vector.id] = currentItems
-                    baselineDirty = true
+                val vectorSensorType = when (vector.id) {
+                    "bg_location" -> GuardSensorType.LOCATION
+                    "clipboard_access" -> GuardSensorType.CLIPBOARD
+                    "live_mic_cam" -> if (_captureState.value.isCameraActive) GuardSensorType.CAMERA else GuardSensorType.MIC
+                    else -> GuardSensorType.SCREEN
                 }
+                if (!forceNotifyActive && isGlobalSensorSnoozed(vectorSensorType)) {
+                    continue
+                }
+
+                // Always advance baseline when processed so denied notification permission never causes duplicate event spam
+                knownVectorItemsMap[vector.id] = currentItems
+                baselineDirty = true
 
                 val appNames = vector.flaggedApps.map { it.appName }.distinct()
                 val details = vector.extraDetails.sorted()

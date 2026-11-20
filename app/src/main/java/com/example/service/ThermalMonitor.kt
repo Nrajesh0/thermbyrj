@@ -12,6 +12,7 @@ import android.os.Environment
 import android.os.StatFs
 import android.os.SystemClock
 import android.view.Display
+import androidx.core.content.ContextCompat
 import com.example.queryDeviceStorageTotals
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -61,7 +62,9 @@ data class LiveThermalData(
     val cpuArch: String = System.getProperty("os.arch") ?: "Unknown",
 
     val uptime: Long = 0L,
-    val refreshRate: Float = 60f
+    val refreshRate: Float = 60f,
+    val thermalStatusCode: Int = 0,
+    val thermalStatusLabel: String = "Nominal"
 )
 
 class ThermalMonitor private constructor(private val context: Context) {
@@ -77,7 +80,7 @@ class ThermalMonitor private constructor(private val context: Context) {
         }
     }
 
-    private val monitorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val monitorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default + safeCoroutineExceptionHandler())
 
     private val _liveData = MutableStateFlow(
         LiveThermalData(
@@ -214,15 +217,22 @@ class ThermalMonitor private constructor(private val context: Context) {
         } else {
             Pair(cachedTotalStorage, cachedAvailStorage)
         }
+        val currentState = _liveData.value
+        val batteryExtras = readBatteryManagerExtras(currentState.isCharging)
+        val (thermalCode, thermalLabel) = readOsThermalStatus()
 
         _liveData.value = _liveData.value.copy(
             cpuTemp = cpuTempC,
+            batteryCurrentMa = batteryExtras.currentMa,
+            chargeTimeRemainingMs = batteryExtras.chargeTimeRemainingMs,
             totalRam = totRam,
             availRam = avRam,
             totalStorage = totStore,
             availStorage = avStore,
             uptime = SystemClock.elapsedRealtime(),
-            refreshRate = getRefreshRate()
+            refreshRate = getRefreshRate(),
+            thermalStatusCode = thermalCode,
+            thermalStatusLabel = thermalLabel
         )
     }
 
@@ -242,44 +252,75 @@ class ThermalMonitor private constructor(private val context: Context) {
     fun startMonitoring() {
         if (monitoringJob?.isActive == true) {
             if (com.example.MainActivity.isUiForeground) {
-                monitorScope.launch { refreshSystemSpecs() }
+                monitorScope.launch(Dispatchers.IO) {
+                    try {
+                        refreshSystemSpecs()
+                    } catch (_: Throwable) {
+                    }
+                }
             }
             return
         }
 
-        // Pull initial state once
-        forceUpdate()
+        // Pull initial state off the main thread so thermal/storage Binder I/O never stalls UI startup
+        monitorScope.launch(Dispatchers.IO) {
+            try {
+                forceUpdate()
+            } catch (_: Throwable) {
+            }
+        }
 
         // Event-driven battery monitoring via OS broadcasts (zero polling overhead)
         monitoringJob = callbackFlow {
             val receiver = object : BroadcastReceiver() {
                 override fun onReceive(ctx: Context?, intent: Intent?) {
-                    trySend(intent)
+                    try {
+                        trySend(intent)
+                    } catch (_: Throwable) {
+                    }
                 }
             }
             val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
-            val initialSticky = context.registerReceiver(receiver, filter)
-            if (initialSticky != null) {
-                trySend(initialSticky)
+            var registered = false
+            try {
+                val initialSticky = ContextCompat.registerReceiver(
+                    context,
+                    receiver,
+                    filter,
+                    ContextCompat.RECEIVER_NOT_EXPORTED
+                )
+                registered = true
+                if (initialSticky != null) {
+                    trySend(initialSticky)
+                }
+            } catch (_: Throwable) {
             }
             awaitClose {
-                try {
-                    context.unregisterReceiver(receiver)
-                } catch (_: Exception) {
+                if (registered) {
+                    try {
+                        context.unregisterReceiver(receiver)
+                    } catch (_: Throwable) {
+                    }
                 }
             }
         }.onEach { intent ->
-            updateDataFromIntent(intent)
+            try {
+                updateDataFromIntent(intent)
+            } catch (_: Throwable) {
+            }
         }.launchIn(monitorScope)
 
         // Low-frequency 15s refresh for RAM & current mA only while UI is visible in foreground
         tickerJob?.cancel()
-        tickerJob = monitorScope.launch {
+        tickerJob = monitorScope.launch(Dispatchers.IO) {
             while (isActive) {
                 if (com.example.MainActivity.isUiForeground) {
                     delay(15_000L)
                     if (com.example.MainActivity.isUiForeground) {
-                        refreshSystemSpecs()
+                        try {
+                            refreshSystemSpecs()
+                        } catch (_: Throwable) {
+                        }
                     }
                 } else {
                     delay(30_000L)
@@ -305,11 +346,12 @@ class ThermalMonitor private constructor(private val context: Context) {
 
     private fun getMemoryInfo(): Pair<Long, Long> {
         return try {
-            val actManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val actManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+                ?: return Pair(0L, 0L)
             val memInfo = ActivityManager.MemoryInfo()
             actManager.getMemoryInfo(memInfo)
             Pair(memInfo.totalMem, memInfo.availMem)
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             Pair(0L, 0L)
         }
     }
@@ -330,8 +372,10 @@ class ThermalMonitor private constructor(private val context: Context) {
                         val typeFile = File(zone, "type")
                         val tempFile = File(zone, "temp")
                         if (typeFile.canRead() && tempFile.canRead()) {
-                            val type = typeFile.readText().trim()
-                            if (type.contains("cpu", ignoreCase = true) || type.contains("soc", ignoreCase = true)) {
+                            val type = typeFile.readText().trim().lowercase()
+                            if (type.contains("cpu") || type.contains("soc") || type.contains("tsens") ||
+                                type.contains("mtktscpu") || type.contains("ap_ntc") || type.contains("cluster")
+                            ) {
                                 val raw = tempFile.readText().trim().toFloatOrNull()
                                 if (raw != null) {
                                     val tempC = if (raw > 1000f) raw / 1000f else raw
@@ -355,11 +399,35 @@ class ThermalMonitor private constructor(private val context: Context) {
         return -1f
     }
 
+    private fun readOsThermalStatus(): Pair<Int, String> {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val pm = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+                val code = pm?.currentThermalStatus ?: android.os.PowerManager.THERMAL_STATUS_NONE
+                val label = when (code) {
+                    android.os.PowerManager.THERMAL_STATUS_NONE -> "Nominal"
+                    android.os.PowerManager.THERMAL_STATUS_LIGHT -> "Light Throttle"
+                    android.os.PowerManager.THERMAL_STATUS_MODERATE -> "Moderate"
+                    android.os.PowerManager.THERMAL_STATUS_SEVERE -> "Severe"
+                    android.os.PowerManager.THERMAL_STATUS_CRITICAL -> "Critical"
+                    android.os.PowerManager.THERMAL_STATUS_EMERGENCY -> "Emergency"
+                    android.os.PowerManager.THERMAL_STATUS_SHUTDOWN -> "Shutdown"
+                    else -> "Nominal"
+                }
+                code to label
+            } else {
+                0 to "Nominal"
+            }
+        } catch (_: Throwable) {
+            0 to "Nominal"
+        }
+    }
+
     private fun getRefreshRate(): Float {
         return try {
-            val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
-            dm.getDisplay(Display.DEFAULT_DISPLAY)?.refreshRate ?: 60f
-        } catch (_: Exception) {
+            val dm = context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+            dm?.getDisplay(Display.DEFAULT_DISPLAY)?.refreshRate ?: 60f
+        } catch (_: Throwable) {
             60f
         }
     }

@@ -171,7 +171,7 @@ object OfflineThreatScanner {
         "eyezy",
         "umobix",
         "mobiletrackerfree",
-        "cerberus"
+        "com.lsdroid.cerberus"
     )
 
     private data class CertCacheKey(
@@ -187,13 +187,22 @@ object OfflineThreatScanner {
     private var cachedLauncherPkgsTimestamp: Long = 0L
 
     /**
-     * Checks offline if Android's built-in Package Verifier / Google Play Protect verification
-     * is enabled in global system settings (`package_verifier_enable` / ` verifier_verify_adb_installs`).
+     * Checks offline if Android's built-in Package Verifier is enabled.
+     * Note: `package_verifier_enable` was deprecated on Android 11 (API 30) and is often 0 or unset
+     * on modern OEM/Play Protect ROMs even when Play Protect is active. On API 30+, only flag
+     * when ADB install verification (`verifier_verify_adb_installs`) is explicitly disabled while ADB is ON.
      */
     fun isPackageVerifierEnabled(context: Context): Boolean {
         return try {
-            val enabled = Settings.Global.getInt(context.contentResolver, "package_verifier_enable", 1)
-            enabled != 0
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val adbOn = Settings.Global.getInt(context.contentResolver, Settings.Global.ADB_ENABLED, 0) == 1
+                if (!adbOn) return true
+                val adbVerify = Settings.Global.getInt(context.contentResolver, "verifier_verify_adb_installs", 1)
+                adbVerify != 0
+            } else {
+                val enabled = Settings.Global.getInt(context.contentResolver, "package_verifier_enable", 1)
+                enabled != 0
+            }
         } catch (_: Exception) {
             true
         }

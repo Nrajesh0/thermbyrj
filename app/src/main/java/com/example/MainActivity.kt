@@ -164,6 +164,7 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestPermission()
     ) { _ ->
     }
+    private var osScreenRecordingCallback: java.util.function.Consumer<Int>? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -214,12 +215,37 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         isUiForeground = true
         com.example.service.ThermalMonitor.getInstance(applicationContext).startMonitoring()
-        LiveGuardMonitor.getInstance(applicationContext).startMonitoring()
+        val guard = LiveGuardMonitor.getInstance(applicationContext)
+        guard.startMonitoring()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+            try {
+                val callback = java.util.function.Consumer<Int> { state ->
+                    guard.onOsScreenRecordingStateChanged(
+                        state == android.view.WindowManager.SCREEN_RECORDING_STATE_VISIBLE
+                    )
+                }
+                osScreenRecordingCallback = callback
+                val initialState = windowManager.addScreenRecordingCallback(mainExecutor, callback)
+                guard.onOsScreenRecordingStateChanged(
+                    initialState == android.view.WindowManager.SCREEN_RECORDING_STATE_VISIBLE
+                )
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     override fun onStop() {
         super.onStop()
         isUiForeground = false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+            try {
+                osScreenRecordingCallback?.let { cb ->
+                    windowManager.removeScreenRecordingCallback(cb)
+                }
+                osScreenRecordingCallback = null
+            } catch (_: Throwable) {
+            }
+        }
         val prefs = getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
         if (!prefs.getBoolean("background_monitoring", true)) {
             com.example.service.ThermalMonitor.getInstance(applicationContext).stopMonitoring()
@@ -1029,7 +1055,11 @@ fun MorphingSettingsOrb(
                         tag = "perm_row_notifications",
                         onAction = {
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotifPerm) {
-                                orbNotifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                try {
+                                    orbNotifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                } catch (_: Throwable) {
+                                    PermissionUtils.launchNotificationSettings(context)
+                                }
                             } else {
                                 PermissionUtils.launchNotificationSettings(context)
                             }
@@ -1043,7 +1073,11 @@ fun MorphingSettingsOrb(
                         tag = "perm_row_media",
                         onAction = {
                             if (!hasMediaPerm) {
-                                orbMediaLauncher.launch(PermissionUtils.requiredMediaPermissions())
+                                try {
+                                    orbMediaLauncher.launch(PermissionUtils.requiredMediaPermissions())
+                                } catch (_: Throwable) {
+                                    PermissionUtils.launchAppDetailsSettings(context)
+                                }
                             } else {
                                 PermissionUtils.launchAppDetailsSettings(context)
                             }
@@ -1116,7 +1150,11 @@ fun MorphingSettingsOrb(
                                 .background(AuraCyan.copy(alpha = 0.14f))
                                 .border(1.dp, AuraCyan.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
                                 .clickable {
-                                    exportBackupLauncher.launch("dot_settings_backup.json")
+                                    try {
+                                        exportBackupLauncher.launch("dot_settings_backup.json")
+                                    } catch (_: Throwable) {
+                                        Toast.makeText(context, "No document picker available on device", Toast.LENGTH_SHORT).show()
+                                    }
                                 }
                                 .padding(vertical = 12.dp),
                             contentAlignment = Alignment.Center
@@ -1136,7 +1174,11 @@ fun MorphingSettingsOrb(
                                 .background(GlassPanel)
                                 .border(1.dp, GlassBorder, RoundedCornerShape(12.dp))
                                 .clickable {
-                                    importBackupLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                                    try {
+                                        importBackupLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                                    } catch (_: Throwable) {
+                                        Toast.makeText(context, "No document picker available on device", Toast.LENGTH_SHORT).show()
+                                    }
                                 }
                                 .padding(vertical = 12.dp),
                             contentAlignment = Alignment.Center

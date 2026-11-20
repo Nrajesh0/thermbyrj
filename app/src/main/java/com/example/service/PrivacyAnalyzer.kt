@@ -3,14 +3,19 @@ package com.example.service
 import android.Manifest
 import android.app.AppOpsManager
 import android.app.admin.DevicePolicyManager
+import android.app.usage.NetworkStats
+import android.app.usage.NetworkStatsManager
 import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
+import android.net.ConnectivityManager
+import android.net.TrafficStats
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -389,36 +394,46 @@ object PrivacyAnalyzer {
         val pkgUri = packageName?.let { Uri.parse("package:$it") }
 
         // 1. Handle Special Access permissions that have dedicated Android Settings screens
-        val specialIntent: Intent? = when (perm.permissionName) {
+        val specialIntents: List<Intent> = when (perm.permissionName) {
             Manifest.permission.SYSTEM_ALERT_WINDOW ->
-                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, pkgUri)
+                listOf(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, pkgUri))
             Manifest.permission.MANAGE_EXTERNAL_STORAGE ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, pkgUri)
-                } else null
+                    listOf(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, pkgUri))
+                } else emptyList()
             Manifest.permission.REQUEST_INSTALL_PACKAGES, "SPECIAL_SIDELOADED_APP" ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, pkgUri)
-                } else null
+                    listOf(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, pkgUri))
+                } else emptyList()
             Manifest.permission.PACKAGE_USAGE_STATS ->
-                Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
+                listOfNotNull(
+                    pkgUri?.let { Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS, it) },
+                    Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
+                )
             "SPECIAL_ACCESSIBILITY_SERVICE" ->
-                Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                listOf(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             "SPECIAL_NOTIFICATION_LISTENER" ->
-                Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS")
+                listOf(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
             "SPECIAL_DEVICE_ADMIN" ->
-                Intent(Settings.ACTION_SECURITY_SETTINGS)
+                listOf(
+                    Intent().setComponent(
+                        ComponentName("com.android.settings", "com.android.settings.DeviceAdminSettings")
+                    ),
+                    Intent(Settings.ACTION_SECURITY_SETTINGS)
+                )
             "SPECIAL_SCREEN_CAPTURE", "SPECIAL_SCREEN_MIRROR" ->
-                Intent(Settings.ACTION_CAST_SETTINGS)
+                listOf(Intent(Settings.ACTION_CAST_SETTINGS))
             "SPECIAL_CUSTOM_KEYBOARD" ->
-                Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)
+                listOf(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
             "SPECIAL_USB_DEBUGGING" ->
-                Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)
-            else -> null
+                listOf(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+            else -> emptyList()
         }
 
-        if (specialIntent != null && tryStartActivity(context, specialIntent)) {
-            return
+        for (intent in specialIntents) {
+            if (tryStartActivity(context, intent)) {
+                return
+            }
         }
 
         if (packageName != null) {
@@ -554,13 +569,13 @@ object PrivacyAnalyzer {
                 }
             }
             val pm = context.packageManager
-            val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
-            val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+            val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager
+            val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
 
             val enabledAccessibilitySet = getEnabledAccessibilityPackages(context)
             val enabledNotifListeners = getEnabledNotificationListeners(context)
             val activeAdminSet = try {
-                dpm.activeAdmins?.map { it.packageName }?.toSet() ?: emptySet()
+                dpm?.activeAdmins?.map { it.packageName }?.toSet() ?: emptySet()
             } catch (_: Throwable) {
                 emptySet()
             }
@@ -919,6 +934,7 @@ object PrivacyAnalyzer {
                 "Sentry Telemetry" to listOf("io.sentry")
             )
 
+            val uidTraffic30d = queryUidNetworkUsage30d(context)
             val reports = mutableListOf<AppTelemetryReport>()
 
             for (appInfo in installedApps) {
@@ -1000,10 +1016,30 @@ object PrivacyAnalyzer {
             } catch (_: Exception) {
                 pkgInfo.packageName
             }
-            val icon = try {
-                pm.getApplicationIcon(appInfo)
+            val icon = appIconDrawableCache[pkgInfo.packageName] ?: try {
+                pm.getApplicationIcon(appInfo).also { loaded ->
+                    if (appIconDrawableCache.size < 350) {
+                        appIconDrawableCache[pkgInfo.packageName] = loaded
+                    }
+                }
             } catch (_: Exception) {
                 context.applicationInfo.loadIcon(pm)
+            }
+
+            val statsPair = uidTraffic30d[appInfo.uid]
+            val txBytes = (statsPair?.first ?: 0L).let { v ->
+                if (v > 0L) v else try {
+                    TrafficStats.getUidTxBytes(appInfo.uid).coerceAtLeast(0L)
+                } catch (_: Throwable) {
+                    0L
+                }
+            }
+            val rxBytes = (statsPair?.second ?: 0L).let { v ->
+                if (v > 0L) v else try {
+                    TrafficStats.getUidRxBytes(appInfo.uid).coerceAtLeast(0L)
+                } catch (_: Throwable) {
+                    0L
+                }
             }
 
             reports.add(
@@ -1018,8 +1054,8 @@ object PrivacyAnalyzer {
                     usesAdId = usesAdId,
                     runsAtBoot = runsAtBoot,
                     usesWakeLock = usesWakeLock,
-                    uploadedBytes = 0L,
-                    downloadedBytes = 0L,
+                    uploadedBytes = txBytes,
+                    downloadedBytes = rxBytes,
                     telemetryScore = finalScore,
                     severityBadge = badge
                 )
@@ -1049,6 +1085,43 @@ object PrivacyAnalyzer {
         }
         return result
         }
+    }
+
+    /**
+     * Queries 30-day per-UID uploaded (tx) and downloaded (rx) bytes offline via NetworkStatsManager
+     * when Usage Access is granted (no INTERNET permission required).
+     */
+    @Suppress("DEPRECATION")
+    private fun queryUidNetworkUsage30d(context: Context): Map<Int, Pair<Long, Long>> {
+        if (!hasUsageStatsPermission(context)) return emptyMap()
+        val totals = HashMap<Int, LongArray>()
+        try {
+            val nsm = context.getSystemService(Context.NETWORK_STATS_SERVICE) as? NetworkStatsManager
+                ?: return emptyMap()
+            val end = System.currentTimeMillis()
+            val start = end - (30L * 24L * 60L * 60L * 1000L)
+            val types = intArrayOf(ConnectivityManager.TYPE_WIFI, ConnectivityManager.TYPE_MOBILE)
+            val bucket = NetworkStats.Bucket()
+            for (netType in types) {
+                try {
+                    nsm.querySummary(netType, null, start, end)?.use { stats ->
+                        while (stats.hasNextBucket()) {
+                            if (stats.getNextBucket(bucket)) {
+                                val uid = bucket.uid
+                                if (uid > 0) {
+                                    val acc = totals.getOrPut(uid) { LongArray(2) }
+                                    acc[0] += bucket.txBytes.coerceAtLeast(0L)
+                                    acc[1] += bucket.rxBytes.coerceAtLeast(0L)
+                                }
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        return totals.mapValues { it.value[0] to it.value[1] }
     }
 
     private fun buildShortActionTips(reports: List<AppPrivacyReport>, unusedRiskyCount: Int): List<String> {
@@ -1190,11 +1263,12 @@ object PrivacyAnalyzer {
      */
     @Suppress("DEPRECATION")
     private fun isSpecialAppOpAllowed(
-        appOps: AppOpsManager,
+        appOps: AppOpsManager?,
         op: String,
         uid: Int,
         packageName: String
     ): Boolean {
+        if (appOps == null) return false
         return try {
             val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 appOps.unsafeCheckOpNoThrow(op, uid, packageName)
@@ -1203,7 +1277,7 @@ object PrivacyAnalyzer {
                 appOps.checkOpNoThrow(op, uid, packageName)
             }
             mode == AppOpsManager.MODE_ALLOWED
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             false
         }
     }
@@ -1214,11 +1288,12 @@ object PrivacyAnalyzer {
      */
     @Suppress("DEPRECATION")
     private fun isRuntimePermissionAppOpAllowed(
-        appOps: AppOpsManager,
+        appOps: AppOpsManager?,
         permName: String,
         uid: Int,
         packageName: String
     ): Boolean {
+        if (appOps == null) return true
         return try {
             val op = AppOpsManager.permissionToOp(permName) ?: return true
             val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -1230,7 +1305,7 @@ object PrivacyAnalyzer {
             mode == AppOpsManager.MODE_ALLOWED ||
                 mode == AppOpsManager.MODE_DEFAULT ||
                 mode == 4 /* AppOpsManager.MODE_FOREGROUND */
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             true
         }
     }
@@ -1443,7 +1518,7 @@ object PrivacyAnalyzer {
     @Suppress("DEPRECATION")
     fun hasUsageStatsPermission(context: Context): Boolean {
         return try {
-            val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+            val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return false
             val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), context.packageName)
             } else {
@@ -1451,7 +1526,7 @@ object PrivacyAnalyzer {
                 appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), context.packageName)
             }
             mode == AppOpsManager.MODE_ALLOWED
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             false
         }
     }
@@ -1574,10 +1649,29 @@ object PrivacyAnalyzer {
             val appOpsTimes = queryAppOpsLastAccessMap(context)
         val pm = context.packageManager
         val guardMonitor = LiveGuardMonitor.getInstance(context)
-        val ignored = guardMonitor.ignoredPackages.value
         val liveCapture = guardMonitor.captureState.value
         val now = System.currentTimeMillis()
         val defaultSysIcon: Drawable = context.applicationInfo.loadIcon(pm)
+
+        fun isEventTrustedForSensor(pkg: String?, sensorType: GuardSensorType): Boolean {
+            if (pkg.isNullOrBlank() || pkg == "system.sensor") return false
+            return guardMonitor.isSensorTrusted(pkg, sensorType)
+        }
+
+        fun isPackageFullyTrusted(pkg: String?): Boolean {
+            if (pkg.isNullOrBlank() || pkg == "system.sensor") return false
+            val rule = guardMonitor.trustedRules.value[pkg] ?: return false
+            return rule.trustedSensors.size >= GuardSensorType.entries.size
+        }
+
+        fun sensorTypeForPermission(perm: PlainPermissionInfo): GuardSensorType? = when {
+            perm.permissionName == Manifest.permission.RECORD_AUDIO -> GuardSensorType.MIC
+            perm.permissionName == Manifest.permission.CAMERA -> GuardSensorType.CAMERA
+            perm.category == PermissionCategory.LOCATION -> GuardSensorType.LOCATION
+            perm.permissionName == "SPECIAL_CLIPBOARD_READ" -> GuardSensorType.CLIPBOARD
+            perm.permissionName == "SPECIAL_SCREEN_CAPTURE" || perm.permissionName == "SPECIAL_SCREEN_MIRROR" -> GuardSensorType.SCREEN
+            else -> null
+        }
 
         val timeline = mutableListOf<PermissionAccessEvent>()
 
@@ -1612,7 +1706,7 @@ object PrivacyAnalyzer {
 
         // 0. Live Ongoing Hardware Sessions ("LIVE NOW") — ensures active calls, mic, camera, or screen recording show immediately while happening
         if (liveCapture.isScreenRecordingOrCasting) {
-            val recPkg = liveCapture.suspectedRecorderPackages.firstOrNull { it !in ignored }
+            val recPkg = liveCapture.suspectedRecorderPackages.firstOrNull { !isEventTrustedForSensor(it, GuardSensorType.SCREEN) }
             val (rPkg, rName, rIcon) = resolvePkgMeta(recPkg)
             val isMirror = liveCapture.activeCaptureDisplays.any {
                 it.contains("Mirror", ignoreCase = true) || it.contains("Cast", ignoreCase = true)
@@ -1642,7 +1736,7 @@ object PrivacyAnalyzer {
                 it.appName.equals(micLabel, ignoreCase = true) || it.packageName == micLabel
             }
             val rPkg = matchedApp?.packageName ?: "system.sensor"
-            if (rPkg !in ignored) {
+            if (!isEventTrustedForSensor(rPkg, GuardSensorType.MIC)) {
                 val rName = matchedApp?.appName ?: micLabel ?: "Call / Microphone"
                 val rIcon = matchedApp?.icon ?: defaultSysIcon
                 val pInfo = permissionCatalog[Manifest.permission.RECORD_AUDIO] ?: clipboardTimelineInfo
@@ -1670,7 +1764,7 @@ object PrivacyAnalyzer {
                 it.appName.equals(camLabel, ignoreCase = true) || it.packageName == camLabel
             }
             val rPkg = matchedApp?.packageName ?: "system.sensor"
-            if (rPkg !in ignored) {
+            if (!isEventTrustedForSensor(rPkg, GuardSensorType.CAMERA)) {
                 val rName = matchedApp?.appName ?: camLabel ?: "Camera Sensor"
                 val rIcon = matchedApp?.icon ?: defaultSysIcon
                 val pInfo = permissionCatalog[Manifest.permission.CAMERA] ?: clipboardTimelineInfo
@@ -1694,7 +1788,7 @@ object PrivacyAnalyzer {
 
         // 1. Verified OS AppOps last-access timestamps (only real per-permission timestamps, never fabricated from app launch times)
         for (app in summary.appReports) {
-            if (app.packageName in ignored) continue
+            if (isPackageFullyTrusted(app.packageName)) continue
             val pkgOps = appOpsTimes[app.packageName]
             if (!pkgOps.isNullOrEmpty()) {
                 val candidates = buildList {
@@ -1704,6 +1798,8 @@ object PrivacyAnalyzer {
                 }
 
                 for (perm in candidates) {
+                    val mappedSensor = sensorTypeForPermission(perm)
+                    if (mappedSensor != null && isEventTrustedForSensor(app.packageName, mappedSensor)) continue
                     val appOpTime = pkgOps[perm.permissionName] ?: 0L
                     if (appOpTime in 1L..now) {
                         timeline.add(
@@ -1743,6 +1839,7 @@ object PrivacyAnalyzer {
                     ev.description.contains("File:", ignoreCase = true) ||
                     ev.description.contains("AppOps:", ignoreCase = true) ||
                     ev.description.contains("Route:", ignoreCase = true) ||
+                    ev.description.contains("Screen Mirroring", ignoreCase = true) ||
                     ev.description.contains("OS Screen Recording", ignoreCase = true) ||
                     ev.description.contains("Virtual Display", ignoreCase = true)
                 if (!isDedicatedScreenApp && !hasHardCaptureEvidence) {
@@ -1754,7 +1851,21 @@ object PrivacyAnalyzer {
 
         for (ev in sensorEvents) {
             val pkg = ev.packageName
-            if (pkg != null && pkg in ignored) continue
+            val evSensorType = when (ev.type) {
+                "MIC" -> GuardSensorType.MIC
+                "CAMERA" -> GuardSensorType.CAMERA
+                "LOCATION" -> GuardSensorType.LOCATION
+                "CLIPBOARD" -> GuardSensorType.CLIPBOARD
+                "SCREEN" -> GuardSensorType.SCREEN
+                else -> null
+            }
+            if (pkg != null) {
+                if (evSensorType != null) {
+                    if (isEventTrustedForSensor(pkg, evSensorType)) continue
+                } else if (isPackageFullyTrusted(pkg)) {
+                    continue
+                }
+            }
 
             val isMirrorEvent = ev.type == "SCREEN" && (
                 ev.title.contains("Mirror", ignoreCase = true) ||
@@ -1983,6 +2094,7 @@ object PrivacyAnalyzer {
                             "android:read_media_images" -> Manifest.permission.READ_MEDIA_IMAGES
                             "android:read_media_video" -> Manifest.permission.READ_MEDIA_VIDEO
                             "android:project_media" -> "SPECIAL_SCREEN_CAPTURE"
+                            "android:read_clipboard" -> "SPECIAL_CLIPBOARD_READ"
                             else -> null
                         }
                         if (mappedPerm != null) {
@@ -1998,13 +2110,13 @@ object PrivacyAnalyzer {
 
     private fun getRecentUsageMap(context: Context): Map<String, Long> {
         return try {
-            val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+            val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager ?: return emptyMap()
             val end = System.currentTimeMillis()
             val start = end - (30L * 24 * 60 * 60 * 1000L)
             usm.queryUsageStats(UsageStatsManager.INTERVAL_MONTHLY, start, end)
                 ?.associate { it.packageName to it.lastTimeUsed }
                 ?: emptyMap()
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             emptyMap()
         }
     }

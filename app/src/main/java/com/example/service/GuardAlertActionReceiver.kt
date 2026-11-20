@@ -15,70 +15,77 @@ import com.example.ui.screens.GuardRulesActivity
 class GuardAlertActionReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
-        val action = intent.action ?: return
-        val pkg = intent.getStringExtra(EXTRA_PACKAGE_NAME)
-        val sensorName = intent.getStringExtra(EXTRA_SENSOR_TYPE) ?: GuardSensorType.MIC.name
-        val notificationId = intent.getIntExtra(EXTRA_NOTIFICATION_ID, 1003)
-        val monitor = LiveGuardMonitor.getInstance(context)
-        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        try {
+            val action = intent.action ?: return
+            val pkg = intent.getStringExtra(EXTRA_PACKAGE_NAME)
+            val sensorName = intent.getStringExtra(EXTRA_SENSOR_TYPE) ?: GuardSensorType.MIC.name
+            val notificationId = intent.getIntExtra(EXTRA_NOTIFICATION_ID, 1003)
+            val monitor = LiveGuardMonitor.getInstance(context)
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
 
-        when (action) {
-            ACTION_SNOOZE_1H -> {
-                val sensor = try {
-                    GuardSensorType.valueOf(sensorName)
-                } catch (_: Exception) {
-                    GuardSensorType.MIC
-                }
-                val targetKey = if (!pkg.isNullOrBlank()) pkg else "SENSOR:${sensor.name}"
-                val label = resolveAppLabel(context, pkg) ?: "All ${sensor.label} Alerts"
-                monitor.snoozeTarget(targetKey, label, durationMs = 3_600_000L)
-                nm.cancel(notificationId)
-                postQuietConfirmation(
-                    context = context,
-                    nm = nm,
-                    title = "Snoozed for 1 hour: $label",
-                    text = "Tap to manage or resume in Guard Rules.",
-                    undoAction = null
-                )
-            }
-
-            ACTION_TRUST_APP -> {
-                if (!pkg.isNullOrBlank()) {
-                    val label = resolveAppLabel(context, pkg) ?: pkg
-                    monitor.setAppTrust(
-                        packageName = pkg,
-                        sensors = GuardSensorType.entries.toSet(),
-                        source = "Notification action"
-                    )
-                    nm.cancel(notificationId)
-
-                    val undoIntent = Intent(context, GuardAlertActionReceiver::class.java).apply {
-                        this.action = ACTION_UNDO_TRUST
-                        putExtra(EXTRA_PACKAGE_NAME, pkg)
-                        putExtra(EXTRA_NOTIFICATION_ID, CONFIRM_NOTIFICATION_ID)
+            when (action) {
+                ACTION_SNOOZE_1H -> {
+                    val sensor = try {
+                        GuardSensorType.valueOf(sensorName)
+                    } catch (_: Exception) {
+                        GuardSensorType.MIC
                     }
-                    val undoPi = PendingIntent.getBroadcast(
-                        context,
-                        pkg.hashCode(),
-                        undoIntent,
-                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                    )
-                    postQuietConfirmation(
-                        context = context,
-                        nm = nm,
-                        title = "Trusted $label in Live Guard",
-                        text = "Alerts muted for $label. Tap to review rules.",
-                        undoAction = NotificationCompat.Action.Builder(0, "Undo", undoPi).build()
-                    )
+                    val targetKey = if (!pkg.isNullOrBlank()) pkg else "SENSOR:${sensor.name}"
+                    val label = resolveAppLabel(context, pkg) ?: "All ${sensor.label} Alerts"
+                    monitor.snoozeTarget(targetKey, label, durationMs = 3_600_000L)
+                    nm?.cancel(notificationId)
+                    if (nm != null) {
+                        postQuietConfirmation(
+                            context = context,
+                            nm = nm,
+                            title = "Snoozed for 1 hour: $label",
+                            text = "Tap to manage or resume in Guard Rules.",
+                            undoAction = null
+                        )
+                    }
                 }
-            }
 
-            ACTION_UNDO_TRUST -> {
-                if (!pkg.isNullOrBlank()) {
-                    monitor.removeAppTrust(pkg)
+                ACTION_TRUST_APP -> {
+                    if (!pkg.isNullOrBlank()) {
+                        val label = resolveAppLabel(context, pkg) ?: pkg
+                        monitor.setAppTrust(
+                            packageName = pkg,
+                            sensors = GuardSensorType.entries.toSet(),
+                            source = "Notification action"
+                        )
+                        nm?.cancel(notificationId)
+
+                        val undoIntent = Intent(context, GuardAlertActionReceiver::class.java).apply {
+                            this.action = ACTION_UNDO_TRUST
+                            putExtra(EXTRA_PACKAGE_NAME, pkg)
+                            putExtra(EXTRA_NOTIFICATION_ID, CONFIRM_NOTIFICATION_ID)
+                        }
+                        val undoPi = PendingIntent.getBroadcast(
+                            context,
+                            pkg.hashCode(),
+                            undoIntent,
+                            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                        )
+                        if (nm != null) {
+                            postQuietConfirmation(
+                                context = context,
+                                nm = nm,
+                                title = "Trusted $label in Live Guard",
+                                text = "Alerts muted for $label. Tap to review rules.",
+                                undoAction = NotificationCompat.Action.Builder(0, "Undo", undoPi).build()
+                            )
+                        }
+                    }
                 }
-                nm.cancel(notificationId)
+
+                ACTION_UNDO_TRUST -> {
+                    if (!pkg.isNullOrBlank()) {
+                        monitor.removeAppTrust(pkg)
+                    }
+                    nm?.cancel(notificationId)
+                }
             }
+        } catch (_: Throwable) {
         }
     }
 

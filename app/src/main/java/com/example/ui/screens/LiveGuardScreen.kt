@@ -152,6 +152,8 @@ import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.ui.theme.TextTertiary
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -261,17 +263,12 @@ fun LiveGuardScreen() {
         events.firstOrNull { it.type != "AUDIT" }?.id ?: 0L
     }
 
+    // Full 12-vector audit + timeline refresh only on lifecycle resume, app install/remove, or trust/ack changes
     LaunchedEffect(
         refreshTrigger,
         globalRefreshVersion,
         ignoredPackages,
-        acknowledgedVectors,
-        latestSensorEventId,
-        captureState.isScreenRecordingOrCasting,
-        captureState.isMicActive,
-        captureState.isCameraActive,
-        captureState.isBackgroundLocationActive,
-        captureState.isClipboardAccessedRecently
+        acknowledgedVectors
     ) {
         if (!isScanning) {
             try {
@@ -296,6 +293,32 @@ fun LiveGuardScreen() {
         }
     }
 
+    // Fast lightweight timeline refresh when live sensor state changes (avoids re-running all 12 APK audit vectors)
+    LaunchedEffect(
+        latestSensorEventId,
+        captureState.isScreenRecordingOrCasting,
+        captureState.isMicActive,
+        captureState.isCameraActive,
+        captureState.isBackgroundLocationActive,
+        captureState.isClipboardAccessedRecently
+    ) {
+        if (!isScanning && auditVectors.isNotEmpty()) {
+            try {
+                val timeline = withContext(Dispatchers.IO) {
+                    PrivacyAnalyzer.getPermissionAccessTimeline(
+                        context,
+                        includeSystemApps = false,
+                        forceRefresh = true
+                    )
+                }
+                accessTimeline = timeline
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
     val filteredTimeline = remember(accessTimeline, activeTimelineFilter) {
         when (activeTimelineFilter) {
             "LOCATION" -> accessTimeline.filter { it.category == PermissionCategory.LOCATION }
@@ -312,18 +335,34 @@ fun LiveGuardScreen() {
         if (isScanning) return
         coroutineScope.launch {
             isScanning = true
+            scanProgress = 0.12f
             try {
-                for (step in 1..4) {
-                    scanProgress = step * 0.25f
-                    delay(180)
-                }
-                val (results, timeline) = withContext(Dispatchers.IO) {
-                    val v = guardMonitor.runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = true)
-                    val t = PrivacyAnalyzer.getPermissionAccessTimeline(context, includeSystemApps = false, forceRefresh = true)
-                    v to t
+                val (results, timeline) = coroutineScope {
+                    val scanJob = async(Dispatchers.IO) {
+                        val v = guardMonitor.runDeepSecurityAudit(includeSystemApps = false, logAuditEvent = true)
+                        val t = PrivacyAnalyzer.getPermissionAccessTimeline(
+                            context,
+                            includeSystemApps = false,
+                            forceRefresh = true
+                        )
+                        v to t
+                    }
+                    // Advance progress smoothly while the real scan executes concurrently
+                    var current = 0.18f
+                    while (!scanJob.isCompleted && current < 0.92f) {
+                        scanProgress = current
+                        delay(110)
+                        current = (current + 0.14f).coerceAtMost(0.92f)
+                    }
+                    val output = scanJob.await()
+                    scanProgress = 1f
+                    output
                 }
                 auditVectors = results
                 accessTimeline = timeline
+                if (selectedVector != null) {
+                    selectedVector = results.find { it.id == selectedVector?.id }
+                }
             } catch (ce: kotlinx.coroutines.CancellationException) {
                 throw ce
             } catch (_: Throwable) {
@@ -333,8 +372,7 @@ fun LiveGuardScreen() {
         }
     }
 
-    if (selectedVector != null) {
-        val vector = selectedVector!!
+    selectedVector?.let { vector ->
         ModalBottomSheet(
             onDismissRequest = { selectedVector = null },
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
@@ -346,10 +384,10 @@ fun LiveGuardScreen() {
                 onOpenSettings = { actionStr ->
                     try {
                         context.startActivity(Intent(actionStr))
-                    } catch (_: Exception) {
+                    } catch (_: Throwable) {
                         try {
                             context.startActivity(Intent(Settings.ACTION_SETTINGS))
-                        } catch (_: Exception) {
+                        } catch (_: Throwable) {
                         }
                     }
                 },
@@ -361,7 +399,7 @@ fun LiveGuardScreen() {
                                 Uri.fromParts("package", pkg, null)
                             )
                         )
-                    } catch (_: Exception) {
+                    } catch (_: Throwable) {
                     }
                 },
                 onIgnoreApp = { pkg, appLabel ->
@@ -515,7 +553,11 @@ fun LiveGuardScreen() {
                     tint = AuraRose,
                     onAction = {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            notificationPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            try {
+                                notificationPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            } catch (_: Throwable) {
+                                openAppNotificationSettings(context)
+                            }
                         } else {
                             openAppNotificationSettings(context)
                         }
@@ -562,9 +604,13 @@ fun LiveGuardScreen() {
             isScanning = isScanning,
             scanProgress = scanProgress,
             onScreenClick = {
-                try {
-                    context.startActivity(Intent(context, GuardRulesActivity::class.java))
-                } catch (_: Throwable) {
+                auditVectors.firstOrNull { it.id == "screen_recording" }?.let {
+                    selectedVector = it
+                } ?: run {
+                    try {
+                        context.startActivity(Intent(context, GuardRulesActivity::class.java))
+                    } catch (_: Throwable) {
+                    }
                 }
             },
             onMicClick = {
@@ -576,12 +622,30 @@ fun LiveGuardScreen() {
                 activeTimelineFilter = "CAMERA"
             },
             onLocationClick = {
-                activeSubTab = "TIMELINE"
-                activeTimelineFilter = "LOCATION"
+                if (!captureState.isAppOpsIntrospectionAvailable) {
+                    auditVectors.firstOrNull { it.id == "bg_location" }?.let {
+                        selectedVector = it
+                    } ?: run {
+                        activeSubTab = "TIMELINE"
+                        activeTimelineFilter = "LOCATION"
+                    }
+                } else {
+                    activeSubTab = "TIMELINE"
+                    activeTimelineFilter = "LOCATION"
+                }
             },
             onClipboardClick = {
-                activeSubTab = "TIMELINE"
-                activeTimelineFilter = "SPECIAL_ACCESS"
+                if (!captureState.isAppOpsIntrospectionAvailable) {
+                    auditVectors.firstOrNull { it.id == "clipboard_access" }?.let {
+                        selectedVector = it
+                    } ?: run {
+                        activeSubTab = "TIMELINE"
+                        activeTimelineFilter = "SPECIAL_ACCESS"
+                    }
+                } else {
+                    activeSubTab = "TIMELINE"
+                    activeTimelineFilter = "SPECIAL_ACCESS"
+                }
             }
         )
 
@@ -770,7 +834,8 @@ fun LiveGuardScreen() {
                                     .clickable {
                                         try {
                                             context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
-                                        } catch (_: Exception) {}
+                                        } catch (_: Throwable) {
+                                        }
                                     }
                             ) {
                                 Row(
@@ -889,7 +954,8 @@ fun LiveGuardScreen() {
                                             if (item.packageName == "system.sensor") {
                                                 try {
                                                     context.startActivity(Intent(Settings.ACTION_PRIVACY_SETTINGS))
-                                                } catch (_: Exception) {}
+                                                } catch (_: Throwable) {
+                                                }
                                             } else {
                                                 PrivacyAnalyzer.openSpecificPermissionSettings(
                                                     context,
@@ -1251,7 +1317,10 @@ private fun CompactHardwareShieldCard(
                         captureState.isScreenRecordingOrCasting ->
                             captureState.activeCaptureDisplays.firstOrNull() ?: "Display is being mirrored or recorded"
                         activeSensorSummary.isNotEmpty() -> activeSensorSummary
-                        else -> "No background capture, GPS, or clipboard snooping"
+                        captureState.isAppOpsIntrospectionAvailable ->
+                            "Screen, Mic, Cam, GPS & Clipboard live monitors ready"
+                        else ->
+                            "Live Screen, Mic & Cam active • GPS & Clipboard via OS Posture"
                     },
                     color = TextSecondary,
                     style = MaterialTheme.typography.bodySmall,
@@ -1289,7 +1358,7 @@ private fun CompactHardwareShieldCard(
                 modifier = Modifier.weight(1f),
                 icon = Icons.AutoMirrored.Filled.ScreenShare,
                 label = "Screen",
-                status = if (captureState.isScreenRecordingOrCasting) "Rec" else "Safe",
+                status = if (captureState.isScreenRecordingOrCasting) "Rec" else "Live",
                 isActive = captureState.isScreenRecordingOrCasting,
                 activeColor = AuraRose,
                 onClick = onScreenClick
@@ -1316,18 +1385,28 @@ private fun CompactHardwareShieldCard(
                 modifier = Modifier.weight(1f),
                 icon = Icons.Default.MyLocation,
                 label = "GPS",
-                status = if (captureState.isBackgroundLocationActive) "Active" else "Idle",
+                status = when {
+                    captureState.isBackgroundLocationActive -> "Active"
+                    captureState.isAppOpsIntrospectionAvailable -> "Idle"
+                    else -> "Audit"
+                },
                 isActive = captureState.isBackgroundLocationActive,
                 activeColor = AuraOrange,
+                idleColor = if (captureState.isAppOpsIntrospectionAvailable) AuraGreen else AuraCyan,
                 onClick = onLocationClick
             )
             LiveSensorChip(
                 modifier = Modifier.weight(1f),
                 icon = Icons.Default.ContentPaste,
                 label = "Clip",
-                status = if (captureState.isClipboardAccessedRecently) "Read" else "Safe",
+                status = when {
+                    captureState.isClipboardAccessedRecently -> "Read"
+                    captureState.isAppOpsIntrospectionAvailable -> "Safe"
+                    else -> "OS Safe"
+                },
                 isActive = captureState.isClipboardAccessedRecently,
                 activeColor = AuraPurple,
+                idleColor = if (captureState.isAppOpsIntrospectionAvailable) AuraGreen else AuraCyan,
                 onClick = onClipboardClick
             )
         }
@@ -1386,9 +1465,10 @@ private fun LiveSensorChip(
     status: String,
     isActive: Boolean,
     activeColor: Color,
+    idleColor: Color = AuraGreen,
     onClick: () -> Unit
 ) {
-    val tint = if (isActive) activeColor else AuraGreen
+    val tint = if (isActive) activeColor else idleColor
     Column(
         modifier = modifier
             .clip(RoundedCornerShape(12.dp))

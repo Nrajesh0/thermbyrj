@@ -139,6 +139,8 @@ import com.example.service.ShredJobCoordinator
 import com.example.service.ShredStandard
 import com.example.service.ShredTarget
 import com.example.service.StorageScanCache
+import com.example.service.safeStartActivity
+import com.example.service.toSafeComposeBitmap
 import com.example.ui.components.ActiveFilePreview
 import com.example.ui.components.BuiltInFilePreviewHost
 import com.example.ui.components.ExpandableSearchBar
@@ -355,13 +357,14 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
             val q = searchQuery.trim().lowercase()
             albumFiltered.filter { it.name.lowercase().contains(q) }
         }
+        val deduped = filtered.distinctBy { "${it.id}_${it.path}" }
         when (sortOption) {
-            "Size (High to Low)" -> filtered.sortedByDescending { it.size }
-            "Size (Low to High)" -> filtered.sortedBy { it.size }
-            "Date (Newest)" -> filtered.sortedByDescending { it.dateModified }
-            "Date (Oldest)" -> filtered.sortedBy { it.dateModified }
-            "Name (A-Z)" -> filtered.sortedBy { it.name.lowercase() }
-            else -> filtered
+            "Size (High to Low)" -> deduped.sortedByDescending { it.size }
+            "Size (Low to High)" -> deduped.sortedBy { it.size }
+            "Date (Newest)" -> deduped.sortedByDescending { it.dateModified }
+            "Date (Oldest)" -> deduped.sortedBy { it.dateModified }
+            "Name (A-Z)" -> deduped.sortedBy { it.name.lowercase() }
+            else -> deduped
         }
     }
 
@@ -410,10 +413,12 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
         }
         if (uris.isEmpty()) return
         try {
+            val firstSelected = selectedItems.firstOrNull()
+            val firstUri = uris.firstOrNull() ?: return
             val intent = if (uris.size == 1) {
                 Intent(Intent.ACTION_SEND).apply {
-                    type = selectedItems.first().mimeType
-                    putExtra(Intent.EXTRA_STREAM, uris.first())
+                    type = firstSelected?.mimeType ?: "*/*"
+                    putExtra(Intent.EXTRA_STREAM, firstUri)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
             } else {
@@ -423,8 +428,8 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
             }
-            context.startActivity(Intent.createChooser(intent, "Share Files"))
-        } catch (_: Exception) {
+            context.safeStartActivity(Intent.createChooser(intent, "Share Files"), "Unable to share selected files")
+        } catch (_: Throwable) {
             Toast.makeText(context, "Unable to share selected files", Toast.LENGTH_SHORT).show()
         }
     }
@@ -749,8 +754,7 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
     )
 
     // Rename Dialog
-    if (itemForRename != null) {
-        val target = itemForRename!!
+    itemForRename?.let { target ->
         AlertDialog(
             onDismissRequest = { itemForRename = null },
             containerColor = GlassPanel,
@@ -799,8 +803,7 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
     }
 
     // Item Details Sheet
-    if (itemForDetails != null) {
-        val target = itemForDetails!!
+    itemForDetails?.let { target ->
         CategoryFileDetailsSheet(
             item = target,
             onShowInFolder = {
@@ -812,8 +815,7 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
     }
 
     // Item Context Action Sheet
-    if (itemForMenu != null) {
-        val target = itemForMenu!!
+    itemForMenu?.let { target ->
         ModalBottomSheet(
             onDismissRequest = { itemForMenu = null },
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
@@ -934,8 +936,9 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                 },
                 actions = {
                     if (isSelectionMode) {
-                        if (selectedItems.size == 1) {
-                            IconButton(onClick = { itemForMenu = selectedItems.first() }) {
+                        val singleItem = if (selectedItems.size == 1) selectedItems.firstOrNull() else null
+                        if (singleItem != null) {
+                            IconButton(onClick = { itemForMenu = singleItem }) {
                                 Icon(Icons.Default.MoreVert, contentDescription = "More Actions", tint = AuraCyan)
                             }
                         }
@@ -1108,7 +1111,13 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                     }
                     Spacer(modifier = Modifier.width(8.dp))
                     Button(
-                        onClick = { mediaPermLauncher.launch(PermissionUtils.requiredMediaPermissions()) },
+                        onClick = {
+                            try {
+                                mediaPermLauncher.launch(PermissionUtils.requiredMediaPermissions())
+                            } catch (_: Throwable) {
+                                PermissionUtils.launchAppDetailsSettings(context)
+                            }
+                        },
                         colors = ButtonDefaults.buttonColors(containerColor = AuraCyan)
                     ) {
                         Text("Grant", color = Obsidian, fontWeight = FontWeight.Bold)
@@ -1155,7 +1164,13 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                         )
                         if (searchQuery.isBlank() && !hasMediaPerm && !hasManageStorage) {
                             Spacer(modifier = Modifier.height(12.dp))
-                            OutlinedButton(onClick = { mediaPermLauncher.launch(PermissionUtils.requiredMediaPermissions()) }) {
+                            OutlinedButton(onClick = {
+                                try {
+                                    mediaPermLauncher.launch(PermissionUtils.requiredMediaPermissions())
+                                } catch (_: Throwable) {
+                                    PermissionUtils.launchAppDetailsSettings(context)
+                                }
+                            }) {
                                 Text("Grant Media Permission", color = AuraCyan)
                             }
                         }
@@ -1290,8 +1305,8 @@ private fun CategoryFileDetailsSheet(
             InfoRow("MIME TYPE", item.mimeType)
             InfoRow("SIZE", formatBytes(item.size))
             InfoRow("MODIFIED", dateStr)
-            if (sha256Hash != null) {
-                InfoRow("SHA-256", sha256Hash!!)
+            sha256Hash?.let { hash ->
+                InfoRow("SHA-256", hash)
             }
             if (item.path.isNotBlank()) {
                 Spacer(modifier = Modifier.height(8.dp))
@@ -1366,9 +1381,10 @@ fun MediaThumbnail(
         modifier = modifier.background(color.copy(alpha = 0.15f)),
         contentAlignment = Alignment.Center
     ) {
-        if (bitmap != null) {
+        val safeBmp = remember(bitmap) { bitmap.toSafeComposeBitmap() }
+        if (safeBmp != null) {
             Image(
-                bitmap = bitmap!!.asImageBitmap(),
+                bitmap = safeBmp.asImageBitmap(),
                 contentDescription = file.name,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()

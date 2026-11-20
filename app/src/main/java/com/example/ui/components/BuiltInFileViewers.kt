@@ -92,6 +92,7 @@ import androidx.core.content.FileProvider
 import com.example.InfoRow
 import com.example.formatBytes
 import com.example.service.FileManagerOps
+import com.example.service.toSafeComposeBitmap
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
 import com.example.ui.theme.AuraOrange
@@ -292,9 +293,10 @@ private fun InAppImageViewerDialog(
                     },
                 contentAlignment = Alignment.Center
             ) {
-                if (bitmap != null) {
+                val safeBmp = remember(bitmap) { bitmap.toSafeComposeBitmap() }
+                if (safeBmp != null) {
                     Image(
-                        bitmap = bitmap!!.asImageBitmap(),
+                        bitmap = safeBmp.asImageBitmap(),
                         contentDescription = file.name,
                         contentScale = ContentScale.Fit,
                         modifier = Modifier
@@ -425,26 +427,27 @@ private fun InAppTextViewerDialog(
     LaunchedEffect(file.absolutePath, inMemoryText) {
         if (inMemoryText != null) {
             content = inMemoryText
+            truncated = false
             readError = null
             return@LaunchedEffect
         }
-        withContext(Dispatchers.IO) {
+        val result = withContext(Dispatchers.IO) {
             try {
                 val maxRead = 512 * 1024
                 if (file.length() > maxRead) {
-                    truncated = true
                     val buf = ByteArray(maxRead)
-                    file.inputStream().use { it.read(buf) }
-                    content = String(buf)
+                    val readCount = file.inputStream().use { it.read(buf) }.coerceAtLeast(0)
+                    Triple(String(buf, 0, readCount), true, null as String?)
                 } else {
-                    truncated = false
-                    content = file.readText()
+                    Triple(file.readText(), false, null as String?)
                 }
-                readError = null
-            } catch (e: Exception) {
-                readError = e.message ?: "Cannot read file"
+            } catch (e: Throwable) {
+                Triple("", false, e.message ?: "Cannot read file")
             }
         }
+        content = result.first
+        truncated = result.second
+        readError = result.third
     }
 
     Dialog(
@@ -526,9 +529,10 @@ private fun InAppTextViewerDialog(
 
             HorizontalDivider(color = GlassBorder)
 
-            if (readError != null) {
+            val currentReadError = readError
+            if (currentReadError != null) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text(readError!!, color = AuraRose)
+                    Text(currentReadError, color = AuraRose)
                 }
             } else if (isEditing) {
                 OutlinedTextField(
@@ -586,7 +590,7 @@ private fun InAppZipViewerDialog(
     var loadError by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(file.absolutePath) {
-        withContext(Dispatchers.IO) {
+        val result = withContext(Dispatchers.IO) {
             try {
                 val list = mutableListOf<ZipEntryPreview>()
                 ZipInputStream(file.inputStream().buffered()).use { zis ->
@@ -603,12 +607,13 @@ private fun InAppZipViewerDialog(
                         entry = zis.nextEntry
                     }
                 }
-                entries = list
-                loadError = null
-            } catch (e: Exception) {
-                loadError = e.message ?: "Unable to read archive"
+                list to (null as String?)
+            } catch (e: Throwable) {
+                emptyList<ZipEntryPreview>() to (e.message ?: "Unable to read archive")
             }
         }
+        entries = result.first
+        loadError = result.second
     }
 
     Dialog(onDismissRequest = onDismiss) {
@@ -634,8 +639,9 @@ private fun InAppZipViewerDialog(
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            if (loadError != null) {
-                Text(loadError!!, color = AuraRose, style = MaterialTheme.typography.bodySmall)
+            val currentLoadError = loadError
+            if (currentLoadError != null) {
+                Text(currentLoadError, color = AuraRose, style = MaterialTheme.typography.bodySmall)
             } else {
                 LazyColumn(
                     modifier = Modifier
@@ -732,19 +738,22 @@ private fun InAppApkViewerSheet(
                     @Suppress("DEPRECATION")
                     pkg.versionCode.toLong()
                 }
-                val iconBmp = appInfo?.loadIcon(pm)?.let { drawable ->
-                    if (drawable is BitmapDrawable && drawable.bitmap != null) drawable.bitmap
-                    else {
-                        val bmp = Bitmap.createBitmap(
-                            drawable.intrinsicWidth.coerceAtLeast(64),
-                            drawable.intrinsicHeight.coerceAtLeast(64),
-                            Bitmap.Config.ARGB_8888
-                        )
-                        val canvas = Canvas(bmp)
-                        drawable.setBounds(0, 0, canvas.width, canvas.height)
-                        drawable.draw(canvas)
-                        bmp
+                val iconBmp = try {
+                    appInfo?.loadIcon(pm)?.let { drawable ->
+                        if (drawable is BitmapDrawable && drawable.bitmap != null && !drawable.bitmap.isRecycled) {
+                            drawable.bitmap.toSafeComposeBitmap()
+                        } else {
+                            val w = drawable.intrinsicWidth.coerceIn(64, 128)
+                            val h = drawable.intrinsicHeight.coerceIn(64, 128)
+                            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                            val canvas = Canvas(bmp)
+                            drawable.setBounds(0, 0, canvas.width, canvas.height)
+                            drawable.draw(canvas)
+                            bmp
+                        }
                     }
+                } catch (_: Throwable) {
+                    null
                 }
                 ApkMetadata(
                     appName = label,
@@ -754,7 +763,7 @@ private fun InAppApkViewerSheet(
                     permissions = pkg.requestedPermissions?.map { it.substringAfterLast('.') }.orEmpty(),
                     icon = iconBmp
                 )
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
                 null
             }
         }
@@ -766,6 +775,8 @@ private fun InAppApkViewerSheet(
         containerColor = GlassPanel,
         contentColor = TextPrimary
     ) {
+        val currentMeta = meta
+        val safeIcon = remember(currentMeta?.icon) { currentMeta?.icon.toSafeComposeBitmap() }
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -773,10 +784,10 @@ private fun InAppApkViewerSheet(
                 .padding(horizontal = 24.dp, vertical = 12.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                if (meta?.icon != null) {
+                if (safeIcon != null && currentMeta != null) {
                     Image(
-                        bitmap = meta!!.icon!!.asImageBitmap(),
-                        contentDescription = meta!!.appName,
+                        bitmap = safeIcon.asImageBitmap(),
+                        contentDescription = currentMeta.appName,
                         modifier = Modifier.size(48.dp).clip(RoundedCornerShape(12.dp))
                     )
                 } else {
@@ -789,21 +800,21 @@ private fun InAppApkViewerSheet(
                 }
                 Spacer(modifier = Modifier.width(12.dp))
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(meta?.appName ?: file.name, color = TextPrimary, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                    Text(meta?.packageName ?: "Android Package", color = TextTertiary, style = MaterialTheme.typography.labelSmall)
+                    Text(currentMeta?.appName ?: file.name, color = TextPrimary, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    Text(currentMeta?.packageName ?: "Android Package", color = TextTertiary, style = MaterialTheme.typography.labelSmall)
                 }
             }
 
             Spacer(modifier = Modifier.height(14.dp))
             InfoRow("FILE", file.name)
             InfoRow("SIZE", formatBytes(file.length()))
-            if (meta != null) {
-                InfoRow("VERSION", "${meta!!.versionName} (${meta!!.versionCode})")
-                InfoRow("PERMISSIONS", "${meta!!.permissions.size} declared")
-                if (meta!!.permissions.isNotEmpty()) {
+            if (currentMeta != null) {
+                InfoRow("VERSION", "${currentMeta.versionName} (${currentMeta.versionCode})")
+                InfoRow("PERMISSIONS", "${currentMeta.permissions.size} declared")
+                if (currentMeta.permissions.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        meta!!.permissions.take(12).joinToString(" • "),
+                        currentMeta.permissions.take(12).joinToString(" • "),
                         color = TextSecondary,
                         style = MaterialTheme.typography.labelSmall
                     )

@@ -62,7 +62,7 @@ data class ShredJobState(
 )
 
 object ShredJobCoordinator {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + safeCoroutineExceptionHandler())
     private val _state = MutableStateFlow(ShredJobState())
     val state: StateFlow<ShredJobState> = _state.asStateFlow()
 
@@ -77,17 +77,8 @@ object ShredJobCoordinator {
         if (targets.isEmpty() || _state.value.isRunning) return false
         val appContext = context.applicationContext
 
-        try {
-            val svcIntent = Intent(appContext, FileShredService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                appContext.startForegroundService(svcIntent)
-            } else {
-                appContext.startService(svcIntent)
-            }
-        } catch (_: Exception) {
-        }
-
         val initialTotal = targets.size.coerceAtLeast(1)
+        // Set running state BEFORE starting FileShredService so onStartCommand never sees isRunning == false
         _state.value = ShredJobState(
             isRunning = true,
             progress = 0f,
@@ -100,19 +91,38 @@ object ShredJobCoordinator {
             attemptedTargetUris = targets.mapNotNull { it.contentUri?.toString() }.toSet()
         )
 
+        try {
+            val svcIntent = Intent(appContext, FileShredService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                appContext.startForegroundService(svcIntent)
+            } else {
+                appContext.startService(svcIntent)
+            }
+        } catch (_: Throwable) {
+        }
+
         activeJob = scope.launch {
-            val result = FileShredder.shredTargets(
-                context = appContext,
-                targets = targets,
-                standard = standard
-            ) { done, total, label ->
-                val fraction = if (total > 0) (done.toFloat() / total.toFloat()).coerceIn(0f, 1f) else 0f
-                _state.value = _state.value.copy(
-                    isRunning = true,
-                    progress = fraction,
-                    completedFiles = done,
-                    totalFiles = total,
-                    statusText = label
+            val result = try {
+                FileShredder.shredTargets(
+                    context = appContext,
+                    targets = targets,
+                    standard = standard,
+                    onDetailedProgress = { fraction, done, total, label ->
+                        _state.value = _state.value.copy(
+                            isRunning = true,
+                            progress = fraction.coerceIn(0f, 1f),
+                            completedFiles = done,
+                            totalFiles = total,
+                            statusText = label
+                        )
+                    }
+                )
+            } catch (_: Throwable) {
+                ShredResult(
+                    shreddedCount = 0,
+                    totalBytesWiped = 0L,
+                    blockedForOverwrite = emptyList(),
+                    failedTargets = targets
                 )
             }
 
@@ -179,6 +189,7 @@ object FileShredder {
         context: Context,
         targets: List<ShredTarget>,
         standard: ShredStandard = ShredStandard.DOD_5220_22_M,
+        onDetailedProgress: ((fraction: Float, completedFiles: Int, totalFiles: Int, statusLabel: String) -> Unit)? = null,
         onProgress: (completedFiles: Int, totalFiles: Int, statusLabel: String) -> Unit = { _, _, _ -> }
     ): ShredResult {
         val expandedFiles = mutableListOf<ShredTarget>()
@@ -210,6 +221,15 @@ object FileShredder {
             val file = target.file
             val fileName = file.name.ifBlank { "File ${idx + 1}" }
             onProgress(idx, total, "Shredding $fileName...")
+            onDetailedProgress?.invoke(idx.toFloat() / total.toFloat(), idx, total, "Shredding $fileName...")
+
+            val perFileProgress: (Int, Int, Float) -> Unit = { passNum, totalPasses, passFraction ->
+                val fileFraction = ((passNum - 1) + passFraction.coerceIn(0f, 1f)) / totalPasses.coerceAtLeast(1).toFloat()
+                val overallFraction = ((idx + fileFraction) / total.toFloat()).coerceIn(0f, 1f)
+                val pct = (passFraction.coerceIn(0f, 1f) * 100f).toInt()
+                val label = "Pass $passNum/$totalPasses · $fileName ($pct%)"
+                onDetailedProgress?.invoke(overallFraction, idx, total, label)
+            }
 
             var wipedSuccessfully = false
             val fileLen = if (file.exists()) file.length() else 0L
@@ -221,7 +241,8 @@ object FileShredder {
                     file = file,
                     contentUri = target.contentUri,
                     standard = standard,
-                    buffer = buffer
+                    buffer = buffer,
+                    onPassProgress = perFileProgress
                 )
                 clearInterruptedShredPath(context)
             } else if (target.contentUri != null) {
@@ -233,7 +254,8 @@ object FileShredder {
                     uri = target.contentUri,
                     fileLengthHint = fileLen,
                     standard = standard,
-                    buffer = buffer
+                    buffer = buffer,
+                    onPassProgress = perFileProgress
                 )
                 clearInterruptedShredPath(context)
             }
@@ -250,7 +272,9 @@ object FileShredder {
                 failed.add(target)
             }
 
-            onProgress(idx + 1, total, "Completed ${idx + 1} / $total")
+            val doneLabel = "Completed ${idx + 1} / $total"
+            onProgress(idx + 1, total, doneLabel)
+            onDetailedProgress?.invoke((idx + 1).toFloat() / total.toFloat(), idx + 1, total, doneLabel)
         }
 
         // Remove empty shredded subdirectories bottom-up
@@ -279,7 +303,8 @@ object FileShredder {
         file: File,
         contentUri: Uri?,
         standard: ShredStandard,
-        buffer: ByteArray
+        buffer: ByteArray,
+        onPassProgress: (passNum: Int, totalPasses: Int, passFraction: Float) -> Unit
     ): Boolean {
         val originalPath = file.absolutePath
         return try {
@@ -287,12 +312,12 @@ object FileShredder {
             if (length > 0L) {
                 when (standard) {
                     ShredStandard.DOD_5220_22_M -> {
-                        overwritePass(file, length, mode = 0, buffer = buffer) // 0x00
-                        overwritePass(file, length, mode = 1, buffer = buffer) // 0xFF
-                        overwritePass(file, length, mode = 2, buffer = buffer) // Random
+                        overwritePass(file, length, mode = 0, buffer = buffer) { f -> onPassProgress(1, 3, f) }
+                        overwritePass(file, length, mode = 1, buffer = buffer) { f -> onPassProgress(2, 3, f) }
+                        overwritePass(file, length, mode = 2, buffer = buffer) { f -> onPassProgress(3, 3, f) }
                     }
                     ShredStandard.NIST_SP_800_88 -> {
-                        overwritePass(file, length, mode = 2, buffer = buffer) // Random
+                        overwritePass(file, length, mode = 2, buffer = buffer) { f -> onPassProgress(1, 1, f) }
                     }
                 }
             }
@@ -315,14 +340,22 @@ object FileShredder {
         }
     }
 
-    private fun overwritePass(file: File, length: Long, mode: Int, buffer: ByteArray) {
+    private fun overwritePass(
+        file: File,
+        length: Long,
+        mode: Int,
+        buffer: ByteArray,
+        onFraction: (Float) -> Unit
+    ) {
         RandomAccessFile(file, "rws").use { raf ->
             raf.seek(0L)
             var written = 0L
+            var lastEmitMs = 0L
             when (mode) {
                 0 -> java.util.Arrays.fill(buffer, 0x00.toByte())
                 1 -> java.util.Arrays.fill(buffer, 0xFF.toByte())
             }
+            onFraction(0f)
             while (written < length) {
                 if (mode == 2) {
                     random.nextBytes(buffer)
@@ -330,6 +363,11 @@ object FileShredder {
                 val toWrite = minOf(buffer.size.toLong(), length - written).toInt()
                 raf.write(buffer, 0, toWrite)
                 written += toWrite
+                val now = System.currentTimeMillis()
+                if (now - lastEmitMs >= 150L || written >= length) {
+                    lastEmitMs = now
+                    onFraction((written.toFloat() / length.toFloat()).coerceIn(0f, 1f))
+                }
             }
             raf.fd.sync()
         }
@@ -340,7 +378,8 @@ object FileShredder {
         uri: Uri,
         fileLengthHint: Long,
         standard: ShredStandard,
-        buffer: ByteArray
+        buffer: ByteArray,
+        onPassProgress: (passNum: Int, totalPasses: Int, passFraction: Float) -> Unit
     ): Boolean {
         return try {
             val pfd = context.contentResolver.openFileDescriptor(uri, "rw") ?: return false
@@ -350,18 +389,25 @@ object FileShredder {
                 if (actualLen > 0L) {
                     FileOutputStream(descriptor.fileDescriptor).use { fos ->
                         val ch = fos.channel
-                        passes.forEach { mode ->
+                        passes.forEachIndexed { passIdx, mode ->
                             ch.position(0L)
                             when (mode) {
                                 0 -> java.util.Arrays.fill(buffer, 0x00.toByte())
                                 1 -> java.util.Arrays.fill(buffer, 0xFF.toByte())
                             }
                             var written = 0L
+                            var lastEmitMs = 0L
+                            onPassProgress(passIdx + 1, passes.size, 0f)
                             while (written < actualLen) {
                                 if (mode == 2) random.nextBytes(buffer)
                                 val toWrite = minOf(buffer.size.toLong(), actualLen - written).toInt()
                                 ch.write(java.nio.ByteBuffer.wrap(buffer, 0, toWrite))
                                 written += toWrite
+                                val now = System.currentTimeMillis()
+                                if (now - lastEmitMs >= 150L || written >= actualLen) {
+                                    lastEmitMs = now
+                                    onPassProgress(passIdx + 1, passes.size, (written.toFloat() / actualLen.toFloat()).coerceIn(0f, 1f))
+                                }
                             }
                             ch.force(true)
                         }
@@ -391,12 +437,22 @@ object FileShredder {
     fun findMediaContentUriForFile(context: Context, file: File): Uri? {
         val path = file.absolutePath
         if (path.isBlank()) return null
-        val uris = listOf(
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
-            MediaStore.Files.getContentUri("external")
-        )
+        val ext = file.extension.lowercase()
+        val imagesUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val videoUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        val audioUri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+        val filesUri = MediaStore.Files.getContentUri("external")
+
+        val uris = when (ext) {
+            "jpg", "jpeg", "png", "webp", "gif", "heic", "heif", "bmp", "dng" ->
+                listOf(imagesUri, filesUri)
+            "mp4", "mkv", "mov", "avi", "webm", "3gp", "m4v" ->
+                listOf(videoUri, filesUri)
+            "mp3", "wav", "ogg", "m4a", "flac", "aac", "opus" ->
+                listOf(audioUri, filesUri)
+            else ->
+                listOf(filesUri, imagesUri, videoUri, audioUri)
+        }
         for (baseUri in uris) {
             try {
                 context.contentResolver.query(

@@ -17,8 +17,8 @@ android {
     applicationId = "com.aistudio.thermals.qwerty"
     minSdk = 24
     targetSdk = 36
-    versionCode = 19
-    versionName = "2.8"
+    versionCode = 22
+    versionName = "3.1"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

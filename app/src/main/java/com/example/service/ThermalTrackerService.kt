@@ -37,7 +37,7 @@ class ThermalTrackerService : Service() {
     }
 
     private val serviceJob = SupervisorJob()
-    private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
+    private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob + safeCoroutineExceptionHandler())
     private lateinit var thermalMonitor: ThermalMonitor
     private lateinit var liveGuardMonitor: LiveGuardMonitor
     private lateinit var repository: ThermalRepository
@@ -56,28 +56,37 @@ class ThermalTrackerService : Service() {
         super.onCreate()
         isServiceRunning = true
 
-        thermalMonitor = ThermalMonitor.getInstance(this)
-        thermalMonitor.startMonitoring()
+        try {
+            thermalMonitor = ThermalMonitor.getInstance(this)
+            thermalMonitor.startMonitoring()
 
-        liveGuardMonitor = LiveGuardMonitor.getInstance(this)
-        liveGuardMonitor.onHighPriorityAlert = null
-        liveGuardMonitor.onGuardAlert = { payload ->
-            val prefs = getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
-            if (prefs.getBoolean("live_guard_alerts", true)) {
-                sendGuardNotification(payload)
+            liveGuardMonitor = LiveGuardMonitor.getInstance(this)
+            liveGuardMonitor.onHighPriorityAlert = null
+            liveGuardMonitor.onGuardAlert = { payload ->
+                try {
+                    val prefs = getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
+                    if (prefs.getBoolean("live_guard_alerts", true)) {
+                        sendGuardNotification(payload)
+                    }
+                } catch (_: Throwable) {
+                }
             }
-        }
-        liveGuardMonitor.startMonitoring()
+            liveGuardMonitor.startMonitoring()
 
-        val db = AppDatabase.getInstance(this)
-        repository = ThermalRepository(db.thermalDao())
+            val db = AppDatabase.getInstance(this)
+            repository = ThermalRepository(db.thermalDao())
 
-        createNotificationChannels()
+            createNotificationChannels()
 
-        // Prune records older than 8 days once on service startup to keep DB fast and compact
-        serviceScope.launch {
-            val eightDaysAgo = System.currentTimeMillis() - (8L * 24 * 60 * 60 * 1000L)
-            repository.deleteRecordsOlderThan(eightDaysAgo)
+            // Prune records older than 8 days once on service startup to keep DB fast and compact
+            serviceScope.launch {
+                try {
+                    val eightDaysAgo = System.currentTimeMillis() - (8L * 24 * 60 * 60 * 1000L)
+                    repository.deleteRecordsOlderThan(eightDaysAgo)
+                } catch (_: Throwable) {
+                }
+            }
+        } catch (_: Throwable) {
         }
     }
 
@@ -110,10 +119,15 @@ class ThermalTrackerService : Service() {
         startTrackingLoop()
 
         serviceScope.launch {
-            delay(1000)
-            val temp = thermalMonitor.liveData.value.batteryTemp
-            if (temp > 0f) {
-                updateWidget(temp)
+            try {
+                delay(1000)
+                if (::thermalMonitor.isInitialized) {
+                    val temp = thermalMonitor.liveData.value.batteryTemp
+                    if (temp > 0f) {
+                        updateWidget(temp)
+                    }
+                }
+            } catch (_: Throwable) {
             }
         }
 
@@ -125,13 +139,19 @@ class ThermalTrackerService : Service() {
     private var lastWidgetTemp = -100f
 
     private fun startTrackingLoop() {
+        if (!::thermalMonitor.isInitialized || !::repository.isInitialized) return
         if (trackingJob?.isActive != true) {
             trackingJob = serviceScope.launch {
-                thermalMonitor.liveData.collect { live ->
-                    if (live.batteryTemp <= 0f) return@collect
-
-                    checkThermalAlerts(live.batteryTemp)
-                    maybeRecordAndUpdateWidget(live)
+                try {
+                    thermalMonitor.liveData.collect { live ->
+                        if (live.batteryTemp <= 0f) return@collect
+                        try {
+                            checkThermalAlerts(live.batteryTemp)
+                            maybeRecordAndUpdateWidget(live)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                } catch (_: Throwable) {
                 }
             }
         }
@@ -163,69 +183,121 @@ class ThermalTrackerService : Service() {
 
         if (kotlin.math.abs(live.batteryTemp - lastWidgetTemp) >= 0.2f) {
             updateWidget(live.batteryTemp)
+            updateForegroundNotification(live)
             lastWidgetTemp = live.batteryTemp
         }
     }
 
+    private fun updateForegroundNotification(live: LiveThermalData) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+            ) {
+                return
+            }
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+            val tempText = String.format(Locale.US, "%.1f°C", live.batteryTemp)
+            val chargeSuffix = if (live.isCharging) " • Charging (${live.batteryLevel}%)" else " • ${live.batteryLevel}%"
+            val guardSuffix = if (::liveGuardMonitor.isInitialized && liveGuardMonitor.isMonitoringActive()) " • Guard On" else ""
+            nm.notify(NOTIFICATION_ID, createNotification("$tempText$chargeSuffix$guardSuffix"))
+        } catch (_: Throwable) {
+        }
+    }
+
     private suspend fun updateWidget(@Suppress("UNUSED_PARAMETER") temp: Float) {
-        val widgetManager = AppWidgetManager.getInstance(this)
-        val widgetIds = widgetManager.getAppWidgetIds(ComponentName(this, ThermalWidgetProvider::class.java))
-        if (widgetIds.isEmpty()) return
-        val oneHourAgo = System.currentTimeMillis() - (60 * 60 * 1000L)
-        val recentRecords = repository.getRecordsSinceSync(oneHourAgo)
-        ThermalWidgetProvider.updateAllWidgets(
-            context = this,
-            recentRecords = recentRecords,
-            appWidgetManager = widgetManager,
-            appWidgetIds = widgetIds
-        )
+        try {
+            val widgetManager = AppWidgetManager.getInstance(this) ?: return
+            val widgetIds = widgetManager.getAppWidgetIds(ComponentName(this, ThermalWidgetProvider::class.java))
+            if (widgetIds.isEmpty()) return
+            val oneHourAgo = System.currentTimeMillis() - (60 * 60 * 1000L)
+            val recentRecords = repository.getRecordsSinceSync(oneHourAgo)
+            ThermalWidgetProvider.updateAllWidgets(
+                context = this,
+                recentRecords = recentRecords,
+                appWidgetManager = widgetManager,
+                appWidgetIds = widgetIds
+            )
+        } catch (_: Throwable) {
+        }
     }
 
     private fun checkThermalAlerts(temp: Float) {
         val prefs = getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
         val warningTemp = prefs.getFloat("warning_temp", 35f)
         val criticalTemp = warningTemp + 5f
+        val hysteresis = 1.0f
 
-        val currentState = when {
-            temp >= criticalTemp -> 2 // Critical
-            temp >= warningTemp -> 1 // Elevated
-            else -> 0 // Normal/Optimal
+        val nextState = when (lastAlertState) {
+            2 -> when {
+                temp >= criticalTemp - hysteresis -> 2
+                temp >= warningTemp -> 1
+                else -> 0
+            }
+            1 -> when {
+                temp >= criticalTemp -> 2
+                temp >= warningTemp - hysteresis -> 1
+                else -> 0
+            }
+            else -> when {
+                temp >= criticalTemp -> 2
+                temp >= warningTemp -> 1
+                else -> 0
+            }
         }
 
-        if (currentState != lastAlertState) {
+        if (nextState != lastAlertState) {
             val alertsEnabled = prefs.getBoolean("thermal_alerts_enabled", true)
             if (alertsEnabled) {
-                if (currentState == 2) {
+                if (nextState == 2 && lastAlertState < 2) {
                     sendAlertNotification(
                         "Critical Temperature",
                         "Device temperature has exceeded ${String.format(Locale.US, "%.0f", criticalTemp)}°C (${String.format(Locale.US, "%.1f", temp)}°C). Please let it cool down."
                     )
-                } else if (currentState == 1 && lastAlertState < 1) {
+                } else if (nextState == 1 && lastAlertState < 1) {
                     sendAlertNotification(
                         "Elevated Temperature",
                         "Device temperature has reached ${String.format(Locale.US, "%.1f", temp)}°C."
                     )
                 }
             }
-            lastAlertState = currentState
+            lastAlertState = nextState
+        }
+    }
+
+    private fun buildOpenAppPendingIntent(requestCode: Int): PendingIntent? {
+        return try {
+            val openIntent = Intent(this, com.example.MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            }
+            PendingIntent.getActivity(
+                this,
+                requestCode,
+                openIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+        } catch (_: Throwable) {
+            null
         }
     }
 
     private fun sendAlertNotification(title: String, message: String) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+            ) {
+                return
+            }
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+            val builder = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
+                .setContentTitle(title)
+                .setContentText(message)
+                .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setAutoCancel(true)
+            buildOpenAppPendingIntent(ALERT_NOTIFICATION_ID)?.let { builder.setContentIntent(it) }
+            notificationManager.notify(ALERT_NOTIFICATION_ID, builder.build())
+        } catch (_: Throwable) {
         }
-        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val alertNotification = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
-            .setContentTitle(title)
-            .setContentText(message)
-            .setSmallIcon(android.R.drawable.ic_dialog_alert)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setAutoCancel(true)
-            .build()
-        notificationManager.notify(ALERT_NOTIFICATION_ID, alertNotification)
     }
 
     private fun sendGuardNotification(payload: GuardAlertPayload) {
@@ -235,12 +307,15 @@ class ThermalTrackerService : Service() {
     }
 
     private fun createNotification(content: String): Notification {
-        return NotificationCompat.Builder(this, TRACKER_CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, TRACKER_CHANNEL_ID)
             .setContentTitle("dot Shield Active")
             .setContentText(content)
             .setSmallIcon(android.R.drawable.ic_menu_info_details)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+        buildOpenAppPendingIntent(NOTIFICATION_ID)?.let { builder.setContentIntent(it) }
+        return builder.build()
     }
 
     private fun createNotificationChannels() {

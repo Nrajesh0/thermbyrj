@@ -124,6 +124,7 @@ import com.example.service.FileShredder
 import com.example.service.ShredStandard
 import com.example.service.ShredTarget
 import com.example.service.StorageScanCache
+import com.example.service.toSafeComposeBitmap
 import com.example.ui.components.ActiveFilePreview
 import com.example.ui.components.BuiltInFilePreviewHost
 import com.example.ui.components.ExpandableSearchBar
@@ -194,25 +195,44 @@ object VaultManager {
             .build()
     }
 
-    fun getRegistry(context: Context): SharedPreferences {
-        val appCtx = context.applicationContext
+    fun getMasterKeyOrNull(context: Context): MasterKey? {
         return try {
-            EncryptedSharedPreferences.create(
+            getMasterKey(context)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    fun getRegistry(context: Context): SharedPreferences {
+        return openEncryptedPrefsSafely(context.applicationContext, "vault_registry_prefs")
+    }
+
+    internal fun openEncryptedPrefsSafely(appCtx: Context, prefsName: String): SharedPreferences {
+        fun createEncrypted(): SharedPreferences {
+            return EncryptedSharedPreferences.create(
                 appCtx,
-                "vault_registry_prefs",
+                prefsName,
                 getMasterKey(appCtx),
                 EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
             )
-        } catch (_: Exception) {
-            // Retry once in case of transient Keystore contention
-            EncryptedSharedPreferences.create(
-                appCtx,
-                "vault_registry_prefs",
-                getMasterKey(appCtx),
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-            )
+        }
+        return try {
+            createEncrypted()
+        } catch (_: Throwable) {
+            try {
+                // Retry once in case of transient Keystore contention
+                createEncrypted()
+            } catch (_: Throwable) {
+                try {
+                    // Corrupted ciphertext (e.g. after backup restore or Keystore invalidation): wipe & recreate
+                    appCtx.deleteSharedPreferences(prefsName)
+                    createEncrypted()
+                } catch (_: Throwable) {
+                    // Hardware Keystore unavailable: fall back safely to private app-sandboxed SharedPreferences
+                    appCtx.getSharedPreferences("${prefsName}_fallback", Context.MODE_PRIVATE)
+                }
+            }
         }
     }
 
@@ -409,24 +429,7 @@ class VaultActivity : ComponentActivity() {
 }
 
 private fun getVaultEncryptedPrefs(context: Context): SharedPreferences {
-    val appCtx = context.applicationContext
-    return try {
-        EncryptedSharedPreferences.create(
-            appCtx,
-            "vault_secure_prefs",
-            VaultManager.getMasterKey(appCtx),
-            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-        )
-    } catch (_: Exception) {
-        EncryptedSharedPreferences.create(
-            appCtx,
-            "vault_secure_prefs",
-            VaultManager.getMasterKey(appCtx),
-            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-        )
-    }
+    return VaultManager.openEncryptedPrefsSafely(context.applicationContext, "vault_secure_prefs")
 }
 
 private fun legacyHashPinWithSalt(pin: String, saltBase64: String): String {
@@ -596,7 +599,7 @@ fun VaultScreen(onBack: () -> Unit) {
 
     val vaultDir = remember { VaultManager.getVaultDir(context) }
     val registry = remember { VaultManager.getRegistry(context) }
-    val masterKey = remember { VaultManager.getMasterKey(context) }
+    val masterKey = remember { VaultManager.getMasterKeyOrNull(context) }
     val previewCacheDir = remember { VaultManager.getPreviewCacheDir(context) }
 
     val isSelectionMode = selectedIds.isNotEmpty()
@@ -664,11 +667,12 @@ fun VaultScreen(onBack: () -> Unit) {
      * Exports a decrypted copy to Downloads while keeping the encrypted file in the Vault.
      */
     fun exportCopyToDownloads(entry: VaultEntry): Boolean {
+        val key = masterKey ?: return false
         return try {
             val encryptedFile = EncryptedFile.Builder(
                 context,
                 entry.encryptedFile,
-                masterKey,
+                key,
                 EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB
             ).build()
 
@@ -709,20 +713,20 @@ fun VaultScreen(onBack: () -> Unit) {
      * AND securely shreds/removes the encrypted copy from the Vault.
      */
     fun restoreAndUnlockEntry(entry: VaultEntry): Pair<Boolean, String> {
+        val key = masterKey ?: return false to ""
         return try {
             val encryptedFile = EncryptedFile.Builder(
                 context,
                 entry.encryptedFile,
-                masterKey,
+                key,
                 EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB
             ).build()
 
             val targetParent = entry.originalParentPath?.let { File(it) }
-            val canRestoreToOriginal = targetParent != null &&
+            if (targetParent != null &&
                 (targetParent.exists() || targetParent.mkdirs()) &&
                 targetParent.canWrite()
-
-            if (canRestoreToOriginal && targetParent != null) {
+            ) {
                 var destFile = File(targetParent, entry.originalName)
                 if (destFile.exists()) {
                     val stamp = System.currentTimeMillis() % 10000
@@ -762,12 +766,17 @@ fun VaultScreen(onBack: () -> Unit) {
      * Only falls back to auto-shredded previewCacheDir for formats that require a File descriptor (ZIP/APK/External).
      */
     fun previewEncryptedEntry(entry: VaultEntry) {
+        val key = masterKey
+        if (key == null) {
+            Toast.makeText(context, "Device Keystore unavailable", Toast.LENGTH_SHORT).show()
+            return
+        }
         scope.launch(Dispatchers.IO) {
             try {
                 val encryptedFile = EncryptedFile.Builder(
                     context,
                     entry.encryptedFile,
-                    masterKey,
+                    key,
                     EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB
                 ).build()
 
@@ -993,10 +1002,11 @@ fun VaultScreen(onBack: () -> Unit) {
                     val destFile = File(vaultDir, "$uuid.enc")
                     if (destFile.exists()) destFile.delete()
 
+                    val key = masterKey ?: throw IllegalStateException("Keystore unavailable")
                     val encryptedFile = EncryptedFile.Builder(
                         context,
                         destFile,
-                        masterKey,
+                        key,
                         EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB
                     ).build()
 
@@ -1231,8 +1241,13 @@ fun VaultScreen(onBack: () -> Unit) {
             if (isUnlocked && !isSelectionMode) {
                 FloatingActionButton(
                     onClick = {
-                        isLaunchingSystemDialog = true
-                        filePickerLauncher.launch(arrayOf("*/*"))
+                        try {
+                            isLaunchingSystemDialog = true
+                            filePickerLauncher.launch(arrayOf("*/*"))
+                        } catch (_: Throwable) {
+                            isLaunchingSystemDialog = false
+                            Toast.makeText(context, "No file picker available on device", Toast.LENGTH_SHORT).show()
+                        }
                     },
                     containerColor = AuraCyan,
                     contentColor = Color.Black
@@ -1658,15 +1673,15 @@ fun VaultScreen(onBack: () -> Unit) {
 @Composable
 private fun VaultEntryThumbnail(
     entry: VaultEntry,
-    masterKey: MasterKey,
+    masterKey: MasterKey?,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val ext = entry.extension
     var bitmap by remember(entry.id) { mutableStateOf(vaultThumbMemoryCache.get(entry.id)) }
 
-    LaunchedEffect(entry.id) {
-        if (bitmap == null && ext in setOf("jpg", "jpeg", "png", "webp", "bmp")) {
+    LaunchedEffect(entry.id, masterKey) {
+        if (masterKey != null && bitmap == null && ext in setOf("jpg", "jpeg", "png", "webp", "bmp")) {
             val decoded = withContext(Dispatchers.IO) {
                 try {
                     val encryptedFile = EncryptedFile.Builder(
@@ -1691,7 +1706,7 @@ private fun VaultEntryThumbnail(
                     encryptedFile.openFileInput().use { stream ->
                         BitmapFactory.decodeStream(stream, null, decodeOpts)
                     }
-                } catch (_: Exception) {
+                } catch (_: Throwable) {
                     null
                 }
             }
@@ -1716,9 +1731,10 @@ private fun VaultEntryThumbnail(
             .background(tint.copy(alpha = 0.14f)),
         contentAlignment = Alignment.Center
     ) {
-        if (bitmap != null) {
+        val safeBmp = remember(bitmap) { bitmap.toSafeComposeBitmap() }
+        if (safeBmp != null) {
             Image(
-                bitmap = bitmap!!.asImageBitmap(),
+                bitmap = safeBmp.asImageBitmap(),
                 contentDescription = entry.originalName,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()

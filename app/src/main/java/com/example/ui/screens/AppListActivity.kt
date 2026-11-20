@@ -143,11 +143,11 @@ private val HIGH_RISK_PERMS = mapOf(
     "android.permission.RECORD_AUDIO" to "Microphone",
     "android.permission.ACCESS_FINE_LOCATION" to "Precise Location",
     "android.permission.ACCESS_COARSE_LOCATION" to "Coarse Location",
+    "android.permission.ACCESS_BACKGROUND_LOCATION" to "Background Location",
     "android.permission.READ_CONTACTS" to "Read Contacts",
     "android.permission.READ_SMS" to "Read SMS",
     "android.permission.SEND_SMS" to "Send SMS",
-    "android.permission.READ_CALL_LOG" to "Call Logs",
-    "android.permission.SYSTEM_ALERT_WINDOW" to "Draw Over Other Apps"
+    "android.permission.READ_CALL_LOG" to "Call Logs"
 )
 
 class AppListActivity : ComponentActivity() {
@@ -166,14 +166,18 @@ class AppListActivity : ComponentActivity() {
 
 @Suppress("DEPRECATION")
 private fun hasUsagePermission(context: Context): Boolean {
-    val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
-    val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
-    } else {
-        @Suppress("DEPRECATION")
-        appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
+    return try {
+        val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return false
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
+        } else {
+            @Suppress("DEPRECATION")
+            appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
+        }
+        mode == AppOpsManager.MODE_ALLOWED
+    } catch (_: Throwable) {
+        false
     }
-    return mode == AppOpsManager.MODE_ALLOWED
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -208,10 +212,15 @@ fun AppListScreen(onBack: () -> Unit) {
         isLoading = true
         if (refreshTrigger > 0) delay(600)
         hasUsageAccess = hasUsagePermission(context)
-        withContext(Dispatchers.IO) {
-            apps = fetchInstalledApps(context)
-            isLoading = false
+        val loaded = withContext(Dispatchers.IO) {
+            try {
+                fetchInstalledApps(context)
+            } catch (_: Throwable) {
+                emptyList()
+            }
         }
+        apps = loaded
+        isLoading = false
     }
 
     val filteredAndSortedApps = remember(apps, sortOption, showSystemApps, searchQuery) {
@@ -219,7 +228,7 @@ fun AppListScreen(onBack: () -> Unit) {
         val filtered = apps.filter {
             (if (showSystemApps) true else !it.isSystemApp) &&
                 (q.isEmpty() || it.name.lowercase().contains(q) || it.packageName.lowercase().contains(q))
-        }
+        }.distinctBy { it.packageName }
         when (sortOption) {
             "Size" -> filtered.sortedByDescending { it.totalSize }
             "InstallNew" -> filtered.sortedWith(
@@ -239,8 +248,7 @@ fun AppListScreen(onBack: () -> Unit) {
         }
     }
 
-    if (selectedAppForAudit != null) {
-        val app = selectedAppForAudit!!
+    selectedAppForAudit?.let { app ->
         AlertDialog(
             onDismissRequest = { selectedAppForAudit = null },
             containerColor = GlassPanel,
@@ -315,7 +323,10 @@ fun AppListScreen(onBack: () -> Unit) {
                                 val intent = Intent(Intent.ACTION_DELETE).apply {
                                     data = Uri.parse("package:$pkg")
                                 }
-                                uninstallLauncher.launch(intent)
+                                try {
+                                    uninstallLauncher.launch(intent)
+                                } catch (_: Throwable) {
+                                }
                             }
                         ) {
                             Icon(Icons.Default.Delete, contentDescription = null, tint = AuraRose, modifier = Modifier.size(16.dp))
@@ -468,7 +479,11 @@ fun AppListScreen(onBack: () -> Unit) {
                         .fillMaxWidth()
                         .padding(horizontal = 24.dp, vertical = 4.dp)
                         .clickable {
-                            usageAccessLauncher.launch(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                            try {
+                                usageAccessLauncher.launch(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                            } catch (_: Throwable) {
+                                com.example.service.PermissionUtils.launchUsageAccessSettings(context)
+                            }
                         }
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -666,17 +681,20 @@ private fun fetchInstalledApps(context: Context): List<AppItem> {
     val usageMap = mutableMapOf<String, Long>()
     if (hasUsage) {
         try {
-            val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
-            val end = System.currentTimeMillis()
-            val start = end - (1000L * 60 * 60 * 24 * 365)
-            val stats = usm.queryAndAggregateUsageStats(start, end)
-            stats.forEach { (pkg, uStat) ->
-                usageMap[pkg] = uStat.lastTimeUsed
+            val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
+            if (usm != null) {
+                val end = System.currentTimeMillis()
+                val start = end - (1000L * 60 * 60 * 24 * 365)
+                val stats = usm.queryAndAggregateUsageStats(start, end)
+                stats?.forEach { (pkg, uStat) ->
+                    usageMap[pkg] = uStat.lastTimeUsed
+                }
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
     }
 
+    val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager
     val packages = try {
         pm.getInstalledPackages(PackageManager.GET_PERMISSIONS)
     } catch (_: Exception) {
@@ -720,18 +738,53 @@ private fun fetchInstalledApps(context: Context): List<AppItem> {
         val grantedDangerous = mutableListOf<String>()
         val reqPerms = pkgInfo.requestedPermissions
         val reqFlags = pkgInfo.requestedPermissionsFlags
+        val reqSet = reqPerms?.toSet() ?: emptySet()
         if (reqPerms != null && reqFlags != null) {
-            for (i in reqPerms.indices) {
+            val count = minOf(reqPerms.size, reqFlags.size)
+            for (i in 0 until count) {
                 val permName = reqPerms[i]
                 val isGranted = (reqFlags[i] and android.content.pm.PackageInfo.REQUESTED_PERMISSION_GRANTED) != 0
-                if (isGranted && HIGH_RISK_PERMS.containsKey(permName)) {
-                    grantedDangerous.add(HIGH_RISK_PERMS[permName]!!)
+                if (isGranted) {
+                    HIGH_RISK_PERMS[permName]?.let { grantedDangerous.add(it) }
+                }
+            }
+        }
+
+        // Special AppOps-gated permissions cannot be trusted from REQUESTED_PERMISSION_GRANTED on Android 6+
+        if (appOps != null) {
+            if ("android.permission.SYSTEM_ALERT_WINDOW" in reqSet) {
+                val overlayMode = try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW, appInfo.uid, pkgInfo.packageName)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        appOps.checkOpNoThrow(AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW, appInfo.uid, pkgInfo.packageName)
+                    }
+                } catch (_: Throwable) {
+                    AppOpsManager.MODE_DEFAULT
+                }
+                if (overlayMode == AppOpsManager.MODE_ALLOWED) {
+                    grantedDangerous.add("Draw Over Other Apps")
+                }
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && "android.permission.MANAGE_EXTERNAL_STORAGE" in reqSet) {
+                val allFilesMode = try {
+                    appOps.unsafeCheckOpNoThrow("android:manage_external_storage", appInfo.uid, pkgInfo.packageName)
+                } catch (_: Throwable) {
+                    AppOpsManager.MODE_DEFAULT
+                }
+                if (allFilesMode == AppOpsManager.MODE_ALLOWED) {
+                    grantedDangerous.add("All Files Access")
                 }
             }
         }
 
         val riskLevel = when {
-            grantedDangerous.size >= 3 || grantedDangerous.contains("Draw Over Other Apps") || grantedDangerous.contains("Read SMS") -> RiskLevel.HIGH
+            grantedDangerous.size >= 3 ||
+                grantedDangerous.contains("Draw Over Other Apps") ||
+                grantedDangerous.contains("Read SMS") ||
+                grantedDangerous.contains("All Files Access") ||
+                grantedDangerous.contains("Background Location") -> RiskLevel.HIGH
             grantedDangerous.isNotEmpty() -> RiskLevel.MEDIUM
             else -> RiskLevel.LOW
         }

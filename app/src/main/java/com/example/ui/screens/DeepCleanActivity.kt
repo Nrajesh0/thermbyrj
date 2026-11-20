@@ -146,15 +146,13 @@ fun DeepCleanScreen(onBack: () -> Unit) {
     var expandedCategories by remember { mutableStateOf<Set<String>>(emptySet()) }
     var scanTrigger by remember { mutableIntStateOf(0) }
     var hasManageStorage by remember {
-        mutableStateOf(
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else true
-        )
+        mutableStateOf(com.example.service.PermissionUtils.hasAllFilesPermission())
     }
 
     val manageStorageLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) {
-        hasManageStorage = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else true
+        hasManageStorage = com.example.service.PermissionUtils.hasAllFilesPermission()
         scanTrigger++
     }
 
@@ -226,12 +224,15 @@ fun DeepCleanScreen(onBack: () -> Unit) {
                 }
             }
         }
+        if (removedCount > 0) {
+            StorageScanCache.invalidate()
+        }
         return removedCount to freed
     }
 
     LaunchedEffect(scanTrigger) {
         isScanning = true
-        withContext(Dispatchers.IO) {
+        val scanResult = withContext(Dispatchers.IO) {
             val root = Environment.getExternalStorageDirectory()
             val apkItems = mutableListOf<JunkFileItem>()
             val tempItems = mutableListOf<JunkFileItem>()
@@ -262,7 +263,9 @@ fun DeepCleanScreen(onBack: () -> Unit) {
                         val nameLower = f.name.lowercase()
                         if (nameLower == ".thumbnails" || nameLower == "cache" || nameLower == ".cache" || nameLower == ".trash") {
                             val dirSize = getDirSize(f)
-                            cacheItems.add(JunkFileItem(f, dirSize, "Cache folder"))
+                            if (dirSize > 0L) {
+                                cacheItems.add(JunkFileItem(f, dirSize, "Cache folder"))
+                            }
                             hasNonEmptyChild = true
                         } else if (!f.name.startsWith(".") && f.name != "Android") {
                             val childEmpty = scanDirectory(f)
@@ -274,6 +277,12 @@ fun DeepCleanScreen(onBack: () -> Unit) {
                         val len = f.length()
                         val nameLower = f.name.lowercase()
                         val ext = f.extension.lowercase()
+
+                        // Never touch hidden marker files like .nomedia (0-byte media-scanner shields)
+                        if (f.name.startsWith(".")) {
+                            hasNonEmptyChild = true
+                            continue
+                        }
 
                         when {
                             ext == "apk" || ext == "xapk" || ext == "apks" -> {
@@ -316,8 +325,8 @@ fun DeepCleanScreen(onBack: () -> Unit) {
                 builtCategories.add(
                     JunkCategory(
                         id = "apks",
-                        title = "Obsolete APK Installers",
-                        description = "Setup packages in storage (safe to remove)",
+                        title = "APK Installers",
+                        description = "Installed/outdated APKs auto-selected; review newer/uninstalled",
                         items = sorted,
                         totalSize = sorted.sumOf { it.size },
                         icon = Icons.Default.Android,
@@ -395,11 +404,18 @@ fun DeepCleanScreen(onBack: () -> Unit) {
                 )
             }
 
-            val allPaths = builtCategories.flatMap { cat -> cat.items.map { it.file.absolutePath } }.toSet()
-            categories = builtCategories
-            selectedPaths = allPaths
-            isScanning = false
+            val safeAutoSelectedPaths = builtCategories.flatMap { cat ->
+                if (cat.id == "apks") {
+                    cat.items.filter { it.badge == "Already Installed" || it.badge == "Outdated APK" }
+                } else {
+                    cat.items
+                }
+            }.map { it.file.absolutePath }.toSet()
+            builtCategories.toList() to safeAutoSelectedPaths
         }
+        categories = scanResult.first
+        selectedPaths = scanResult.second
+        isScanning = false
     }
 
     Scaffold(
@@ -501,11 +517,15 @@ fun DeepCleanScreen(onBack: () -> Unit) {
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Button(
                                     onClick = {
-                                        val intent = Intent(
-                                            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                                            Uri.parse("package:${context.packageName}")
-                                        )
-                                        manageStorageLauncher.launch(intent)
+                                        try {
+                                            val intent = Intent(
+                                                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                                Uri.parse("package:${context.packageName}")
+                                            )
+                                            manageStorageLauncher.launch(intent)
+                                        } catch (_: Throwable) {
+                                            com.example.service.PermissionUtils.launchAllFilesAccessSettings(context)
+                                        }
                                     },
                                     colors = ButtonDefaults.buttonColors(containerColor = AuraOrange)
                                 ) {
