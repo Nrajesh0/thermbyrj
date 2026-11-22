@@ -22,6 +22,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import com.example.service.PermissionUtils
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -164,22 +165,6 @@ class AppListActivity : ComponentActivity() {
     }
 }
 
-@Suppress("DEPRECATION")
-private fun hasUsagePermission(context: Context): Boolean {
-    return try {
-        val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return false
-        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
-        } else {
-            @Suppress("DEPRECATION")
-            appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
-        }
-        mode == AppOpsManager.MODE_ALLOWED
-    } catch (_: Throwable) {
-        false
-    }
-}
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AppListScreen(onBack: () -> Unit) {
@@ -192,7 +177,7 @@ fun AppListScreen(onBack: () -> Unit) {
     var showSystemApps by remember { mutableStateOf(false) }
     var selectedAppForAudit by remember { mutableStateOf<AppItem?>(null) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
-    var hasUsageAccess by remember { mutableStateOf(hasUsagePermission(context)) }
+    var hasUsageAccess by remember { mutableStateOf(PermissionUtils.hasUsageStatsPermission(context)) }
 
     val uninstallLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -204,14 +189,14 @@ fun AppListScreen(onBack: () -> Unit) {
     val usageAccessLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) {
-        hasUsageAccess = hasUsagePermission(context)
+        hasUsageAccess = PermissionUtils.hasUsageStatsPermission(context)
         refreshTrigger++
     }
 
     LaunchedEffect(refreshTrigger) {
         isLoading = true
         if (refreshTrigger > 0) delay(600)
-        hasUsageAccess = hasUsagePermission(context)
+        hasUsageAccess = PermissionUtils.hasUsageStatsPermission(context)
         val loaded = withContext(Dispatchers.IO) {
             try {
                 fetchInstalledApps(context)
@@ -673,7 +658,7 @@ private fun drawableToImageBitmap(packageName: String, drawable: Drawable): Imag
 
 private fun fetchInstalledApps(context: Context): List<AppItem> {
     val pm = context.packageManager
-    val hasUsage = hasUsagePermission(context)
+    val hasUsage = PermissionUtils.hasUsageStatsPermission(context)
     val storageStatsManager = if (hasUsage) {
         context.getSystemService(Context.STORAGE_STATS_SERVICE) as? StorageStatsManager
     } else null

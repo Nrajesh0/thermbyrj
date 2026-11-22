@@ -69,7 +69,6 @@ import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayCircleOutline
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
@@ -296,7 +295,8 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                 val failedUris = result.failedTargets.mapNotNull { it.contentUri?.toString() }.toSet()
                 val deletedItems = selectedItems.filter { item ->
                     val uriStr = item.contentUri.toString()
-                    uriStr !in blockedUris && uriStr !in failedUris
+                    val stillExistsOnDisk = item.path.isNotBlank() && File(item.path).exists()
+                    uriStr !in blockedUris && uriStr !in failedUris && (!result.wasCancelled || !stillExistsOnDisk)
                 }.toSet()
                 deletedItems.forEach { mediaThumbnailCache.remove(it.contentUri) }
                 files = files.filterNot { it in deletedItems }
@@ -310,10 +310,13 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                     showAllFilesPromptDialog = true
                 } else {
                     showShredDialog = false
-                    val msg = if (result.blockedForOverwrite.isNotEmpty()) {
-                        "Shredded ${result.shreddedCount} file(s); ${result.blockedForOverwrite.size} blocked."
-                    } else {
-                        "Shredded ${result.shreddedCount} file(s) (${formatBytes(result.totalBytesWiped)})"
+                    val msg = when {
+                        result.wasCancelled ->
+                            "Shredding cancelled (${result.shreddedCount} file(s) completed)"
+                        result.blockedForOverwrite.isNotEmpty() ->
+                            "Shredded ${result.shreddedCount} file(s); ${result.blockedForOverwrite.size} blocked."
+                        else ->
+                            "Shredded ${result.shreddedCount} file(s) (${formatBytes(result.totalBytesWiped)})"
                     }
                     Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                 }
@@ -699,7 +702,11 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                 }
             },
             dismissButton = {
-                if (!shredState.isRunning) {
+                if (shredState.isRunning) {
+                    TextButton(onClick = { ShredJobCoordinator.cancelCurrentShred() }) {
+                        Text("Stop Shred", color = AuraRose, fontWeight = FontWeight.Bold)
+                    }
+                } else {
                     TextButton(onClick = { showShredDialog = false }) {
                         Text("Cancel", color = TextSecondary)
                     }
@@ -727,16 +734,6 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                 selectedItems = setOf(match)
                 shareSelectedFiles()
                 selectedItems = emptySet()
-            }
-        },
-        onVault = { f, uri ->
-            scope.launch {
-                val ok = withContext(Dispatchers.IO) { FileManagerOps.encryptFileToVault(context, f, uri) }
-                if (ok) {
-                    files = files.filterNot { it.path == f.absolutePath || it.contentUri == uri }
-                    refreshTrigger++
-                }
-                Toast.makeText(context, if (ok) "Locked in Vault" else "Vault failed", Toast.LENGTH_SHORT).show()
             }
         },
         onDelete = { f, uri ->
@@ -870,22 +867,6 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                             Toast.makeText(context, "Ready to move — open destination in Explorer", Toast.LENGTH_SHORT).show()
                         }
                     }
-                    CategorySheetAction(Icons.Default.Lock, "Vault", AuraPurple) {
-                        itemForMenu = null
-                        if (target.path.isNotBlank()) {
-                            scope.launch {
-                                val ok = withContext(Dispatchers.IO) {
-                                    FileManagerOps.encryptFileToVault(context, File(target.path), target.contentUri)
-                                }
-                                if (ok) {
-                                    files = files.filterNot { it == target }
-                                    selectedItems = selectedItems - target
-                                    refreshTrigger++
-                                }
-                                Toast.makeText(context, if (ok) "Locked in Vault" else "Vault failed", Toast.LENGTH_SHORT).show()
-                            }
-                        }
-                    }
                     CategorySheetAction(Icons.Default.Share, "Share", AuraCyan) {
                         itemForMenu = null
                         selectedItems = setOf(target)
@@ -946,23 +927,6 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
                             selectedItems = if (selectedItems.size == sortedFiles.size) emptySet() else sortedFiles.toSet()
                         }) {
                             Icon(Icons.Default.SelectAll, contentDescription = "Select All", tint = TextPrimary)
-                        }
-                        IconButton(onClick = {
-                            val paths = selectedItems.mapNotNull { it.path.takeIf { p -> p.isNotBlank() } }.toSet()
-                            if (paths.isNotEmpty()) {
-                                scope.launch {
-                                    val count = withContext(Dispatchers.IO) {
-                                        selectedItems.count { item ->
-                                            item.path.isNotBlank() && FileManagerOps.encryptFileToVault(context, File(item.path), item.contentUri)
-                                        }
-                                    }
-                                    selectedItems = emptySet()
-                                    refreshTrigger++
-                                    Toast.makeText(context, "Locked $count file(s) in Vault", Toast.LENGTH_SHORT).show()
-                                }
-                            }
-                        }) {
-                            Icon(Icons.Default.Lock, contentDescription = "Lock in Vault", tint = AuraPurple)
                         }
                         IconButton(onClick = { shareSelectedFiles() }) {
                             Icon(Icons.Default.Share, contentDescription = "Share Selected", tint = AuraCyan)

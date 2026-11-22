@@ -1,3 +1,14 @@
 <resources>
     <string name="app_name">dot</string>
+    <string name="notif_shield_active">dot Shield Active</string>
+    <string name="notif_boot_resume_title">Resume dot Shield</string>
+    <string name="notif_boot_resume_body">Device restarted — tap to resume 24/7 Live Guard &amp; thermal monitoring.</string>
+    <string name="notif_shred_active">Secure File Shredder Active</string>
+    <string name="notif_shred_complete">Secure Shredder Complete</string>
+    <string name="notif_shred_cancelled">Secure Shredder Cancelled</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="dialog_discard_title">Discard unsaved changes?</string>
+    <string name="dialog_discard_body">You have edited this file. Closing now will discard your unsaved changes.</string>
+    <string name="action_keep_editing">Keep Editing</string>
+    <string name="action_discard">Discard</string>
 </resources>

@@ -1,7 +1,6 @@
 package com.example.ui.screens
 
 import android.Manifest
-import android.app.AppOpsManager
 import android.app.usage.StorageStatsManager
 import android.content.Context
 import android.content.Intent
@@ -9,7 +8,6 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
-import android.os.Process
 import android.os.StatFs
 import android.os.storage.StorageManager
 import android.provider.MediaStore
@@ -89,9 +87,7 @@ import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.NoteAdd
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.SdStorage
 import androidx.compose.material.icons.filled.Settings
@@ -216,32 +212,6 @@ data class BrowserFileItem(
 
 private val explorerThumbCache = LruCache<String, Bitmap>(96)
 
-@Suppress("DEPRECATION")
-private fun checkUsageStatsPermission(context: Context): Boolean {
-    return try {
-        val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return false
-        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
-        } else {
-            @Suppress("DEPRECATION")
-            appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName)
-        }
-        mode == AppOpsManager.MODE_ALLOWED
-    } catch (_: Throwable) {
-        false
-    }
-}
-
-private fun checkMediaPermission(context: Context): Boolean {
-    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED &&
-            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED &&
-            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED
-    } else {
-        ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-    }
-}
-
 @Volatile
 private var cachedFilesTotal: Long = 0L
 @Volatile
@@ -277,11 +247,11 @@ fun FilesScreen() {
     var freeSpace by remember { mutableLongStateOf(cachedFilesFree) }
     var isAnalyzing by remember { mutableStateOf(cachedFilesCategories.isEmpty()) }
 
-    var hasUsageAccess by remember { mutableStateOf(checkUsageStatsPermission(context)) }
+    var hasUsageAccess by remember { mutableStateOf(PermissionUtils.hasUsageStatsPermission(context)) }
     var hasManageStorage by remember {
         mutableStateOf(PermissionUtils.hasAllFilesPermission())
     }
-    var hasPermission by remember { mutableStateOf(checkMediaPermission(context)) }
+    var hasPermission by remember { mutableStateOf(PermissionUtils.hasMediaPermissions(context)) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
     val globalRefreshVersion by AppRefreshCoordinator.refreshVersion.collectAsStateWithLifecycle()
     LaunchedEffect(globalRefreshVersion) {
@@ -409,7 +379,7 @@ fun FilesScreen() {
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) {
-        val granted = checkMediaPermission(context)
+        val granted = PermissionUtils.hasMediaPermissions(context)
         hasPermission = granted
         if (!granted && mediaPermPromptAttempted) {
             Toast.makeText(context, "Enable Photos, Videos & Audio in App Permissions", Toast.LENGTH_SHORT).show()
@@ -424,7 +394,7 @@ fun FilesScreen() {
     val usageAccessLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) {
-        hasUsageAccess = checkUsageStatsPermission(context)
+        hasUsageAccess = PermissionUtils.hasUsageStatsPermission(context)
         forceFilesRescan = true
         StorageScanCache.invalidate()
         refreshTrigger++
@@ -449,9 +419,9 @@ fun FilesScreen() {
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                hasUsageAccess = checkUsageStatsPermission(context)
+                hasUsageAccess = PermissionUtils.hasUsageStatsPermission(context)
                 hasManageStorage = PermissionUtils.hasAllFilesPermission()
-                hasPermission = checkMediaPermission(context)
+                hasPermission = PermissionUtils.hasMediaPermissions(context)
                 interruptedShredPath = if (shredState.isRunning) null else FileShredder.peekInterruptedShredPath(context)
                 refreshTrigger++
             }
@@ -472,6 +442,8 @@ fun FilesScreen() {
             refreshTrigger++
             if (res != null) {
                 val msg = when {
+                    res.wasCancelled ->
+                        "Shredding cancelled (${res.shreddedCount} file(s) completed)"
                     res.blockedForOverwrite.isNotEmpty() ->
                         "Shredded ${res.shreddedCount}; ${res.blockedForOverwrite.size} blocked without All Files Access"
                     else ->
@@ -519,7 +491,7 @@ fun FilesScreen() {
             val otherUsed = max(0L, used - mediaTotal)
 
             var exactAppSize = 0L
-            if (checkUsageStatsPermission(context)) {
+            if (PermissionUtils.hasUsageStatsPermission(context)) {
                 try {
                     val storageStatsManager = context.getSystemService(Context.STORAGE_STATS_SERVICE) as? StorageStatsManager
                     if (storageStatsManager != null) {
@@ -973,7 +945,11 @@ fun FilesScreen() {
                 }
             },
             dismissButton = {
-                if (!shredState.isRunning) {
+                if (shredState.isRunning) {
+                    TextButton(onClick = { ShredJobCoordinator.cancelCurrentShred() }) {
+                        Text("STOP SHRED", color = AuraRose, fontWeight = FontWeight.Bold)
+                    }
+                } else {
                     TextButton(onClick = { showDeleteConfirm = false }) {
                         Text("CANCEL", color = TextSecondary)
                     }
@@ -1077,15 +1053,6 @@ fun FilesScreen() {
                         }
                     }
                     if (!target.isDirectory) {
-                        SimpleSheetAction(Icons.Default.Lock, "Vault", AuraPurple) {
-                            itemForMenu = null
-                            coroutineScope.launch {
-                                val ok = withContext(Dispatchers.IO) { FileManagerOps.encryptFileToVault(context, target.file) }
-                                Toast.makeText(context, if (ok) "Locked in Vault" else "Vault failed", Toast.LENGTH_SHORT).show()
-                                forceFilesRescan = true
-                                refreshTrigger++
-                            }
-                        }
                         SimpleSheetAction(Icons.Default.Share, "Share", AuraCyan) {
                             itemForMenu = null
                             shareFileWithProvider(context, target.file)
@@ -1137,14 +1104,6 @@ fun FilesScreen() {
             }
         },
         onShare = { f, _ -> shareFileWithProvider(context, f) },
-        onVault = { f, uri ->
-            coroutineScope.launch {
-                val ok = withContext(Dispatchers.IO) { FileManagerOps.encryptFileToVault(context, f, uri) }
-                Toast.makeText(context, if (ok) "Locked in Vault" else "Vault failed", Toast.LENGTH_SHORT).show()
-                forceFilesRescan = true
-                refreshTrigger++
-            }
-        },
         onDelete = { f, _ ->
             selectedPaths = setOf(f.absolutePath)
             deleteWithShredder = false
@@ -1306,13 +1265,28 @@ fun FilesScreen() {
                         item {
                             GlassCard(modifier = Modifier.fillMaxWidth()) {
                                 Column {
-                                    Text(
-                                        shredState.statusText.ifBlank { "Shredding in progress..." },
-                                        color = AuraRose,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            shredState.statusText.ifBlank { "Shredding in progress..." },
+                                            color = AuraRose,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        TextButton(
+                                            onClick = { ShredJobCoordinator.cancelCurrentShred() },
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                                        ) {
+                                            Text("Cancel", color = AuraRose, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                    Spacer(modifier = Modifier.height(6.dp))
                                     LinearProgressIndicator(
                                         progress = { shredState.progress },
                                         color = AuraRose,
@@ -1408,18 +1382,6 @@ fun FilesScreen() {
                             ) {
                                 try {
                                     context.startActivity(Intent(context, DeepCleanActivity::class.java))
-                                } catch (_: Throwable) {
-                                }
-                            }
-                            QuickToolCard(
-                                modifier = Modifier.weight(1f),
-                                icon = Icons.Default.Lock,
-                                title = "Vault",
-                                tint = AuraRose,
-                                tag = "tool_vault"
-                            ) {
-                                try {
-                                    context.startActivity(Intent(context, VaultActivity::class.java))
                                 } catch (_: Throwable) {
                                 }
                             }
@@ -1719,7 +1681,7 @@ fun FilesScreen() {
                                     )
                                     DropdownMenuItem(
                                         text = { Text("New Text File", color = TextPrimary) },
-                                        leadingIcon = { Icon(Icons.Default.NoteAdd, contentDescription = null, tint = AuraGreen) },
+                                        leadingIcon = { Icon(Icons.Default.Description, contentDescription = null, tint = AuraGreen) },
                                         onClick = {
                                             showCreateMenu = false
                                             showCreateFileDialog = true
@@ -1958,20 +1920,6 @@ fun FilesScreen() {
                                             FileManagerOps.compressFilesToZip(targets, File(currentDir, archiveName))
                                         }
                                         Toast.makeText(context, if (ok) "Saved $archiveName" else "Zip failed", Toast.LENGTH_SHORT).show()
-                                        selectedPaths = emptySet()
-                                        forceFilesRescan = true
-                                        refreshTrigger++
-                                    }
-                                }
-                                MiniBarAction(Icons.Default.Lock, "Vault", AuraPurple) {
-                                    coroutineScope.launch {
-                                        val lockedCount = withContext(Dispatchers.IO) {
-                                            selectedPaths.count { p ->
-                                                val f = File(p)
-                                                f.isFile && FileManagerOps.encryptFileToVault(context, f)
-                                            }
-                                        }
-                                        Toast.makeText(context, "Locked $lockedCount file(s) in Vault", Toast.LENGTH_SHORT).show()
                                         selectedPaths = emptySet()
                                         forceFilesRescan = true
                                         refreshTrigger++

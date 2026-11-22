@@ -16,8 +16,6 @@ import android.os.storage.StorageManager
 import android.provider.MediaStore
 import android.util.Size
 import androidx.core.content.ContextCompat
-import androidx.security.crypto.EncryptedFile
-import com.example.ui.screens.VaultManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -348,82 +346,6 @@ object FileManagerOps {
             StorageScanCache.invalidate()
             true
         } catch (_: Exception) {
-            false
-        }
-    }
-
-    /**
-     * Encrypts a file into the AES-256-GCM Vault, records original path metadata,
-     * and securely shreds/cleans up both disk plaintext and MediaStore index.
-     */
-    fun encryptFileToVault(context: Context, sourceFile: File, contentUri: Uri? = null): Boolean {
-        var destFile: File? = null
-        var registered = false
-        return try {
-            if (!sourceFile.exists() || !sourceFile.isFile) return false
-            val originalName = sourceFile.name
-            val originalParent = sourceFile.parentFile?.absolutePath
-            val originalSize = sourceFile.length()
-            val uuid = UUID.randomUUID().toString()
-            val vaultDir = VaultManager.getVaultDir(context)
-            val targetDest = File(vaultDir, "$uuid.enc")
-            destFile = targetDest
-            if (targetDest.exists()) targetDest.delete()
-
-            val encryptedFile = EncryptedFile.Builder(
-                context,
-                targetDest,
-                VaultManager.getMasterKey(context),
-                EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB
-            ).build()
-
-            sourceFile.inputStream().use { input ->
-                encryptedFile.openFileOutput().use { output ->
-                    input.copyTo(output)
-                }
-            }
-
-            if (!targetDest.exists() || (originalSize > 0L && targetDest.length() == 0L)) {
-                targetDest.delete()
-                return false
-            }
-
-            VaultManager.registerVaultEntry(
-                context = context,
-                uuid = uuid,
-                originalName = originalName,
-                originalParentPath = originalParent,
-                originalSizeBytes = originalSize
-            )
-            registered = true
-
-            // Securely shred plaintext blocks (NIST 1-Pass) + clean up MediaStore index
-            val targetUri = contentUri ?: FileShredder.findMediaContentUriForFile(context, sourceFile)
-            val shredResult = FileShredder.shredTargets(
-                context = context,
-                targets = listOf(ShredTarget(sourceFile, targetUri)),
-                standard = ShredStandard.NIST_SP_800_88
-            )
-            if (shredResult.shreddedCount == 0 && sourceFile.exists()) {
-                val deleted = sourceFile.delete()
-                if (deleted) {
-                    FileShredder.cleanupMediaStoreEntry(context, sourceFile.absolutePath, targetUri)
-                } else if (targetUri != null) {
-                    try {
-                        context.contentResolver.delete(targetUri, null, null)
-                    } catch (_: Exception) {
-                    }
-                }
-            }
-            StorageScanCache.invalidate()
-            true
-        } catch (_: Exception) {
-            if (!registered) {
-                try {
-                    destFile?.let { if (it.exists()) it.delete() }
-                } catch (_: Exception) {
-                }
-            }
             false
         }
     }

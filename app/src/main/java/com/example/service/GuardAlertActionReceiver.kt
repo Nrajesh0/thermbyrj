@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.example.R
 import com.example.ui.screens.GuardRulesActivity
 
 class GuardAlertActionReceiver : BroadcastReceiver() {
@@ -125,7 +126,7 @@ class GuardAlertActionReceiver : BroadcastReceiver() {
         val builder = NotificationCompat.Builder(context, NotificationChannels.GUARD_ALERT_CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_menu_info_details)
+            .setSmallIcon(R.drawable.ic_stat_dot)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setSilent(true)
             .setAutoCancel(true)

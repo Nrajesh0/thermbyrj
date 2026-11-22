@@ -14,7 +14,7 @@ import androidx.core.content.ContextCompat
 
 /**
  * Process-wide invalidation signal for the Overview storage scan cache.
- * Any screen or service that deletes, shreds, cleans, vaults, zips, or uninstalls items
+ * Any screen or service that deletes, shreds, cleans, zips, or uninstalls items
  * calls [invalidate] so [com.example.ui.screens.FilesScreen] refreshes immediately on resume.
  */
 object StorageScanCache {

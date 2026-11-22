@@ -1515,21 +1515,8 @@ object PrivacyAnalyzer {
         }
     }
 
-    @Suppress("DEPRECATION")
-    fun hasUsageStatsPermission(context: Context): Boolean {
-        return try {
-            val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return false
-            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), context.packageName)
-            } else {
-                @Suppress("DEPRECATION")
-                appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), context.packageName)
-            }
-            mode == AppOpsManager.MODE_ALLOWED
-        } catch (_: Throwable) {
-            false
-        }
-    }
+    fun hasUsageStatsPermission(context: Context): Boolean =
+        PermissionUtils.hasUsageStatsPermission(context)
 
     private val clipboardTimelineInfo = PlainPermissionInfo(
         permissionName = "SPECIAL_CLIPBOARD_READ",
@@ -2434,7 +2421,7 @@ object PrivacyAnalyzer {
                 context,
                 NotificationChannels.GUARD_ALERT_CHANNEL_ID
             )
-                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setSmallIcon(com.example.R.drawable.ic_stat_dot)
                 .setContentTitle(title)
                 .setContentText(message)
                 .setStyle(androidx.core.app.NotificationCompat.BigTextStyle().bigText(message))

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <data-extraction-rules>
-    <!-- Explicit allowlist: vault_registry_prefs.xml, vault_secure_prefs.xml, and encrypted vault files are intentionally excluded -->
+    <!-- Explicit allowlist of app preferences and thermal database -->
     <cloud-backup>
         <include domain="sharedpref" path="thermal_prefs.xml"/>
         <include domain="sharedpref" path="guard_events_prefs.xml"/>

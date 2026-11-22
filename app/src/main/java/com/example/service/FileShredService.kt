@@ -33,6 +33,7 @@ class FileShredService : Service() {
         private const val SHRED_CHANNEL_ID = NotificationChannels.SHRED_CHANNEL_ID
         private const val SHRED_NOTIF_ID = 2001
         private const val SHRED_DONE_NOTIF_ID = 2002
+        const val ACTION_CANCEL_SHRED = "com.example.action.CANCEL_SHRED"
     }
 
     override fun onCreate() {
@@ -44,6 +45,21 @@ class FileShredService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_CANCEL_SHRED) {
+            ShredJobCoordinator.cancelCurrentShred()
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            if (nm != null && canPostNotification()) {
+                try {
+                    nm.notify(
+                        SHRED_NOTIF_ID,
+                        buildProgressNotification("Cancelling shredder...", 0, 1, indeterminate = true)
+                    )
+                } catch (_: Throwable) {
+                }
+            }
+            return START_NOT_STICKY
+        }
+
         val initialNotif = buildProgressNotification("Preparing secure file shredder...", 0, 1, indeterminate = true)
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -122,24 +138,39 @@ class FileShredService : Service() {
         }
     }
 
+    private fun buildOpenAppPendingIntent(requestCode: Int): PendingIntent {
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        }
+        return PendingIntent.getActivity(
+            this,
+            requestCode,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
     private fun postCompletionNotification(result: ShredResult?) {
         try {
             if (result == null || !canPostNotification()) return
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-            val text = if (result.blockedForOverwrite.isNotEmpty()) {
-                "Shredded ${result.shreddedCount} file(s); ${result.blockedForOverwrite.size} blocked (needs All Files Access)."
+            val title = if (result.wasCancelled) {
+                getString(R.string.notif_shred_cancelled)
             } else {
-                "Permanently shredded ${result.shreddedCount} file(s) (${formatBytes(result.totalBytesWiped)})."
+                getString(R.string.notif_shred_complete)
             }
-            val pi = PendingIntent.getActivity(
-                this,
-                0,
-                Intent(this, MainActivity::class.java),
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
+            val text = when {
+                result.wasCancelled ->
+                    "Cancelled after shredding ${result.shreddedCount} file(s) (${formatBytes(result.totalBytesWiped)})."
+                result.blockedForOverwrite.isNotEmpty() ->
+                    "Shredded ${result.shreddedCount} file(s); ${result.blockedForOverwrite.size} blocked (needs All Files Access)."
+                else ->
+                    "Permanently shredded ${result.shreddedCount} file(s) (${formatBytes(result.totalBytesWiped)})."
+            }
+            val pi = buildOpenAppPendingIntent(SHRED_DONE_NOTIF_ID)
             val notif = NotificationCompat.Builder(this, SHRED_CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.ic_menu_info_details)
-                .setContentTitle("Secure Shredder Complete")
+                .setSmallIcon(R.drawable.ic_stat_dot)
+                .setContentTitle(title)
                 .setContentText(text)
                 .setAutoCancel(true)
                 .setContentIntent(pi)
@@ -154,14 +185,27 @@ class FileShredService : Service() {
         progress: Int,
         max: Int,
         indeterminate: Boolean
-    ) = NotificationCompat.Builder(this, SHRED_CHANNEL_ID)
-        .setSmallIcon(android.R.drawable.ic_menu_delete)
-        .setContentTitle("Secure File Shredder Active")
-        .setContentText(text)
-        .setOngoing(true)
-        .setOnlyAlertOnce(true)
-        .setProgress(max, progress, indeterminate)
-        .build()
+    ): android.app.Notification {
+        val cancelIntent = Intent(this, FileShredService::class.java).apply {
+            action = ACTION_CANCEL_SHRED
+        }
+        val cancelPi = PendingIntent.getService(
+            this,
+            2003,
+            cancelIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(this, SHRED_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_dot)
+            .setContentTitle(getString(R.string.notif_shred_active))
+            .setContentText(text)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setContentIntent(buildOpenAppPendingIntent(SHRED_NOTIF_ID))
+            .addAction(0, getString(R.string.action_cancel), cancelPi)
+            .setProgress(max, progress, indeterminate)
+            .build()
+    }
 
     private fun createChannel() {
         NotificationChannels.ensureCreated(this)

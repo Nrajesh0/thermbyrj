@@ -1,0 +1,13 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Minimalist monochrome shield outline with central thermal/guard dot -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,2L4,5.4V11.2C4,16.55 7.41,21.48 12,22.8C16.59,21.48 20,16.55 20,11.2V5.4L12,2ZM18,11.2C18,15.42 15.44,19.32 12,20.67C8.56,19.32 6,15.42 6,11.2V6.73L12,4.18L18,6.73V11.2Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,8.5A3.5,3.5 0 1,0 12,15.5A3.5,3.5 0 1,0 12,8.5Z" />
+</vector>

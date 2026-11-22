@@ -50,6 +50,7 @@ import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.FolderOff
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
@@ -63,6 +64,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -83,10 +85,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import com.example.GlassCard
 import com.example.formatBytes
+import com.example.service.FileManagerOps
 import com.example.service.StorageScanCache
+import com.example.ui.components.ActiveFilePreview
+import com.example.ui.components.BuiltInFilePreviewHost
+import com.example.ui.components.openExternalWithProvider
+import com.example.ui.components.resolveInAppViewerType
 import com.example.ui.theme.AppTheme
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
@@ -145,6 +151,8 @@ fun DeepCleanScreen(onBack: () -> Unit) {
     var selectedPaths by remember { mutableStateOf<Set<String>>(emptySet()) }
     var expandedCategories by remember { mutableStateOf<Set<String>>(emptySet()) }
     var scanTrigger by remember { mutableIntStateOf(0) }
+    var activeFilePreview by remember { mutableStateOf<ActiveFilePreview?>(null) }
+    var pendingCleanConfirm by remember { mutableStateOf<Pair<String, List<JunkFileItem>>?>(null) }
     var hasManageStorage by remember {
         mutableStateOf(com.example.service.PermissionUtils.hasAllFilesPermission())
     }
@@ -170,17 +178,11 @@ fun DeepCleanScreen(onBack: () -> Unit) {
 
     fun openFilePreview(file: File) {
         if (file.isDirectory) return
-        try {
-            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-            val ext = file.extension.lowercase()
-            val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, mime)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            context.startActivity(Intent.createChooser(intent, "Preview File"))
-        } catch (_: Exception) {
-            Toast.makeText(context, "Cannot preview this item", Toast.LENGTH_SHORT).show()
+        val viewerType = resolveInAppViewerType(file)
+        if (viewerType != null) {
+            activeFilePreview = ActiveFilePreview(file = file, type = viewerType)
+        } else {
+            openExternalWithProvider(context, file)
         }
     }
 
@@ -405,10 +407,13 @@ fun DeepCleanScreen(onBack: () -> Unit) {
             }
 
             val safeAutoSelectedPaths = builtCategories.flatMap { cat ->
-                if (cat.id == "apks") {
-                    cat.items.filter { it.badge == "Already Installed" || it.badge == "Outdated APK" }
-                } else {
-                    cat.items
+                when (cat.id) {
+                    "apks" -> cat.items.filter { it.badge == "Already Installed" || it.badge == "Outdated APK" }
+                    "temp" -> cat.items.filter {
+                        val ext = it.file.extension.lowercase()
+                        ext != "bak" && ext != "old"
+                    }
+                    else -> cat.items
                 }
             }.map { it.file.absolutePath }.toSet()
             builtCategories.toList() to safeAutoSelectedPaths
@@ -416,6 +421,75 @@ fun DeepCleanScreen(onBack: () -> Unit) {
         categories = scanResult.first
         selectedPaths = scanResult.second
         isScanning = false
+    }
+
+    fun executeCleanConfirmed(label: String, itemsToClean: List<JunkFileItem>) {
+        if (itemsToClean.isEmpty()) return
+        isScanning = true
+        scope.launch(Dispatchers.IO) {
+            val root = Environment.getExternalStorageDirectory()
+            val (removedCount, freedBytes) = cleanFilesAndPruneEmptyParents(itemsToClean, root)
+            if (removedCount > 0) StorageScanCache.invalidate()
+            withContext(Dispatchers.Main) {
+                Toast.makeText(
+                    context,
+                    "Cleaned $removedCount items from $label (${formatBytes(freedBytes)} freed)",
+                    Toast.LENGTH_SHORT
+                ).show()
+                scanTrigger++
+            }
+        }
+    }
+
+    BuiltInFilePreviewHost(
+        preview = activeFilePreview,
+        onDismiss = { activeFilePreview = null },
+        onExtractZip = { zipFile ->
+            scope.launch {
+                val ok = withContext(Dispatchers.IO) {
+                    FileManagerOps.extractZipArchive(context, zipFile, zipFile.parentFile ?: Environment.getExternalStorageDirectory())
+                }
+                Toast.makeText(context, if (ok) "Extracted ${zipFile.name}" else "Extract failed", Toast.LENGTH_SHORT).show()
+                scanTrigger++
+            }
+        },
+        onDelete = { f, _ ->
+            val match = categories.flatMap { it.items }.firstOrNull { it.file.absolutePath == f.absolutePath }
+                ?: JunkFileItem(f, if (f.exists()) f.length() else 0L)
+            pendingCleanConfirm = f.name to listOf(match)
+        },
+        onFileSaved = { scanTrigger++ }
+    )
+
+    pendingCleanConfirm?.let { (label, itemsToClean) ->
+        val totalBytes = remember(itemsToClean) { itemsToClean.sumOf { it.size } }
+        AlertDialog(
+            onDismissRequest = { pendingCleanConfirm = null },
+            containerColor = GlassPanel,
+            title = { Text("Clean ${itemsToClean.size} Item(s)?", color = TextPrimary, fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "Permanently delete ${itemsToClean.size} item(s) from $label (${formatBytes(totalBytes)})?",
+                    color = TextSecondary
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        pendingCleanConfirm = null
+                        executeCleanConfirmed(label, itemsToClean)
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = AuraOrange)
+                ) {
+                    Text("Clean", color = Color.Black, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingCleanConfirm = null }) {
+                    Text("Cancel", color = TextSecondary)
+                }
+            }
+        )
     }
 
     Scaffold(
@@ -453,20 +527,8 @@ fun DeepCleanScreen(onBack: () -> Unit) {
                             val itemsToClean = categories.flatMap { cat ->
                                 cat.items.filter { it.file.absolutePath in selectedPaths }
                             }
-                            if (itemsToClean.isEmpty()) return@Button
-                            isScanning = true
-                            scope.launch(Dispatchers.IO) {
-                                val root = Environment.getExternalStorageDirectory()
-                                val (removedCount, freedBytes) = cleanFilesAndPruneEmptyParents(itemsToClean, root)
-                                if (removedCount > 0) StorageScanCache.invalidate()
-                                withContext(Dispatchers.Main) {
-                                    Toast.makeText(
-                                        context,
-                                        "Cleaned $removedCount items (${formatBytes(freedBytes)} freed)",
-                                        Toast.LENGTH_SHORT
-                                    ).show()
-                                    scanTrigger++
-                                }
+                            if (itemsToClean.isNotEmpty()) {
+                                pendingCleanConfirm = "Selected Categories" to itemsToClean
                             }
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = AuraOrange),
@@ -636,17 +698,8 @@ fun DeepCleanScreen(onBack: () -> Unit) {
                                         onClick = {
                                             val toDelete = cat.items.filter { it.file.absolutePath in selectedPaths }
                                                 .ifEmpty { cat.items }
-                                            scope.launch(Dispatchers.IO) {
-                                                val root = Environment.getExternalStorageDirectory()
-                                                val (cnt, freed) = cleanFilesAndPruneEmptyParents(toDelete, root)
-                                                withContext(Dispatchers.Main) {
-                                                    Toast.makeText(
-                                                        context,
-                                                        "Cleaned $cnt items from ${cat.title} (${formatBytes(freed)})",
-                                                        Toast.LENGTH_SHORT
-                                                    ).show()
-                                                    scanTrigger++
-                                                }
+                                            if (toDelete.isNotEmpty()) {
+                                                pendingCleanConfirm = cat.title to toDelete
                                             }
                                         }
                                     ) {

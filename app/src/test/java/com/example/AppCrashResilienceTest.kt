@@ -14,12 +14,16 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.ThermalRecord
+import com.example.service.BootCompletedReceiver
 import com.example.service.FileManagerOps
 import com.example.service.FileShredService
+import com.example.service.FileShredder
 import com.example.service.GuardAlertActionReceiver
 import com.example.service.LiveGuardMonitor
 import com.example.service.SharedClipboardOp
 import com.example.service.SharedFileClipboard
+import com.example.service.ShredStandard
+import com.example.service.ShredTarget
 import com.example.service.ThermalMonitor
 import com.example.service.ThermalTrackerService
 import com.example.service.ThermalWidgetProvider
@@ -33,8 +37,6 @@ import com.example.ui.screens.DuplicateFinderActivity
 import com.example.ui.screens.DuplicateHashVerifier
 import com.example.ui.screens.FileCategoryActivity
 import com.example.ui.screens.GuardRulesActivity
-import com.example.ui.screens.VaultActivity
-import com.example.ui.screens.VaultManager
 import com.example.ui.theme.AppTheme
 import java.io.File
 import java.io.FileOutputStream
@@ -76,8 +78,7 @@ class AppCrashResilienceTest {
             DataTelemetryActivity::class.java,
             DeepCleanActivity::class.java,
             DuplicateFinderActivity::class.java,
-            GuardRulesActivity::class.java,
-            VaultActivity::class.java
+            GuardRulesActivity::class.java
         )
         for (cls in activities) {
             val ctrl = Robolectric.buildActivity(cls)
@@ -98,15 +99,33 @@ class AppCrashResilienceTest {
     }
 
     @Test
-    fun `VaultManager recovers gracefully when Keystore is unavailable`() {
+    fun `BootCompletedReceiver and FileShredder cancellation handle edge cases safely`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        val registry = VaultManager.getRegistry(context)
-        assertNotNull(registry)
-        registry.edit().putString("test_key", "test_value").commit()
-        assertEquals("test_value", registry.getString("test_key", null))
+        val receiver = BootCompletedReceiver()
+        // Empty, unknown, and valid boot intents must never crash
+        receiver.onReceive(context, Intent())
+        receiver.onReceive(context, Intent("com.example.UNKNOWN"))
+        receiver.onReceive(context, Intent(Intent.ACTION_BOOT_COMPLETED))
+        receiver.onReceive(context, Intent(Intent.ACTION_MY_PACKAGE_REPLACED))
 
-        // Must never throw even if Keystore is unavailable
-        VaultManager.getMasterKeyOrNull(context)
+        // Cancelling shredder mid-batch leaves remaining files untouched and reports wasCancelled = true
+        val tempDir = File(System.getProperty("java.io.tmpdir"), "dot_shred_cancel_${System.nanoTime()}")
+        tempDir.mkdirs()
+        try {
+            val fileA = File(tempDir, "a.txt").apply { writeText("secret data a") }
+            val fileB = File(tempDir, "b.txt").apply { writeText("secret data b") }
+            val result = FileShredder.shredTargets(
+                context = context,
+                targets = listOf(ShredTarget(fileA), ShredTarget(fileB)),
+                standard = ShredStandard.NIST_SP_800_88,
+                isCancelled = { true }
+            )
+            assertTrue(result.wasCancelled)
+            assertEquals(0, result.shreddedCount)
+            assertTrue(fileA.exists() && fileB.exists())
+        } finally {
+            tempDir.deleteRecursively()
+        }
     }
 
     @Test

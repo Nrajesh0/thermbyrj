@@ -191,7 +191,6 @@ class MainActivity : ComponentActivity() {
         // Staggered, low-impact background pre-warm after initial UI, service, and storage scan settle
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                com.example.ui.screens.VaultManager.cleanupStalePreviewCache(applicationContext)
                 delay(2_800L)
                 val summary = PrivacyAnalyzer.peekCachedPrivacySummary(false)
                     ?: PrivacyAnalyzer.analyzeDevicePrivacy(applicationContext, includeSystemApps = false)

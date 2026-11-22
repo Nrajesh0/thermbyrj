@@ -14,9 +14,11 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import com.example.R
 import com.example.data.AppDatabase
 import com.example.data.ThermalRecord
 import com.example.data.ThermalRepository
@@ -137,6 +139,9 @@ class ThermalTrackerService : Service() {
     private var lastRecordedTime = 0L
     private var lastRecordedTemp = -100f
     private var lastWidgetTemp = -100f
+    private var lastWidgetUpdateMs = 0L
+    private var lastNotifTemp = -100f
+    private var lastNotifUpdateMs = 0L
 
     private fun startTrackingLoop() {
         if (!::thermalMonitor.isInitialized || !::repository.isInitialized) return
@@ -154,6 +159,15 @@ class ThermalTrackerService : Service() {
                 } catch (_: Throwable) {
                 }
             }
+        }
+    }
+
+    private fun isDeviceInteractive(): Boolean {
+        return try {
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            pm?.isInteractive != false
+        } catch (_: Throwable) {
+            true
         }
     }
 
@@ -181,10 +195,21 @@ class ThermalTrackerService : Service() {
             lastRecordedTemp = live.batteryTemp
         }
 
-        if (kotlin.math.abs(live.batteryTemp - lastWidgetTemp) >= 0.2f) {
+        val interactive = isDeviceInteractive()
+        val widgetTempDelta = kotlin.math.abs(live.batteryTemp - lastWidgetTemp)
+        val widgetTimeDelta = now - lastWidgetUpdateMs
+        if (interactive && (lastWidgetUpdateMs == 0L || (widgetTempDelta >= 0.5f && widgetTimeDelta >= 10_000L))) {
             updateWidget(live.batteryTemp)
-            updateForegroundNotification(live)
             lastWidgetTemp = live.batteryTemp
+            lastWidgetUpdateMs = now
+        }
+
+        val notifTempDelta = kotlin.math.abs(live.batteryTemp - lastNotifTemp)
+        val notifTimeDelta = now - lastNotifUpdateMs
+        if (lastNotifUpdateMs == 0L || (interactive && notifTempDelta >= 0.5f && notifTimeDelta >= 10_000L) || notifTempDelta >= 1.5f) {
+            updateForegroundNotification(live)
+            lastNotifTemp = live.batteryTemp
+            lastNotifUpdateMs = now
         }
     }
 
@@ -291,7 +316,7 @@ class ThermalTrackerService : Service() {
             val builder = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
                 .setContentTitle(title)
                 .setContentText(message)
-                .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setSmallIcon(R.drawable.ic_stat_dot)
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setAutoCancel(true)
             buildOpenAppPendingIntent(ALERT_NOTIFICATION_ID)?.let { builder.setContentIntent(it) }
@@ -308,9 +333,9 @@ class ThermalTrackerService : Service() {
 
     private fun createNotification(content: String): Notification {
         val builder = NotificationCompat.Builder(this, TRACKER_CHANNEL_ID)
-            .setContentTitle("dot Shield Active")
+            .setContentTitle(getString(R.string.notif_shield_active))
             .setContentText(content)
-            .setSmallIcon(android.R.drawable.ic_menu_info_details)
+            .setSmallIcon(R.drawable.ic_stat_dot)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOnlyAlertOnce(true)
             .setOngoing(true)

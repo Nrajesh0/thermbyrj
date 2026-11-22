@@ -1315,7 +1315,7 @@ class LiveGuardMonitor private constructor(private val context: Context) {
                 .setContentTitle(payload.title)
                 .setContentText(payload.message)
                 .setStyle(androidx.core.app.NotificationCompat.BigTextStyle().bigText(payload.message))
-                .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setSmallIcon(com.example.R.drawable.ic_stat_dot)
                 .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
                 .setAutoCancel(true)
                 .setContentIntent(contentPi)

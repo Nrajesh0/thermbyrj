@@ -69,10 +69,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import com.example.GlassCard
 import com.example.formatBytes
+import com.example.service.FileManagerOps
 import com.example.service.StorageScanCache
+import com.example.ui.components.ActiveFilePreview
+import com.example.ui.components.BuiltInFilePreviewHost
+import com.example.ui.components.openExternalWithProvider
+import com.example.ui.components.resolveInAppViewerType
 import com.example.ui.theme.AppTheme
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
@@ -121,6 +125,7 @@ fun DuplicateFinderScreen(onBack: () -> Unit) {
     var statusText by remember { mutableStateOf("Scanning storage...") }
     var scanTrigger by remember { mutableIntStateOf(0) }
     var showSmartCleanConfirm by remember { mutableStateOf(false) }
+    var activeFilePreview by remember { mutableStateOf<ActiveFilePreview?>(null) }
     var hasManageStorage by remember {
         mutableStateOf(com.example.service.PermissionUtils.hasAllFilesPermission())
     }
@@ -161,19 +166,44 @@ fun DuplicateFinderScreen(onBack: () -> Unit) {
     }
 
     fun openFilePreview(file: File) {
-        try {
-            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-            val ext = file.extension.lowercase()
-            val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, mime)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            context.startActivity(Intent.createChooser(intent, "Preview File"))
-        } catch (_: Exception) {
-            Toast.makeText(context, "No app found to preview this file", Toast.LENGTH_SHORT).show()
+        val viewerType = resolveInAppViewerType(file)
+        if (viewerType != null) {
+            activeFilePreview = ActiveFilePreview(file = file, type = viewerType)
+        } else {
+            openExternalWithProvider(context, file)
         }
     }
+
+    BuiltInFilePreviewHost(
+        preview = activeFilePreview,
+        onDismiss = { activeFilePreview = null },
+        onExtractZip = { zipFile ->
+            scope.launch {
+                val ok = withContext(Dispatchers.IO) {
+                    FileManagerOps.extractZipArchive(context, zipFile, zipFile.parentFile ?: Environment.getExternalStorageDirectory())
+                }
+                Toast.makeText(context, if (ok) "Extracted ${zipFile.name}" else "Extract failed", Toast.LENGTH_SHORT).show()
+                scanTrigger++
+            }
+        },
+        onDelete = { f, _ ->
+            scope.launch(Dispatchers.IO) {
+                val deleted = deleteFileComplete(f)
+                if (deleted) StorageScanCache.invalidate()
+                withContext(Dispatchers.Main) {
+                    if (deleted) {
+                        duplicateGroups = duplicateGroups.mapNotNull { group ->
+                            val newFiles = group.files.filter { it != f }
+                            if (newFiles.size <= 1) null else group.copy(files = newFiles)
+                        }
+                    } else {
+                        Toast.makeText(context, "Could not delete file", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        },
+        onFileSaved = { scanTrigger++ }
+    )
 
     LaunchedEffect(scanTrigger) {
         isScanning = true

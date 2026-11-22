@@ -1,21 +1,25 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# Preserve clean line numbers for crash stack traces while hiding source filenames
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# Room Database entities, DAOs, and generated implementations
+-keep class * extends androidx.room.RoomDatabase
+-keep @androidx.room.Entity class *
+-keep @androidx.room.Dao interface *
+-keepclassmembers class com.example.data.** { *; }
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# Keep Android components declared in AndroidManifest.xml
+-keep public class com.example.MainActivity
+-keep public class com.example.service.ThermalTrackerService
+-keep public class com.example.service.FileShredService
+-keep public class com.example.service.ThermalWidgetProvider
+-keep public class com.example.service.GuardAlertActionReceiver
+-keep public class com.example.service.BootCompletedReceiver
+-keep public class com.example.ui.screens.** extends android.app.Activity
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# Keep reflective hidden-API / AppOps calls safe from aggressive stripping
+-dontwarn android.app.AppOpsManager**
+-dontwarn android.os.storage.**
+-dontwarn android.hardware.camera2.**
+-dontwarn android.media.**
+-dontwarn org.slf4j.**

@@ -46,7 +46,8 @@ data class ShredResult(
     val shreddedCount: Int,
     val totalBytesWiped: Long,
     val blockedForOverwrite: List<ShredTarget>,
-    val failedTargets: List<ShredTarget>
+    val failedTargets: List<ShredTarget>,
+    val wasCancelled: Boolean = false
 )
 
 data class ShredJobState(
@@ -69,6 +70,16 @@ object ShredJobCoordinator {
     @Volatile
     private var activeJob: Job? = null
 
+    @Volatile
+    private var cancelRequested: Boolean = false
+
+    fun cancelCurrentShred() {
+        cancelRequested = true
+        if (_state.value.isRunning) {
+            _state.value = _state.value.copy(statusText = "Cancelling shredder...")
+        }
+    }
+
     fun startBackgroundShred(
         context: Context,
         targets: List<ShredTarget>,
@@ -76,6 +87,7 @@ object ShredJobCoordinator {
     ): Boolean {
         if (targets.isEmpty() || _state.value.isRunning) return false
         val appContext = context.applicationContext
+        cancelRequested = false
 
         val initialTotal = targets.size.coerceAtLeast(1)
         // Set running state BEFORE starting FileShredService so onStartCommand never sees isRunning == false
@@ -107,14 +119,17 @@ object ShredJobCoordinator {
                     context = appContext,
                     targets = targets,
                     standard = standard,
+                    isCancelled = { cancelRequested },
                     onDetailedProgress = { fraction, done, total, label ->
-                        _state.value = _state.value.copy(
-                            isRunning = true,
-                            progress = fraction.coerceIn(0f, 1f),
-                            completedFiles = done,
-                            totalFiles = total,
-                            statusText = label
-                        )
+                        if (!cancelRequested) {
+                            _state.value = _state.value.copy(
+                                isRunning = true,
+                                progress = fraction.coerceIn(0f, 1f),
+                                completedFiles = done,
+                                totalFiles = total,
+                                statusText = label
+                            )
+                        }
                     }
                 )
             } catch (_: Throwable) {
@@ -122,7 +137,8 @@ object ShredJobCoordinator {
                     shreddedCount = 0,
                     totalBytesWiped = 0L,
                     blockedForOverwrite = emptyList(),
-                    failedTargets = targets
+                    failedTargets = targets,
+                    wasCancelled = cancelRequested
                 )
             }
 
@@ -130,15 +146,17 @@ object ShredJobCoordinator {
                 StorageScanCache.invalidate()
             }
 
+            cancelRequested = false
             _state.value = _state.value.copy(
                 isRunning = false,
                 progress = 1f,
                 completionId = System.currentTimeMillis(),
                 lastResult = result,
-                statusText = if (result.blockedForOverwrite.isNotEmpty()) {
-                    "Shredded ${result.shreddedCount}; ${result.blockedForOverwrite.size} blocked"
-                } else {
-                    "Shredded ${result.shreddedCount} file(s)"
+                statusText = when {
+                    result.wasCancelled -> "Cancelled (${result.shreddedCount} shredded)"
+                    result.blockedForOverwrite.isNotEmpty() ->
+                        "Shredded ${result.shreddedCount}; ${result.blockedForOverwrite.size} blocked"
+                    else -> "Shredded ${result.shreddedCount} file(s)"
                 }
             )
         }
@@ -189,6 +207,7 @@ object FileShredder {
         context: Context,
         targets: List<ShredTarget>,
         standard: ShredStandard = ShredStandard.DOD_5220_22_M,
+        isCancelled: () -> Boolean = { false },
         onDetailedProgress: ((fraction: Float, completedFiles: Int, totalFiles: Int, statusLabel: String) -> Unit)? = null,
         onProgress: (completedFiles: Int, totalFiles: Int, statusLabel: String) -> Unit = { _, _, _ -> }
     ): ShredResult {
@@ -213,11 +232,16 @@ object FileShredder {
         val total = expandedFiles.size.coerceAtLeast(1)
         var shreddedCount = 0
         var totalBytesWiped = 0L
+        var cancelledEarly = false
         val blocked = mutableListOf<ShredTarget>()
         val failed = mutableListOf<ShredTarget>()
         val buffer = ByteArray(65536)
 
-        expandedFiles.forEachIndexed { idx, target ->
+        for ((idx, target) in expandedFiles.withIndex()) {
+            if (isCancelled()) {
+                cancelledEarly = true
+                break
+            }
             val file = target.file
             val fileName = file.name.ifBlank { "File ${idx + 1}" }
             onProgress(idx, total, "Shredding $fileName...")
@@ -242,6 +266,7 @@ object FileShredder {
                     contentUri = target.contentUri,
                     standard = standard,
                     buffer = buffer,
+                    isCancelled = isCancelled,
                     onPassProgress = perFileProgress
                 )
                 clearInterruptedShredPath(context)
@@ -255,6 +280,7 @@ object FileShredder {
                     fileLengthHint = fileLen,
                     standard = standard,
                     buffer = buffer,
+                    isCancelled = isCancelled,
                     onPassProgress = perFileProgress
                 )
                 clearInterruptedShredPath(context)
@@ -263,6 +289,10 @@ object FileShredder {
             if (wipedSuccessfully) {
                 shreddedCount++
                 totalBytesWiped += fileLen
+            } else if (isCancelled()) {
+                cancelledEarly = true
+                failed.add(target)
+                break
             } else if (file.exists() && !file.canWrite()) {
                 blocked.add(target)
             } else if (target.contentUri != null) {
@@ -277,24 +307,27 @@ object FileShredder {
             onDetailedProgress?.invoke((idx + 1).toFloat() / total.toFloat(), idx + 1, total, doneLabel)
         }
 
-        // Remove empty shredded subdirectories bottom-up
-        directoriesToRemove
-            .distinct()
-            .sortedByDescending { it.absolutePath.length }
-            .forEach { dir ->
-                try {
-                    if (dir.exists() && (dir.listFiles()?.isEmpty() == true)) {
-                        dir.delete()
+        if (!cancelledEarly) {
+            // Remove empty shredded subdirectories bottom-up
+            directoriesToRemove
+                .distinct()
+                .sortedByDescending { it.absolutePath.length }
+                .forEach { dir ->
+                    try {
+                        if (dir.exists() && (dir.listFiles()?.isEmpty() == true)) {
+                            dir.delete()
+                        }
+                    } catch (_: Exception) {
                     }
-                } catch (_: Exception) {
                 }
-            }
+        }
 
         return ShredResult(
             shreddedCount = shreddedCount,
             totalBytesWiped = totalBytesWiped,
             blockedForOverwrite = blocked,
-            failedTargets = failed
+            failedTargets = failed,
+            wasCancelled = cancelledEarly || isCancelled()
         )
     }
 
@@ -304,22 +337,24 @@ object FileShredder {
         contentUri: Uri?,
         standard: ShredStandard,
         buffer: ByteArray,
+        isCancelled: () -> Boolean,
         onPassProgress: (passNum: Int, totalPasses: Int, passFraction: Float) -> Unit
     ): Boolean {
         val originalPath = file.absolutePath
         return try {
             val length = file.length()
             if (length > 0L) {
-                when (standard) {
+                val ok = when (standard) {
                     ShredStandard.DOD_5220_22_M -> {
-                        overwritePass(file, length, mode = 0, buffer = buffer) { f -> onPassProgress(1, 3, f) }
-                        overwritePass(file, length, mode = 1, buffer = buffer) { f -> onPassProgress(2, 3, f) }
-                        overwritePass(file, length, mode = 2, buffer = buffer) { f -> onPassProgress(3, 3, f) }
+                        overwritePass(file, length, mode = 0, buffer = buffer, isCancelled = isCancelled) { f -> onPassProgress(1, 3, f) } &&
+                            overwritePass(file, length, mode = 1, buffer = buffer, isCancelled = isCancelled) { f -> onPassProgress(2, 3, f) } &&
+                            overwritePass(file, length, mode = 2, buffer = buffer, isCancelled = isCancelled) { f -> onPassProgress(3, 3, f) }
                     }
                     ShredStandard.NIST_SP_800_88 -> {
-                        overwritePass(file, length, mode = 2, buffer = buffer) { f -> onPassProgress(1, 1, f) }
+                        overwritePass(file, length, mode = 2, buffer = buffer, isCancelled = isCancelled) { f -> onPassProgress(1, 1, f) }
                     }
                 }
+                if (!ok || isCancelled()) return false
             }
 
             // Truncate to 0 bytes and force metadata sync before rename/delete
@@ -345,8 +380,9 @@ object FileShredder {
         length: Long,
         mode: Int,
         buffer: ByteArray,
+        isCancelled: () -> Boolean,
         onFraction: (Float) -> Unit
-    ) {
+    ): Boolean {
         RandomAccessFile(file, "rws").use { raf ->
             raf.seek(0L)
             var written = 0L
@@ -357,6 +393,7 @@ object FileShredder {
             }
             onFraction(0f)
             while (written < length) {
+                if (isCancelled()) return false
                 if (mode == 2) {
                     random.nextBytes(buffer)
                 }
@@ -371,6 +408,7 @@ object FileShredder {
             }
             raf.fd.sync()
         }
+        return true
     }
 
     private fun overwriteViaContentUri(
@@ -379,17 +417,23 @@ object FileShredder {
         fileLengthHint: Long,
         standard: ShredStandard,
         buffer: ByteArray,
+        isCancelled: () -> Boolean,
         onPassProgress: (passNum: Int, totalPasses: Int, passFraction: Float) -> Unit
     ): Boolean {
         return try {
             val pfd = context.contentResolver.openFileDescriptor(uri, "rw") ?: return false
+            var completedAllPasses = true
             pfd.use { descriptor ->
                 val actualLen = descriptor.statSize.takeIf { it > 0L } ?: fileLengthHint
                 val passes = if (standard == ShredStandard.DOD_5220_22_M) listOf(0, 1, 2) else listOf(2)
                 if (actualLen > 0L) {
                     FileOutputStream(descriptor.fileDescriptor).use { fos ->
                         val ch = fos.channel
-                        passes.forEachIndexed { passIdx, mode ->
+                        for ((passIdx, mode) in passes.withIndex()) {
+                            if (isCancelled()) {
+                                completedAllPasses = false
+                                break
+                            }
                             ch.position(0L)
                             when (mode) {
                                 0 -> java.util.Arrays.fill(buffer, 0x00.toByte())
@@ -399,6 +443,10 @@ object FileShredder {
                             var lastEmitMs = 0L
                             onPassProgress(passIdx + 1, passes.size, 0f)
                             while (written < actualLen) {
+                                if (isCancelled()) {
+                                    completedAllPasses = false
+                                    break
+                                }
                                 if (mode == 2) random.nextBytes(buffer)
                                 val toWrite = minOf(buffer.size.toLong(), actualLen - written).toInt()
                                 ch.write(java.nio.ByteBuffer.wrap(buffer, 0, toWrite))
@@ -409,13 +457,17 @@ object FileShredder {
                                     onPassProgress(passIdx + 1, passes.size, (written.toFloat() / actualLen.toFloat()).coerceIn(0f, 1f))
                                 }
                             }
+                            if (!completedAllPasses) break
                             ch.force(true)
                         }
-                        ch.truncate(0L)
-                        ch.force(true)
+                        if (completedAllPasses) {
+                            ch.truncate(0L)
+                            ch.force(true)
+                        }
                     }
                 }
             }
+            if (!completedAllPasses || isCancelled()) return false
             val rows = context.contentResolver.delete(uri, null, null)
             rows > 0
         } catch (_: Exception) {

@@ -149,7 +149,17 @@ class ThermalWidgetProvider : AppWidgetProvider() {
             }
         }
 
+        @Volatile
+        private var cachedBgKey: Long = Long.MIN_VALUE
+        @Volatile
+        private var cachedBgBitmap: Bitmap? = null
+
         private fun renderWidgetBackgroundBitmap(bgColor: Int, borderColor: Int): Bitmap {
+            val key = (bgColor.toLong() shl 32) or (borderColor.toLong() and 0xFFFFFFFFL)
+            val existing = cachedBgBitmap
+            if (cachedBgKey == key && existing != null && !existing.isRecycled) {
+                return existing
+            }
             val width = 320
             val height = 160
             val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
@@ -169,6 +179,8 @@ class ThermalWidgetProvider : AppWidgetProvider() {
                 strokeWidth = 2.5f
             }
             canvas.drawRoundRect(rect, radius, radius, strokePaint)
+            cachedBgKey = key
+            cachedBgBitmap = bmp
             return bmp
         }
 

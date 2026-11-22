@@ -6,7 +6,9 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.Matrix
 import android.graphics.drawable.BitmapDrawable
+import android.media.ExifInterface
 import android.net.Uri
 import android.os.Build
 import android.webkit.MimeTypeMap
@@ -46,10 +48,10 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Unarchive
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -81,6 +83,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -90,13 +93,12 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.FileProvider
 import com.example.InfoRow
+import com.example.R
 import com.example.formatBytes
 import com.example.service.FileManagerOps
 import com.example.service.toSafeComposeBitmap
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
-import com.example.ui.theme.AuraOrange
-import com.example.ui.theme.AuraPurple
 import com.example.ui.theme.AuraRose
 import com.example.ui.theme.GlassBorder
 import com.example.ui.theme.GlassPanel
@@ -159,7 +161,6 @@ fun BuiltInFilePreviewHost(
     onDismiss: () -> Unit,
     onExtractZip: ((File) -> Unit)? = null,
     onShare: ((File, Uri?) -> Unit)? = null,
-    onVault: ((File, Uri?) -> Unit)? = null,
     onDelete: ((File, Uri?) -> Unit)? = null,
     onShowDetails: ((File) -> Unit)? = null,
     onFileSaved: ((File) -> Unit)? = null
@@ -175,7 +176,6 @@ fun BuiltInFilePreviewHost(
             displaySizeOverride = preview.displaySizeOverride,
             onDismiss = onDismiss,
             onShare = onShare?.let { fn -> { fn(preview.file, preview.contentUri) } },
-            onVault = onVault?.let { fn -> { fn(preview.file, preview.contentUri); onDismiss() } },
             onDelete = onDelete?.let { fn -> { fn(preview.file, preview.contentUri); onDismiss() } },
             onDetails = onShowDetails?.let { fn -> { fn(preview.file) } },
             onOpenExternal = if (preview.inMemoryBitmap != null && !preview.file.exists()) null else {
@@ -219,6 +219,33 @@ fun BuiltInFilePreviewHost(
     }
 }
 
+private fun applyExifOrientationIfNeeded(bitmap: Bitmap, orientation: Int): Bitmap {
+    val matrix = Matrix()
+    when (orientation) {
+        ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+        ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+        ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+        ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1f, 1f)
+        ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1f, -1f)
+        ExifInterface.ORIENTATION_TRANSPOSE -> {
+            matrix.postRotate(90f)
+            matrix.preScale(-1f, 1f)
+        }
+        ExifInterface.ORIENTATION_TRANSVERSE -> {
+            matrix.postRotate(270f)
+            matrix.preScale(-1f, 1f)
+        }
+        else -> return bitmap
+    }
+    return try {
+        val transformed = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        if (transformed !== bitmap) bitmap.recycle()
+        transformed
+    } catch (_: Throwable) {
+        bitmap
+    }
+}
+
 @Composable
 private fun InAppImageViewerDialog(
     file: File,
@@ -227,7 +254,6 @@ private fun InAppImageViewerDialog(
     displaySizeOverride: Long? = null,
     onDismiss: () -> Unit,
     onShare: (() -> Unit)?,
-    onVault: (() -> Unit)?,
     onDelete: (() -> Unit)?,
     onDetails: (() -> Unit)?,
     onOpenExternal: (() -> Unit)?
@@ -244,6 +270,20 @@ private fun InAppImageViewerDialog(
         }
         bitmap = withContext(Dispatchers.IO) {
             try {
+                val orientation = try {
+                    when {
+                        file.exists() -> ExifInterface(file.absolutePath)
+                            .getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+                        contentUri != null -> context.contentResolver.openInputStream(contentUri)?.use { stream ->
+                            ExifInterface(stream)
+                                .getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+                        } ?: ExifInterface.ORIENTATION_NORMAL
+                        else -> ExifInterface.ORIENTATION_NORMAL
+                    }
+                } catch (_: Throwable) {
+                    ExifInterface.ORIENTATION_NORMAL
+                }
+
                 val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                 if (file.exists()) {
                     BitmapFactory.decodeFile(file.absolutePath, opts)
@@ -255,13 +295,14 @@ private fun InAppImageViewerDialog(
                 val maxDim = maxOf(opts.outWidth, opts.outHeight)
                 val sample = if (maxDim > 2048) (maxDim / 1024).coerceAtLeast(2) else 1
                 val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sample }
-                if (file.exists()) {
+                val decoded = if (file.exists()) {
                     BitmapFactory.decodeFile(file.absolutePath, decodeOpts)
                 } else if (contentUri != null) {
                     context.contentResolver.openInputStream(contentUri)?.use {
                         BitmapFactory.decodeStream(it, null, decodeOpts)
                     }
                 } else null
+                decoded?.let { applyExifOrientationIfNeeded(it, orientation) }
             } catch (_: Exception) {
                 null
             }
@@ -348,7 +389,7 @@ private fun InAppImageViewerDialog(
             }
 
             // Floating bottom quick action bar (elevated above gesture bar / rounded screen corners)
-            val hasAnyActions = onShare != null || onVault != null || onDetails != null || onDelete != null
+            val hasAnyActions = onShare != null || onDetails != null || onDelete != null
             if (hasAnyActions) {
                 Row(
                     modifier = Modifier
@@ -365,9 +406,6 @@ private fun InAppImageViewerDialog(
                 ) {
                     onShare?.let {
                         ViewerBottomAction(Modifier.weight(1f), Icons.Default.Share, "Share", AuraCyan, it)
-                    }
-                    onVault?.let {
-                        ViewerBottomAction(Modifier.weight(1f), Icons.Default.Lock, "Vault", AuraPurple, it)
                     }
                     onDetails?.let {
                         ViewerBottomAction(Modifier.weight(1f), Icons.Default.Info, "Details", TextPrimary, it)
@@ -419,13 +457,25 @@ private fun InAppTextViewerDialog(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    var initialContent by remember(file.absolutePath, inMemoryText) { mutableStateOf(inMemoryText ?: "") }
     var content by remember(file.absolutePath, inMemoryText) { mutableStateOf(inMemoryText ?: "") }
     var isEditing by remember { mutableStateOf(false) }
+    var showDiscardConfirm by remember { mutableStateOf(false) }
     var truncated by remember { mutableStateOf(false) }
     var readError by remember { mutableStateOf<String?>(null) }
 
+    val hasUnsavedChanges = isEditing && content != initialContent
+    val requestClose: () -> Unit = {
+        if (hasUnsavedChanges) {
+            showDiscardConfirm = true
+        } else {
+            onDismiss()
+        }
+    }
+
     LaunchedEffect(file.absolutePath, inMemoryText) {
         if (inMemoryText != null) {
+            initialContent = inMemoryText
             content = inMemoryText
             truncated = false
             readError = null
@@ -445,15 +495,37 @@ private fun InAppTextViewerDialog(
                 Triple("", false, e.message ?: "Cannot read file")
             }
         }
+        initialContent = result.first
         content = result.first
         truncated = result.second
         readError = result.third
     }
 
     Dialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = requestClose,
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
+        if (showDiscardConfirm) {
+            AlertDialog(
+                onDismissRequest = { showDiscardConfirm = false },
+                containerColor = GlassPanel,
+                title = { Text(stringResource(R.string.dialog_discard_title), color = TextPrimary, fontWeight = FontWeight.Bold) },
+                text = { Text(stringResource(R.string.dialog_discard_body), color = TextSecondary) },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showDiscardConfirm = false
+                        onDismiss()
+                    }) {
+                        Text(stringResource(R.string.action_discard), color = AuraRose, fontWeight = FontWeight.Bold)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showDiscardConfirm = false }) {
+                        Text(stringResource(R.string.action_keep_editing), color = AuraCyan, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            )
+        }
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -468,7 +540,7 @@ private fun InAppTextViewerDialog(
                     .padding(horizontal = 12.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(onClick = onDismiss) {
+                IconButton(onClick = requestClose) {
                     Icon(Icons.Default.Close, contentDescription = "Close", tint = TextPrimary)
                 }
                 Column(modifier = Modifier.weight(1f)) {
@@ -482,8 +554,8 @@ private fun InAppTextViewerDialog(
                     )
                     val shownSize = displaySizeOverride ?: file.length()
                     Text(
-                        "${formatBytes(shownSize)}${if (truncated) " • Preview truncated at 512 KB" else ""}",
-                        color = TextTertiary,
+                        "${formatBytes(shownSize)}${if (truncated) " • Preview truncated at 512 KB" else if (hasUnsavedChanges) " • Unsaved edits" else ""}",
+                        color = if (hasUnsavedChanges) AuraCyan else TextTertiary,
                         style = MaterialTheme.typography.labelSmall
                     )
                 }
@@ -504,6 +576,7 @@ private fun InAppTextViewerDialog(
                                         Toast.LENGTH_SHORT
                                     ).show()
                                     if (ok) {
+                                        initialContent = content
                                         isEditing = false
                                         onSaved()
                                     }
