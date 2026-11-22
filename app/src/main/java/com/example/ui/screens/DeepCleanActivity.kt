@@ -243,15 +243,60 @@ fun DeepCleanScreen(onBack: () -> Unit) {
             val cacheItems = mutableListOf<JunkFileItem>()
             val emptyFolders = mutableListOf<JunkFileItem>()
 
+            val maxScanDepth = 32
+            val visitedCanonicalDirs = HashSet<String>()
+
             fun getDirSize(dir: File): Long {
                 var size = 0L
-                dir.walkTopDown().forEach { if (it.isFile) size += it.length() }
+                val seenSizeDirs = HashSet<String>()
+                val stack = ArrayDeque<Pair<File, Int>>()
+                val rootCanon = try {
+                    dir.canonicalPath
+                } catch (_: Exception) {
+                    dir.absolutePath
+                }
+                seenSizeDirs.add(rootCanon)
+                stack.add(dir to 0)
+                while (stack.isNotEmpty()) {
+                    val (current, depth) = stack.removeLast()
+                    val children = try {
+                        current.listFiles()
+                    } catch (_: Exception) {
+                        null
+                    } ?: continue
+                    for (child in children) {
+                        if (child.isFile) {
+                            size += child.length()
+                        } else if (child.isDirectory && depth < maxScanDepth) {
+                            val canon = try {
+                                child.canonicalPath
+                            } catch (_: Exception) {
+                                child.absolutePath
+                            }
+                            if (seenSizeDirs.add(canon)) {
+                                stack.add(child to (depth + 1))
+                            }
+                        }
+                    }
+                }
                 return size
             }
 
             // Returns true if this directory is effectively empty (contains no files and only empty subdirs)
-            fun scanDirectory(dir: File): Boolean {
-                val list = dir.listFiles() ?: return false
+            fun scanDirectory(dir: File, depth: Int): Boolean {
+                if (depth > maxScanDepth) return false
+                val dirCanon = try {
+                    dir.canonicalPath
+                } catch (_: Exception) {
+                    dir.absolutePath
+                }
+                if (!visitedCanonicalDirs.add(dirCanon)) return false
+
+                val list = try {
+                    dir.listFiles()
+                } catch (_: Exception) {
+                    null
+                } ?: return false
                 if (list.isEmpty()) {
                     if (dir != root) {
                         emptyFolders.add(JunkFileItem(dir, 0L, "Empty dir"))
@@ -270,7 +315,7 @@ fun DeepCleanScreen(onBack: () -> Unit) {
                             }
                             hasNonEmptyChild = true
                         } else if (!f.name.startsWith(".") && f.name != "Android") {
-                            val childEmpty = scanDirectory(f)
+                            val childEmpty = scanDirectory(f, depth + 1)
                             if (!childEmpty) hasNonEmptyChild = true
                         } else {
                             hasNonEmptyChild = true
@@ -319,7 +364,7 @@ fun DeepCleanScreen(onBack: () -> Unit) {
                 return false
             }
 
-            scanDirectory(root)
+            scanDirectory(root, 0)
 
             val builtCategories = mutableListOf<JunkCategory>()
             if (apkItems.isNotEmpty()) {

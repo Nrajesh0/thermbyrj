@@ -54,6 +54,7 @@ import androidx.compose.material.icons.filled.Unarchive
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -96,6 +97,7 @@ import com.example.InfoRow
 import com.example.R
 import com.example.formatBytes
 import com.example.service.FileManagerOps
+import com.example.service.safeStartActivity
 import com.example.service.toSafeComposeBitmap
 import com.example.ui.theme.AuraCyan
 import com.example.ui.theme.AuraGreen
@@ -149,8 +151,11 @@ fun openExternalWithProvider(context: Context, file: File?, contentUri: Uri? = n
             setDataAndType(uri, mime)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        context.startActivity(Intent.createChooser(intent, "Open with"))
-    } catch (_: Exception) {
+        context.safeStartActivity(
+            Intent.createChooser(intent, "Open with"),
+            "No application available to open this file"
+        )
+    } catch (_: Throwable) {
         Toast.makeText(context, "No application available to open this file", Toast.LENGTH_SHORT).show()
     }
 }
@@ -260,14 +265,17 @@ private fun InAppImageViewerDialog(
 ) {
     val context = LocalContext.current
     var bitmap by remember(file.absolutePath, contentUri, inMemoryBitmap) { mutableStateOf(inMemoryBitmap) }
+    var isLoading by remember(file.absolutePath, contentUri, inMemoryBitmap) { mutableStateOf(inMemoryBitmap == null) }
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
 
     LaunchedEffect(file.absolutePath, contentUri, inMemoryBitmap) {
         if (inMemoryBitmap != null) {
             bitmap = inMemoryBitmap
+            isLoading = false
             return@LaunchedEffect
         }
+        isLoading = true
         bitmap = withContext(Dispatchers.IO) {
             try {
                 val orientation = try {
@@ -307,6 +315,7 @@ private fun InAppImageViewerDialog(
                 null
             }
         }
+        isLoading = false
     }
 
     Dialog(
@@ -349,6 +358,8 @@ private fun InAppImageViewerDialog(
                                 translationY = offset.y
                             )
                     )
+                } else if (isLoading) {
+                    CircularProgressIndicator(color = AuraCyan)
                 } else {
                     Text("Unable to decode image", color = TextSecondary)
                 }

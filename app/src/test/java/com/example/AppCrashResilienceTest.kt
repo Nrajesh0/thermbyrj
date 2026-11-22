@@ -304,9 +304,109 @@ class AppCrashResilienceTest {
             val goodZip = File(root, "good.zip")
             assertTrue(FileManagerOps.compressFilesToZip(listOf(emptyDir, srcFile), goodZip))
             assertTrue(goodZip.exists() && goodZip.length() > 0L)
+
+            // 6. Extracting into a directory where a folder with the same name already exists must create a unique folder
+            val existingFolder = File(root, "good").apply { mkdirs() }
+            val sentinel = File(existingFolder, "keep_me.txt").apply { writeText("do not overwrite") }
+            assertTrue(FileManagerOps.extractZipArchive(app, goodZip, root))
+            assertTrue("Existing folder content must remain untouched", sentinel.exists() && sentinel.readText() == "do not overwrite")
+            assertTrue("Second extraction folder good_2 must be created", File(root, "good_2").isDirectory)
+
+            // 7. ZIP bomb limits (entry count & uncompressed byte limit) must abort and clean up partial output dir
+            val manyEntriesZip = File(root, "bomb_entries.zip")
+            ZipOutputStream(FileOutputStream(manyEntriesZip)).use { zos ->
+                for (i in 1..6) {
+                    zos.putNextEntry(ZipEntry("f$i.txt"))
+                    zos.write("x".toByteArray())
+                    zos.closeEntry()
+                }
+            }
+            assertFalse(
+                "Archive exceeding maxEntries must fail",
+                FileManagerOps.extractZipArchive(app, manyEntriesZip, root, maxEntries = 3)
+            )
+            assertFalse("Partial output directory must be deleted on abort", File(root, "bomb_entries").exists())
+
+            val oversizedZip = File(root, "bomb_size.zip")
+            ZipOutputStream(FileOutputStream(oversizedZip)).use { zos ->
+                zos.putNextEntry(ZipEntry("big.bin"))
+                zos.write(ByteArray(4096) { 0x5A })
+                zos.closeEntry()
+            }
+            assertFalse(
+                "Archive exceeding maxTotalBytes must fail",
+                FileManagerOps.extractZipArchive(app, oversizedZip, root, maxTotalBytes = 1024L)
+            )
+            assertFalse("Partial output directory must be deleted on size limit abort", File(root, "bomb_size").exists())
         } finally {
             root.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `Flash-safe NIST 1-pass is default, mid-file cancel preserves recovery marker, and idle cancel intent is safe`() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        assertEquals(ShredStandard.NIST_SP_800_88, ShredStandard.entries.first())
+        assertEquals(1, ShredStandard.NIST_SP_800_88.passes)
+
+        // Idle ACTION_CANCEL_SHRED must not crash or leave state stuck
+        val cancelIntent = Intent(app, FileShredService::class.java).apply {
+            action = FileShredService.ACTION_CANCEL_SHRED
+        }
+        Robolectric.buildService(FileShredService::class.java, cancelIntent)
+            .create().startCommand(0, 1).destroy()
+
+        // Mid-file cancellation after bytes are overwritten must preserve peekInterruptedShredPath
+        val tempDir = File(System.getProperty("java.io.tmpdir"), "dot_shred_mid_${System.nanoTime()}")
+        tempDir.mkdirs()
+        try {
+            FileShredder.clearInterruptedShredPath(app)
+            val bigFile = File(tempDir, "large_secret.bin").apply {
+                writeBytes(ByteArray(600 * 1024) { 0x33 })
+            }
+            var cancelNow = false
+            val result = FileShredder.shredTargets(
+                context = app,
+                targets = listOf(ShredTarget(bigFile)),
+                standard = ShredStandard.NIST_SP_800_88,
+                isCancelled = { cancelNow },
+                onDetailedProgress = { fraction, _, _, _ ->
+                    if (fraction > 0f) cancelNow = true
+                }
+            )
+            assertTrue(result.wasCancelled)
+            assertTrue("Partially overwritten file remains for recovery", bigFile.exists())
+            assertEquals(bigFile.absolutePath, FileShredder.peekInterruptedShredPath(app))
+
+            // Completing shred on the interrupted file clears the recovery marker and removes the file
+            val recoveryResult = FileShredder.shredTargets(
+                context = app,
+                targets = listOf(ShredTarget(bigFile)),
+                standard = ShredStandard.NIST_SP_800_88
+            )
+            assertEquals(1, recoveryResult.shreddedCount)
+            assertFalse(bigFile.exists())
+            assertNull(FileShredder.peekInterruptedShredPath(app))
+        } finally {
+            FileShredder.clearInterruptedShredPath(app)
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `MainActivity foreground tracking remains active across secondary screen navigation`() {
+        val mainCtrl = Robolectric.buildActivity(MainActivity::class.java).create().start().resume()
+        assertTrue(MainActivity.isUiForeground)
+
+        // Simulate launching secondary activity: secondary starts before MainActivity stops
+        val secondaryCtrl = Robolectric.buildActivity(GuardRulesActivity::class.java).create().start().resume()
+        mainCtrl.pause().stop()
+        assertTrue("Foreground flag must remain true while secondary screen is visible", MainActivity.isUiForeground)
+
+        // Leaving app from secondary activity drops foreground flag to false
+        secondaryCtrl.pause().stop().destroy()
+        mainCtrl.destroy()
+        assertFalse("Foreground flag must clear once all activities stop", MainActivity.isUiForeground)
     }
 }
 

@@ -25,15 +25,15 @@ enum class ShredStandard(
     val subtitle: String,
     val passes: Int
 ) {
-    DOD_5220_22_M(
-        title = "DoD 5220.22-M (3-Pass)",
-        subtitle = "Zeroes (0x00) -> Ones (0xFF) -> Cryptographic Random + fsync + filename scramble",
-        passes = 3
-    ),
     NIST_SP_800_88(
-        title = "NIST SP 800-88 (1-Pass)",
-        subtitle = "Fast cryptographic random overwrite + fsync + filename scramble",
+        title = "NIST SP 800-88 (1-Pass · Flash-Safe)",
+        subtitle = "Recommended for phone UFS/eMMC flash — 1× sequential random overwrite + single fsync + filename scramble",
         passes = 1
+    ),
+    DOD_5220_22_M(
+        title = "DoD 5220.22-M (3-Pass · High Wear)",
+        subtitle = "Legacy 3× overwrite (0x00 -> 0xFF -> random). Causes 3× NAND flash wear on modern storage",
+        passes = 3
     )
 }
 
@@ -66,6 +66,8 @@ object ShredJobCoordinator {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + safeCoroutineExceptionHandler())
     private val _state = MutableStateFlow(ShredJobState())
     val state: StateFlow<ShredJobState> = _state.asStateFlow()
+
+    private val completionIdSeq = java.util.concurrent.atomic.AtomicLong(0L)
 
     @Volatile
     private var activeJob: Job? = null
@@ -150,7 +152,7 @@ object ShredJobCoordinator {
             _state.value = _state.value.copy(
                 isRunning = false,
                 progress = 1f,
-                completionId = System.currentTimeMillis(),
+                completionId = completionIdSeq.incrementAndGet(),
                 lastResult = result,
                 statusText = when {
                     result.wasCancelled -> "Cancelled (${result.shreddedCount} shredded)"
@@ -203,10 +205,12 @@ object FileShredder {
         }
     }
 
+    private const val SEQUENTIAL_BUFFER_BYTES = 256 * 1024 // 256 KB sequential blocks reduce flash write amplification & syscall overhead
+
     fun shredTargets(
         context: Context,
         targets: List<ShredTarget>,
-        standard: ShredStandard = ShredStandard.DOD_5220_22_M,
+        standard: ShredStandard = ShredStandard.NIST_SP_800_88,
         isCancelled: () -> Boolean = { false },
         onDetailedProgress: ((fraction: Float, completedFiles: Int, totalFiles: Int, statusLabel: String) -> Unit)? = null,
         onProgress: (completedFiles: Int, totalFiles: Int, statusLabel: String) -> Unit = { _, _, _ -> }
@@ -235,7 +239,7 @@ object FileShredder {
         var cancelledEarly = false
         val blocked = mutableListOf<ShredTarget>()
         val failed = mutableListOf<ShredTarget>()
-        val buffer = ByteArray(65536)
+        val buffer = ByteArray(SEQUENTIAL_BUFFER_BYTES)
 
         for ((idx, target) in expandedFiles.withIndex()) {
             if (isCancelled()) {
@@ -256,6 +260,7 @@ object FileShredder {
             }
 
             var wipedSuccessfully = false
+            var partiallyOverwritten = false
             val fileLen = if (file.exists()) file.length() else 0L
 
             if (file.exists() && file.isFile && file.canWrite()) {
@@ -267,9 +272,12 @@ object FileShredder {
                     standard = standard,
                     buffer = buffer,
                     isCancelled = isCancelled,
+                    onBytesModified = { partiallyOverwritten = true },
                     onPassProgress = perFileProgress
                 )
-                clearInterruptedShredPath(context)
+                if (wipedSuccessfully || !partiallyOverwritten || !file.exists()) {
+                    clearInterruptedShredPath(context)
+                }
             } else if (target.contentUri != null) {
                 if (file.absolutePath.isNotBlank() && file.exists()) {
                     markActiveShredPath(context, file.absolutePath)
@@ -281,9 +289,12 @@ object FileShredder {
                     standard = standard,
                     buffer = buffer,
                     isCancelled = isCancelled,
+                    onBytesModified = { partiallyOverwritten = true },
                     onPassProgress = perFileProgress
                 )
-                clearInterruptedShredPath(context)
+                if (wipedSuccessfully || !partiallyOverwritten || !file.exists()) {
+                    clearInterruptedShredPath(context)
+                }
             }
 
             if (wipedSuccessfully) {
@@ -338,29 +349,41 @@ object FileShredder {
         standard: ShredStandard,
         buffer: ByteArray,
         isCancelled: () -> Boolean,
+        onBytesModified: () -> Unit,
         onPassProgress: (passNum: Int, totalPasses: Int, passFraction: Float) -> Unit
     ): Boolean {
         val originalPath = file.absolutePath
         return try {
             val length = file.length()
             if (length > 0L) {
-                val ok = when (standard) {
-                    ShredStandard.DOD_5220_22_M -> {
-                        overwritePass(file, length, mode = 0, buffer = buffer, isCancelled = isCancelled) { f -> onPassProgress(1, 3, f) } &&
-                            overwritePass(file, length, mode = 1, buffer = buffer, isCancelled = isCancelled) { f -> onPassProgress(2, 3, f) } &&
-                            overwritePass(file, length, mode = 2, buffer = buffer, isCancelled = isCancelled) { f -> onPassProgress(3, 3, f) }
+                // Single RandomAccessFile handle in buffered "rw" mode with one explicit fsync() per pass
+                // avoids per-chunk O_SYNC journal flushes ("rws") that cause heavy flash wear on UFS/eMMC.
+                val ok = RandomAccessFile(file, "rw").use { raf ->
+                    val passesOk = when (standard) {
+                        ShredStandard.DOD_5220_22_M -> {
+                            overwritePass(raf, length, mode = 0, buffer = buffer, isCancelled = isCancelled, onBytesModified = onBytesModified) { f -> onPassProgress(1, 3, f) } &&
+                                overwritePass(raf, length, mode = 1, buffer = buffer, isCancelled = isCancelled, onBytesModified = onBytesModified) { f -> onPassProgress(2, 3, f) } &&
+                                overwritePass(raf, length, mode = 2, buffer = buffer, isCancelled = isCancelled, onBytesModified = onBytesModified) { f -> onPassProgress(3, 3, f) }
+                        }
+                        ShredStandard.NIST_SP_800_88 -> {
+                            overwritePass(raf, length, mode = 2, buffer = buffer, isCancelled = isCancelled, onBytesModified = onBytesModified) { f -> onPassProgress(1, 1, f) }
+                        }
                     }
-                    ShredStandard.NIST_SP_800_88 -> {
-                        overwritePass(file, length, mode = 2, buffer = buffer, isCancelled = isCancelled) { f -> onPassProgress(1, 1, f) }
+                    if (!passesOk || isCancelled()) {
+                        false
+                    } else {
+                        // Truncate to 0 bytes and flush once before filename scramble + unlink
+                        raf.setLength(0L)
+                        raf.fd.sync()
+                        true
                     }
                 }
-                if (!ok || isCancelled()) return false
-            }
-
-            // Truncate to 0 bytes and force metadata sync before rename/delete
-            RandomAccessFile(file, "rws").use { raf ->
-                raf.setLength(0L)
-                raf.fd.sync()
+                if (!ok) return false
+            } else {
+                RandomAccessFile(file, "rw").use { raf ->
+                    raf.setLength(0L)
+                    raf.fd.sync()
+                }
             }
 
             // Rename to randomized name to obfuscate directory entry filename
@@ -376,38 +399,38 @@ object FileShredder {
     }
 
     private fun overwritePass(
-        file: File,
+        raf: RandomAccessFile,
         length: Long,
         mode: Int,
         buffer: ByteArray,
         isCancelled: () -> Boolean,
+        onBytesModified: () -> Unit,
         onFraction: (Float) -> Unit
     ): Boolean {
-        RandomAccessFile(file, "rws").use { raf ->
-            raf.seek(0L)
-            var written = 0L
-            var lastEmitMs = 0L
-            when (mode) {
-                0 -> java.util.Arrays.fill(buffer, 0x00.toByte())
-                1 -> java.util.Arrays.fill(buffer, 0xFF.toByte())
-            }
-            onFraction(0f)
-            while (written < length) {
-                if (isCancelled()) return false
-                if (mode == 2) {
-                    random.nextBytes(buffer)
-                }
-                val toWrite = minOf(buffer.size.toLong(), length - written).toInt()
-                raf.write(buffer, 0, toWrite)
-                written += toWrite
-                val now = System.currentTimeMillis()
-                if (now - lastEmitMs >= 150L || written >= length) {
-                    lastEmitMs = now
-                    onFraction((written.toFloat() / length.toFloat()).coerceIn(0f, 1f))
-                }
-            }
-            raf.fd.sync()
+        raf.seek(0L)
+        var written = 0L
+        var lastEmitMs = 0L
+        when (mode) {
+            0 -> java.util.Arrays.fill(buffer, 0x00.toByte())
+            1 -> java.util.Arrays.fill(buffer, 0xFF.toByte())
         }
+        onFraction(0f)
+        while (written < length) {
+            if (isCancelled()) return false
+            if (mode == 2) {
+                random.nextBytes(buffer)
+            }
+            val toWrite = minOf(buffer.size.toLong(), length - written).toInt()
+            raf.write(buffer, 0, toWrite)
+            if (written == 0L) onBytesModified()
+            written += toWrite
+            val now = System.currentTimeMillis()
+            if (now - lastEmitMs >= 150L || written >= length) {
+                lastEmitMs = now
+                onFraction((written.toFloat() / length.toFloat()).coerceIn(0f, 1f))
+            }
+        }
+        raf.fd.sync()
         return true
     }
 
@@ -418,6 +441,7 @@ object FileShredder {
         standard: ShredStandard,
         buffer: ByteArray,
         isCancelled: () -> Boolean,
+        onBytesModified: () -> Unit,
         onPassProgress: (passNum: Int, totalPasses: Int, passFraction: Float) -> Unit
     ): Boolean {
         return try {
@@ -450,6 +474,7 @@ object FileShredder {
                                 if (mode == 2) random.nextBytes(buffer)
                                 val toWrite = minOf(buffer.size.toLong(), actualLen - written).toInt()
                                 ch.write(java.nio.ByteBuffer.wrap(buffer, 0, toWrite))
+                                if (written == 0L) onBytesModified()
                                 written += toWrite
                                 val now = System.currentTimeMillis()
                                 if (now - lastEmitMs >= 150L || written >= actualLen) {
@@ -458,7 +483,7 @@ object FileShredder {
                                 }
                             }
                             if (!completedAllPasses) break
-                            ch.force(true)
+                            ch.force(false)
                         }
                         if (completedAllPasses) {
                             ch.truncate(0L)

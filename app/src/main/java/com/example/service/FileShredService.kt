@@ -46,8 +46,17 @@ class FileShredService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_CANCEL_SHRED) {
-            ShredJobCoordinator.cancelCurrentShred()
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            if (!ShredJobCoordinator.state.value.isRunning) {
+                try {
+                    nm?.cancel(SHRED_NOTIF_ID)
+                    ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                } catch (_: Throwable) {
+                }
+                return START_NOT_STICKY
+            }
+            ShredJobCoordinator.cancelCurrentShred()
             if (nm != null && canPostNotification()) {
                 try {
                     nm.notify(

@@ -101,6 +101,10 @@ object FileManagerOps {
 
     val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "gif", "heic", "bmp")
 
+    internal const val MAX_ZIP_ENTRIES = 10_000
+    internal const val MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES = 2L * 1024L * 1024L * 1024L
+    private const val MAX_DIRECTORY_WALK_DEPTH = 32
+
     fun getAvailableStorageVolumes(context: Context): List<StorageVolumeRoot> {
         val result = mutableListOf<StorageVolumeRoot>()
         val primary = Environment.getExternalStorageDirectory()
@@ -312,20 +316,49 @@ object FileManagerOps {
         }
     }
 
-    fun extractZipArchive(context: Context, zipFile: File, targetParentDir: File): Boolean {
+    internal fun buildUniqueExtractDir(targetParentDir: File, baseName: String): File {
+        val cleanBase = baseName.trim().ifBlank { "extracted" }
+            .replace('/', '_')
+            .replace('\\', '_')
+        var candidate = File(targetParentDir, cleanBase)
+        if (!candidate.exists()) return candidate
+        var index = 2
+        while (candidate.exists()) {
+            candidate = File(targetParentDir, "${cleanBase}_$index")
+            index++
+        }
+        return candidate
+    }
+
+    fun extractZipArchive(
+        context: Context,
+        zipFile: File,
+        targetParentDir: File,
+        maxEntries: Int = MAX_ZIP_ENTRIES,
+        maxTotalBytes: Long = MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES
+    ): Boolean {
+        var outDir: File? = null
         return try {
-            val outDir = File(targetParentDir, zipFile.nameWithoutExtension)
-            if (!outDir.exists()) outDir.mkdirs()
-            val canonicalOutDir = outDir.canonicalPath
+            val dir = buildUniqueExtractDir(targetParentDir, zipFile.nameWithoutExtension)
+            if (!dir.mkdirs() && !dir.isDirectory) return false
+            outDir = dir
+            val canonicalOutDir = dir.canonicalPath
             val canonicalOutPrefix = if (canonicalOutDir.endsWith(File.separator)) {
                 canonicalOutDir
             } else {
                 canonicalOutDir + File.separator
             }
+            var entryCount = 0
+            var totalBytesWritten = 0L
+            val copyBuffer = ByteArray(64 * 1024)
             ZipInputStream(BufferedInputStream(FileInputStream(zipFile))).use { zis ->
                 var entry: ZipEntry? = zis.nextEntry
                 while (entry != null) {
-                    val outFile = File(outDir, entry.name)
+                    entryCount++
+                    if (entryCount > maxEntries) {
+                        throw SecurityException("ZIP archive exceeds maximum entry count ($maxEntries)")
+                    }
+                    val outFile = File(dir, entry.name)
                     val outCanonical = outFile.canonicalPath
                     if (outCanonical != canonicalOutDir && !outCanonical.startsWith(canonicalOutPrefix)) {
                         throw SecurityException("Blocked Zip-Slip path traversal: ${entry.name}")
@@ -335,17 +368,28 @@ object FileManagerOps {
                     } else {
                         outFile.parentFile?.mkdirs()
                         FileOutputStream(outFile).use { fos ->
-                            zis.copyTo(fos)
+                            var read: Int
+                            while (zis.read(copyBuffer).also { read = it } != -1) {
+                                totalBytesWritten += read
+                                if (totalBytesWritten > maxTotalBytes) {
+                                    throw SecurityException("ZIP archive exceeds maximum uncompressed size ($maxTotalBytes bytes)")
+                                }
+                                fos.write(copyBuffer, 0, read)
+                            }
                         }
                     }
                     zis.closeEntry()
                     entry = zis.nextEntry
                 }
             }
-            MediaScannerConnection.scanFile(context, arrayOf(outDir.absolutePath), null, null)
+            MediaScannerConnection.scanFile(context, arrayOf(dir.absolutePath), null, null)
             StorageScanCache.invalidate()
             true
         } catch (_: Exception) {
+            try {
+                outDir?.deleteRecursively()
+            } catch (_: Exception) {
+            }
             false
         }
     }
@@ -384,11 +428,18 @@ object FileManagerOps {
         val q = query.trim().lowercase()
         if (q.isBlank() || !rootDir.exists() || !rootDir.isDirectory) return emptyList()
         val results = mutableListOf<File>()
-        val queue = ArrayDeque<File>()
-        queue.add(rootDir)
+        val visitedCanonicalDirs = HashSet<String>()
+        val queue = ArrayDeque<Pair<File, Int>>()
+        val rootCanon = try {
+            rootDir.canonicalPath
+        } catch (_: Exception) {
+            rootDir.absolutePath
+        }
+        visitedCanonicalDirs.add(rootCanon)
+        queue.add(rootDir to 0)
 
         while (queue.isNotEmpty() && results.size < maxResults) {
-            val dir = queue.removeFirst()
+            val (dir, depth) = queue.removeFirst()
             val children = try {
                 dir.listFiles()
             } catch (_: Exception) {
@@ -406,8 +457,15 @@ object FileManagerOps {
                     results.add(child)
                     if (results.size >= maxResults) break
                 }
-                if (child.isDirectory && results.size < maxResults) {
-                    queue.add(child)
+                if (child.isDirectory && results.size < maxResults && depth < MAX_DIRECTORY_WALK_DEPTH) {
+                    val childCanon = try {
+                        child.canonicalPath
+                    } catch (_: Exception) {
+                        child.absolutePath
+                    }
+                    if (visitedCanonicalDirs.add(childCanon)) {
+                        queue.add(child to (depth + 1))
+                    }
                 }
             }
         }

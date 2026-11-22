@@ -310,7 +310,7 @@ fun FilesScreen() {
     var newFileName by remember { mutableStateOf("") }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var deleteWithShredder by remember { mutableStateOf(false) }
-    var selectedShredStandard by remember { mutableStateOf(ShredStandard.DOD_5220_22_M) }
+    var selectedShredStandard by remember { mutableStateOf(ShredStandard.NIST_SP_800_88) }
     var pendingDeletePaths by rememberSaveable { mutableStateOf<List<String>>(emptyList()) }
     var activeFilePreview by remember { mutableStateOf<ActiveFilePreview?>(null) }
     var interruptedShredPath by remember { mutableStateOf(FileShredder.peekInterruptedShredPath(context)) }

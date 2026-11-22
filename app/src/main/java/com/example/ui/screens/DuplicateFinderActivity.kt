@@ -212,14 +212,28 @@ fun DuplicateFinderScreen(onBack: () -> Unit) {
             try {
                 val root = Environment.getExternalStorageDirectory()
                 val seenCanonicalPaths = HashSet<String>()
+                val visitedCanonicalDirs = HashSet<String>()
                 val candidateFiles = mutableListOf<File>()
+                val maxWalkDepth = 32
 
-                fun walk(dir: File) {
-                    val list = dir.listFiles() ?: return
+                fun walk(dir: File, depth: Int) {
+                    if (depth > maxWalkDepth) return
+                    val dirCanon = try {
+                        dir.canonicalPath
+                    } catch (_: Exception) {
+                        dir.absolutePath
+                    }
+                    if (!visitedCanonicalDirs.add(dirCanon)) return
+
+                    val list = try {
+                        dir.listFiles()
+                    } catch (_: Exception) {
+                        null
+                    } ?: return
                     for (f in list) {
                         if (f.isDirectory) {
                             if (!f.name.startsWith(".") && f.name != "Android") {
-                                walk(f)
+                                walk(f, depth + 1)
                             }
                         } else if (f.isFile && f.canRead()) {
                             val len = f.length()
@@ -237,7 +251,7 @@ fun DuplicateFinderScreen(onBack: () -> Unit) {
                     }
                 }
 
-                walk(root)
+                walk(root, 0)
                 DuplicateHashVerifier.findExactDuplicates(candidateFiles) { stageMsg ->
                     scope.launch(Dispatchers.Main) {
                         statusText = stageMsg

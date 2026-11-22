@@ -157,6 +157,46 @@ class MainActivity : ComponentActivity() {
     companion object {
         @Volatile
         var isUiForeground: Boolean = false
+
+        private var trackedAppRef: java.lang.ref.WeakReference<android.app.Application>? = null
+        private val startedActivityCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+        internal fun ensureAppLifecycleTracking(application: android.app.Application) {
+            synchronized(this) {
+                if (trackedAppRef?.get() === application) return
+                trackedAppRef = java.lang.ref.WeakReference(application)
+                startedActivityCount.set(0)
+            }
+            application.registerActivityLifecycleCallbacks(object : android.app.Application.ActivityLifecycleCallbacks {
+                override fun onActivityCreated(activity: android.app.Activity, savedInstanceState: Bundle?) {}
+
+                override fun onActivityStarted(activity: android.app.Activity) {
+                    startedActivityCount.incrementAndGet()
+                    isUiForeground = true
+                }
+
+                override fun onActivityResumed(activity: android.app.Activity) {}
+                override fun onActivityPaused(activity: android.app.Activity) {}
+
+                override fun onActivityStopped(activity: android.app.Activity) {
+                    val remaining = startedActivityCount.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
+                    if (remaining == 0) {
+                        isUiForeground = false
+                        if (!activity.isChangingConfigurations) {
+                            val appCtx = activity.applicationContext
+                            val prefs = appCtx.getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
+                            if (!prefs.getBoolean("background_monitoring", true)) {
+                                com.example.service.ThermalMonitor.getInstance(appCtx).stopMonitoring()
+                                LiveGuardMonitor.getInstance(appCtx).stopMonitoring()
+                            }
+                        }
+                    }
+                }
+
+                override fun onActivitySaveInstanceState(activity: android.app.Activity, outState: Bundle) {}
+                override fun onActivityDestroyed(activity: android.app.Activity) {}
+            })
+        }
     }
 
     private val viewModel: ThermalViewModel by viewModels()
@@ -168,6 +208,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        ensureAppLifecycleTracking(application)
         isUiForeground = true
 
         PreferencesBackupManager.autoRestoreIfCleared(this)
@@ -235,7 +276,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
-        isUiForeground = false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
             try {
                 osScreenRecordingCallback?.let { cb ->
@@ -244,11 +284,6 @@ class MainActivity : ComponentActivity() {
                 osScreenRecordingCallback = null
             } catch (_: Throwable) {
             }
-        }
-        val prefs = getSharedPreferences("thermal_prefs", Context.MODE_PRIVATE)
-        if (!prefs.getBoolean("background_monitoring", true)) {
-            com.example.service.ThermalMonitor.getInstance(applicationContext).stopMonitoring()
-            LiveGuardMonitor.getInstance(applicationContext).stopMonitoring()
         }
     }
 

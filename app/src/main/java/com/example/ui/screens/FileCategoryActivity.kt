@@ -222,7 +222,7 @@ fun FileCategoryScreen(categoryName: String, onBack: () -> Unit) {
     var showShredDialog by remember { mutableStateOf(false) }
     var showAllFilesPromptDialog by remember { mutableStateOf(false) }
     var blockedShredCount by remember { mutableIntStateOf(0) }
-    var selectedShredStandard by remember { mutableStateOf(ShredStandard.DOD_5220_22_M) }
+    var selectedShredStandard by remember { mutableStateOf(ShredStandard.NIST_SP_800_88) }
     var pendingDeleteUris by rememberSaveable { mutableStateOf<List<String>>(emptyList()) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
     var mediaPermPromptAttempted by rememberSaveable { mutableStateOf(false) }

@@ -53,6 +53,7 @@ class ThermalTrackerService : Service() {
 
     private var lastAlertState = 0 // 0: Normal, 1: Elevated, 2: Critical
     private var trackingJob: Job? = null
+    private var guardWidgetJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -140,8 +141,21 @@ class ThermalTrackerService : Service() {
     private var lastRecordedTemp = -100f
     private var lastWidgetTemp = -100f
     private var lastWidgetUpdateMs = 0L
+    private var lastWidgetBatteryLevel = -1
+    private var lastWidgetCharging: Boolean? = null
+    private var lastWidgetGuardSig = ""
     private var lastNotifTemp = -100f
     private var lastNotifUpdateMs = 0L
+    private var lastNotifBatteryLevel = -1
+    private var lastNotifCharging: Boolean? = null
+    private var lastNotifGuardSig = ""
+
+    private fun currentGuardSignature(): String {
+        if (!::liveGuardMonitor.isInitialized) return "off"
+        val state = liveGuardMonitor.captureState.value
+        val active = liveGuardMonitor.isMonitoringActive()
+        return "$active:${state.isScreenRecordingOrCasting}:${state.isMicActive}:${state.isCameraActive}:${state.isBackgroundLocationActive}:${state.isVpnOrProxyActive}"
+    }
 
     private fun startTrackingLoop() {
         if (!::thermalMonitor.isInitialized || !::repository.isInitialized) return
@@ -154,6 +168,36 @@ class ThermalTrackerService : Service() {
                             checkThermalAlerts(live.batteryTemp)
                             maybeRecordAndUpdateWidget(live)
                         } catch (_: Throwable) {
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        if (::liveGuardMonitor.isInitialized && guardWidgetJob?.isActive != true) {
+            guardWidgetJob = serviceScope.launch {
+                try {
+                    liveGuardMonitor.captureState.collect {
+                        val guardSig = currentGuardSignature()
+                        if (guardSig == lastWidgetGuardSig && guardSig == lastNotifGuardSig) return@collect
+                        val live = thermalMonitor.liveData.value
+                        if (live.batteryTemp <= 0f) return@collect
+                        val now = System.currentTimeMillis()
+                        if (isDeviceInteractive() && guardSig != lastWidgetGuardSig) {
+                            updateWidget(live.batteryTemp)
+                            lastWidgetTemp = live.batteryTemp
+                            lastWidgetBatteryLevel = live.batteryLevel
+                            lastWidgetCharging = live.isCharging
+                            lastWidgetGuardSig = guardSig
+                            lastWidgetUpdateMs = now
+                        }
+                        if (guardSig != lastNotifGuardSig) {
+                            updateForegroundNotification(live)
+                            lastNotifTemp = live.batteryTemp
+                            lastNotifBatteryLevel = live.batteryLevel
+                            lastNotifCharging = live.isCharging
+                            lastNotifGuardSig = guardSig
+                            lastNotifUpdateMs = now
                         }
                     }
                 } catch (_: Throwable) {
@@ -196,19 +240,57 @@ class ThermalTrackerService : Service() {
         }
 
         val interactive = isDeviceInteractive()
+        val guardSig = currentGuardSignature()
+
         val widgetTempDelta = kotlin.math.abs(live.batteryTemp - lastWidgetTemp)
         val widgetTimeDelta = now - lastWidgetUpdateMs
-        if (interactive && (lastWidgetUpdateMs == 0L || (widgetTempDelta >= 0.5f && widgetTimeDelta >= 10_000L))) {
+        val widgetChargingChanged = lastWidgetCharging != null && live.isCharging != lastWidgetCharging
+        val widgetBatteryChanged = live.batteryLevel >= 0 &&
+            lastWidgetBatteryLevel >= 0 &&
+            kotlin.math.abs(live.batteryLevel - lastWidgetBatteryLevel) >= 1 &&
+            widgetTimeDelta >= 15_000L
+        val widgetGuardChanged = lastWidgetGuardSig.isNotEmpty() && guardSig != lastWidgetGuardSig
+        val widgetMaxAgeReached = widgetTimeDelta >= 15L * 60_000L
+
+        if (interactive && (
+                lastWidgetUpdateMs == 0L ||
+                    (widgetTempDelta >= 0.5f && widgetTimeDelta >= 10_000L) ||
+                    widgetChargingChanged ||
+                    widgetBatteryChanged ||
+                    widgetGuardChanged ||
+                    widgetMaxAgeReached
+                )
+        ) {
             updateWidget(live.batteryTemp)
             lastWidgetTemp = live.batteryTemp
+            lastWidgetBatteryLevel = live.batteryLevel
+            lastWidgetCharging = live.isCharging
+            lastWidgetGuardSig = guardSig
             lastWidgetUpdateMs = now
         }
 
         val notifTempDelta = kotlin.math.abs(live.batteryTemp - lastNotifTemp)
         val notifTimeDelta = now - lastNotifUpdateMs
-        if (lastNotifUpdateMs == 0L || (interactive && notifTempDelta >= 0.5f && notifTimeDelta >= 10_000L) || notifTempDelta >= 1.5f) {
+        val notifChargingChanged = lastNotifCharging != null && live.isCharging != lastNotifCharging
+        val notifBatteryChanged = interactive &&
+            live.batteryLevel >= 0 &&
+            lastNotifBatteryLevel >= 0 &&
+            kotlin.math.abs(live.batteryLevel - lastNotifBatteryLevel) >= 2 &&
+            notifTimeDelta >= 15_000L
+        val notifGuardChanged = lastNotifGuardSig.isNotEmpty() && guardSig != lastNotifGuardSig
+
+        if (lastNotifUpdateMs == 0L ||
+            notifChargingChanged ||
+            notifGuardChanged ||
+            notifBatteryChanged ||
+            (interactive && notifTempDelta >= 0.5f && notifTimeDelta >= 10_000L) ||
+            notifTempDelta >= 1.5f
+        ) {
             updateForegroundNotification(live)
             lastNotifTemp = live.batteryTemp
+            lastNotifBatteryLevel = live.batteryLevel
+            lastNotifCharging = live.isCharging
+            lastNotifGuardSig = guardSig
             lastNotifUpdateMs = now
         }
     }
